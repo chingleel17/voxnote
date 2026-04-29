@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]  // 舊版 config.toml 缺少新欄位時，自動填入 Default 值
 pub struct AppConfig {
     // ASR 供應商："assemblyai" | "local"
     pub asr_provider: String,
