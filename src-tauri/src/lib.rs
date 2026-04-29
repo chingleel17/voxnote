@@ -1,10 +1,14 @@
 use tauri::Manager;
 
+mod ai;
+mod asr;
 mod commands;
 mod config;
 mod db;
 
 use commands::{
+    ai_cmds::*,
+    asr_cmds::*,
     meeting_cmds::*,
     recording_cmds::*,
     settings_cmds::*,
@@ -54,6 +58,13 @@ pub fn run() {
             save_settings,
             test_ollama_connection,
             get_ollama_models,
+            test_llm_connection_cmd,
+            // ai
+            proofread_transcript,
+            generate_summary,
+            // asr
+            detect_local_asr_tools,
+            start_transcription,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

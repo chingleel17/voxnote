@@ -53,12 +53,26 @@ export interface Recording {
 }
 
 export interface AppConfig {
-  providerMode: 'cloud' | 'hybrid' | 'ollama';
+  // ASR
+  asrProvider: 'assemblyai' | 'local';
   assemblyAiKey: string;
+  localAsrModel: 'tiny' | 'base' | 'small' | 'medium' | 'large';
+
+  // LLM
+  llmProvider: 'openai' | 'claude' | 'gemini' | 'openrouter' | 'ollama' | 'custom';
+  openaiKey: string;
+  openaiModel: string;
+  claudeKey: string;
+  claudeModel: string;
   geminiKey: string;
   geminiModel: string;
+  openrouterKey: string;
+  openrouterModel: string;
   ollamaEndpoint: string;
-  ollamaLlmModel: string;
+  ollamaModel: string;
+  customEndpoint: string;
+  customApiKey: string;
+  customModel: string;
 }
 
 export interface CreateMeetingRequest {

@@ -4,23 +4,48 @@ use tauri::AppHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    pub provider_mode: String,
+    // ASR 供應商："assemblyai" | "local"
+    pub asr_provider: String,
     pub assembly_ai_key: String,
+    pub local_asr_model: String, // "tiny" | "base" | "small" | "medium" | "large"
+
+    // LLM 供應商："openai" | "claude" | "gemini" | "openrouter" | "ollama" | "custom"
+    pub llm_provider: String,
+    pub openai_key: String,
+    pub openai_model: String,
+    pub claude_key: String,
+    pub claude_model: String,
     pub gemini_key: String,
     pub gemini_model: String,
+    pub openrouter_key: String,
+    pub openrouter_model: String,
     pub ollama_endpoint: String,
-    pub ollama_llm_model: String,
+    pub ollama_model: String,
+    pub custom_endpoint: String,
+    pub custom_api_key: String,
+    pub custom_model: String,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            provider_mode: "cloud".into(),
+            asr_provider: "assemblyai".into(),
             assembly_ai_key: String::new(),
+            local_asr_model: "base".into(),
+            llm_provider: "gemini".into(),
+            openai_key: String::new(),
+            openai_model: "gpt-4o-mini".into(),
+            claude_key: String::new(),
+            claude_model: "claude-3-5-haiku-20241022".into(),
             gemini_key: String::new(),
             gemini_model: "gemini-2.0-flash".into(),
+            openrouter_key: String::new(),
+            openrouter_model: "openai/gpt-4o-mini".into(),
             ollama_endpoint: "http://localhost:11434".into(),
-            ollama_llm_model: String::new(),
+            ollama_model: String::new(),
+            custom_endpoint: String::new(),
+            custom_api_key: String::new(),
+            custom_model: String::new(),
         }
     }
 }
