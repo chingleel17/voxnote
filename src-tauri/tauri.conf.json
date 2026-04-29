@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "x-meet-tauri",
+  "productName": "VoxNote",
   "version": "0.1.0",
-  "identifier": "com.superlanding.x-meet-tauri",
+  "identifier": "com.ching.voxnote",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "x-meet-tauri",
+        "title": "VoxNote",
         "width": 800,
         "height": 600
       }
