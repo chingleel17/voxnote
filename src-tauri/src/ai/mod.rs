@@ -104,7 +104,7 @@ async fn gemini_call(api_key: &str, model: &str, system_prompt: &str, user_conte
     if api_key.is_empty() {
         return Err(anyhow!("Gemini API Key 未設定"));
     }
-    let model = if model.is_empty() { "gemini-2.0-flash" } else { model };
+    let model = if model.is_empty() { "gemini-2.5-flash" } else { model };
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
         model, api_key
@@ -142,7 +142,7 @@ async fn claude_call(api_key: &str, model: &str, system_prompt: &str, user_conte
     if api_key.is_empty() {
         return Err(anyhow!("Claude API Key 未設定"));
     }
-    let model = if model.is_empty() { "claude-3-5-haiku-20241022" } else { model };
+    let model = if model.is_empty() { "claude-haiku-4-5-20251001" } else { model };
 
     let body = json!({
         "model": model,

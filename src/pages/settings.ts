@@ -8,15 +8,37 @@ import {
 import { showToast } from '../components/toast';
 
 // ─────────────────────────────────────────────
-// 預設模型選項
+// 預設模型選項（來源：各供應商官方文件，2026-04-29）
 // ─────────────────────────────────────────────
-const OPENAI_MODELS = ['gpt-4o-mini', 'gpt-4o', 'gpt-4-turbo', 'gpt-3.5-turbo'];
-const CLAUDE_MODELS = [
-  'claude-3-5-haiku-20241022',
-  'claude-3-5-sonnet-20241022',
-  'claude-3-opus-20240229',
+const OPENAI_MODELS = [
+  'gpt-5.5',
+  'gpt-5.4',
+  'gpt-5.4-mini',
+  'gpt-5-mini',
+  'gpt-4.1',
+  'gpt-4.1-mini',
+  'gpt-4.1-nano',
+  'gpt-4o',
+  'gpt-4o-mini',
+  'o3',
+  'o4-mini',
 ];
-const GEMINI_MODELS = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'];
+const CLAUDE_MODELS = [
+  'claude-opus-4-7',
+  'claude-sonnet-4-6',
+  'claude-haiku-4-5-20251001',
+  'claude-opus-4-6',
+  'claude-sonnet-4-5',
+  'claude-3-7-sonnet-20250219',
+  'claude-3-5-sonnet-20241022',
+  'claude-3-5-haiku-20241022',
+];
+const GEMINI_MODELS = [
+  'gemini-2.5-pro',
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
+  'gemini-2.0-flash',
+];
 const LOCAL_ASR_MODELS = ['tiny', 'base', 'small', 'medium', 'large'];
 
 // ─────────────────────────────────────────────
@@ -100,9 +122,9 @@ function buildAsrSection(
       { value: 'assemblyai', label: 'AssemblyAI（雲端）' },
       { value: 'local', label: '本地 Whisper' },
     ],
-    config.asrProvider,
+    config.asr_provider,
     (v) => {
-      config = { ...config, asrProvider: v as AppConfig['asrProvider'] };
+      config = { ...config, asr_provider: v as AppConfig['asr_provider'] };
       onChange(config);
       updateAsrVisibility(v);
     }
@@ -112,8 +134,8 @@ function buildAsrSection(
   // AssemblyAI Key
   const assemblySection = document.createElement('div');
   assemblySection.appendChild(
-    buildInputGroup('AssemblyAI API Key', 'password', config.assemblyAiKey, (v) => {
-      config = { ...config, assemblyAiKey: v };
+    buildInputGroup('AssemblyAI API Key', 'password', config.assembly_ai_key, (v) => {
+      config = { ...config, assembly_ai_key: v };
       onChange(config);
     })
   );
@@ -136,9 +158,9 @@ function buildAsrSection(
     buildSelectGroup(
       '模型大小',
       LOCAL_ASR_MODELS.map((m) => ({ value: m, label: m })),
-      config.localAsrModel,
+      config.local_asr_model,
       (v) => {
-        config = { ...config, localAsrModel: v as AppConfig['localAsrModel'] };
+        config = { ...config, local_asr_model: v as AppConfig['local_asr_model'] };
         onChange(config);
       }
     )
@@ -176,7 +198,7 @@ function buildAsrSection(
     assemblySection.style.display = provider === 'assemblyai' ? '' : 'none';
     localSection.style.display = provider === 'local' ? '' : 'none';
   };
-  updateAsrVisibility(config.asrProvider);
+  updateAsrVisibility(config.asr_provider);
 
   return section;
 }
@@ -209,9 +231,9 @@ function buildLlmSection(
   const providerGroup = buildSelectGroup(
     'LLM 供應商',
     providers,
-    config.llmProvider,
+    config.llm_provider,
     (v) => {
-      config = { ...config, llmProvider: v as AppConfig['llmProvider'] };
+      config = { ...config, llm_provider: v as AppConfig['llm_provider'] };
       onChange(config);
       updateLlmVisibility(v);
     }
@@ -220,44 +242,44 @@ function buildLlmSection(
 
   // ── OpenAI ──
   const openaiSection = buildProviderSection([
-    buildInputGroup('OpenAI API Key', 'password', config.openaiKey, (v) => {
-      config = { ...config, openaiKey: v }; onChange(config);
+    buildInputGroup('OpenAI API Key', 'password', config.openai_key, (v) => {
+      config = { ...config, openai_key: v }; onChange(config);
     }),
-    buildSelectGroup('模型', OPENAI_MODELS.map((m) => ({ value: m, label: m })), config.openaiModel, (v) => {
-      config = { ...config, openaiModel: v }; onChange(config);
+    buildSelectGroup('模型', OPENAI_MODELS.map((m) => ({ value: m, label: m })), config.openai_model, (v) => {
+      config = { ...config, openai_model: v }; onChange(config);
     }),
   ]);
   section.appendChild(openaiSection);
 
   // ── Claude ──
   const claudeSection = buildProviderSection([
-    buildInputGroup('Claude API Key', 'password', config.claudeKey, (v) => {
-      config = { ...config, claudeKey: v }; onChange(config);
+    buildInputGroup('Claude API Key', 'password', config.claude_key, (v) => {
+      config = { ...config, claude_key: v }; onChange(config);
     }),
-    buildSelectGroup('模型', CLAUDE_MODELS.map((m) => ({ value: m, label: m })), config.claudeModel, (v) => {
-      config = { ...config, claudeModel: v }; onChange(config);
+    buildSelectGroup('模型', CLAUDE_MODELS.map((m) => ({ value: m, label: m })), config.claude_model, (v) => {
+      config = { ...config, claude_model: v }; onChange(config);
     }),
   ]);
   section.appendChild(claudeSection);
 
   // ── Gemini ──
   const geminiSection = buildProviderSection([
-    buildInputGroup('Gemini API Key', 'password', config.geminiKey, (v) => {
-      config = { ...config, geminiKey: v }; onChange(config);
+    buildInputGroup('Gemini API Key', 'password', config.gemini_key, (v) => {
+      config = { ...config, gemini_key: v }; onChange(config);
     }),
-    buildSelectGroup('模型', GEMINI_MODELS.map((m) => ({ value: m, label: m })), config.geminiModel, (v) => {
-      config = { ...config, geminiModel: v }; onChange(config);
+    buildSelectGroup('模型', GEMINI_MODELS.map((m) => ({ value: m, label: m })), config.gemini_model, (v) => {
+      config = { ...config, gemini_model: v }; onChange(config);
     }),
   ]);
   section.appendChild(geminiSection);
 
   // ── OpenRouter ──
   const openrouterSection = buildProviderSection([
-    buildInputGroup('OpenRouter API Key', 'password', config.openrouterKey, (v) => {
-      config = { ...config, openrouterKey: v }; onChange(config);
+    buildInputGroup('OpenRouter API Key', 'password', config.openrouter_key, (v) => {
+      config = { ...config, openrouter_key: v }; onChange(config);
     }),
-    buildInputGroup('模型（例如：openai/gpt-4o-mini）', 'text', config.openrouterModel, (v) => {
-      config = { ...config, openrouterModel: v }; onChange(config);
+    buildInputGroup('模型（例如：openai/gpt-4o-mini）', 'text', config.openrouter_model, (v) => {
+      config = { ...config, openrouter_model: v }; onChange(config);
     }),
   ]);
   section.appendChild(openrouterSection);
@@ -271,14 +293,14 @@ function buildLlmSection(
 
   // ── 自訂端點 ──
   const customSection = buildProviderSection([
-    buildInputGroup('API Endpoint（OpenAI-compatible）', 'text', config.customEndpoint, (v) => {
-      config = { ...config, customEndpoint: v }; onChange(config);
+    buildInputGroup('API Endpoint（OpenAI-compatible）', 'text', config.custom_endpoint, (v) => {
+      config = { ...config, custom_endpoint: v }; onChange(config);
     }),
-    buildInputGroup('API Key（可留空）', 'password', config.customApiKey, (v) => {
-      config = { ...config, customApiKey: v }; onChange(config);
+    buildInputGroup('API Key（可留空）', 'password', config.custom_api_key, (v) => {
+      config = { ...config, custom_api_key: v }; onChange(config);
     }),
-    buildInputGroup('模型名稱', 'text', config.customModel, (v) => {
-      config = { ...config, customModel: v }; onChange(config);
+    buildInputGroup('模型名稱', 'text', config.custom_model, (v) => {
+      config = { ...config, custom_model: v }; onChange(config);
     }),
   ]);
   section.appendChild(customSection);
@@ -293,8 +315,8 @@ function buildLlmSection(
     testBtn.disabled = true;
     testBtn.textContent = '測試中...';
     try {
-      onChange(config);
-      // 儲存後測試
+      // 先儲存當前設定，再從磁碟讀取進行測試
+      await saveSettings(config);
       const result = await testLlmConnection();
       showToast(`連線成功：${result}`, 'success');
     } catch (err) {
@@ -325,7 +347,7 @@ function buildLlmSection(
     for (const el of allSections) el.style.display = 'none';
     if (providerMap[provider]) providerMap[provider].style.display = '';
   };
-  updateLlmVisibility(config.llmProvider);
+  updateLlmVisibility(config.llm_provider);
 
   return section;
 }
@@ -350,10 +372,10 @@ function buildOllamaSection(
   const endpointInput = document.createElement('input');
   endpointInput.type = 'text';
   endpointInput.className = 'form-control';
-  endpointInput.value = config.ollamaEndpoint;
+  endpointInput.value = config.ollama_endpoint;
   endpointInput.placeholder = 'http://localhost:11434';
   endpointInput.addEventListener('input', () => {
-    config = { ...config, ollamaEndpoint: endpointInput.value };
+    config = { ...config, ollama_endpoint: endpointInput.value };
     onChange(config);
   });
 
@@ -393,15 +415,15 @@ function buildOllamaSection(
   const modelSelect = document.createElement('select');
   modelSelect.className = 'form-control';
 
-  if (config.ollamaModel) {
+  if (config.ollama_model) {
     const opt = document.createElement('option');
-    opt.value = config.ollamaModel;
-    opt.textContent = config.ollamaModel;
+    opt.value = config.ollama_model;
+    opt.textContent = config.ollama_model;
     opt.selected = true;
     modelSelect.appendChild(opt);
   }
   modelSelect.addEventListener('change', () => {
-    config = { ...config, ollamaModel: modelSelect.value };
+    config = { ...config, ollama_model: modelSelect.value };
     onChange(config);
   });
 
@@ -417,11 +439,11 @@ function buildOllamaSection(
         const opt = document.createElement('option');
         opt.value = m;
         opt.textContent = m;
-        opt.selected = m === config.ollamaModel;
+        opt.selected = m === config.ollama_model;
         modelSelect.appendChild(opt);
       }
       if (models.length > 0) {
-        config = { ...config, ollamaModel: modelSelect.value };
+        config = { ...config, ollama_model: modelSelect.value };
         onChange(config);
       }
     } catch {
