@@ -1,0 +1,82 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Category {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Meeting {
+    pub id: String,
+    pub title: String,
+    pub category_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingWithDetails {
+    pub id: String,
+    pub title: String,
+    pub category_id: Option<String>,
+    pub category_name: Option<String>,
+    pub participants: Vec<String>,
+    pub has_transcript: bool,
+    pub has_summary: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Participant {
+    pub id: String,
+    pub meeting_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Transcript {
+    pub id: String,
+    pub meeting_id: String,
+    pub original_content: Option<String>,
+    pub proofread_content: Option<String>,
+    pub active_version: String,
+    pub proofread_provider: Option<String>,
+    pub proofread_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Summary {
+    pub id: String,
+    pub meeting_id: String,
+    pub content: String,
+    pub provider: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Recording {
+    pub id: String,
+    pub meeting_id: String,
+    pub file_path: Option<String>,
+    pub duration_seconds: Option<i64>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateMeetingRequest {
+    pub title: String,
+    pub category_id: Option<String>,
+    pub participants: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateMeetingRequest {
+    pub title: String,
+    pub category_id: Option<String>,
+    pub participants: Vec<String>,
+}

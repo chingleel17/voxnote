@@ -1,22 +1,66 @@
-import { invoke } from "@tauri-apps/api/core";
+import { renderNav, updateNavActive } from './components/nav';
+import { renderHomePage } from './pages/home';
+import { renderMeetingPage } from './pages/meeting';
+import { renderRecordPage } from './pages/record';
+import { renderSettingsPage } from './pages/settings';
 
-let greetInputEl: HTMLInputElement | null;
-let greetMsgEl: HTMLElement | null;
+interface ParsedRoute {
+  page: string;
+  id?: string;
+}
 
-async function greet() {
-  if (greetMsgEl && greetInputEl) {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    greetMsgEl.textContent = await invoke("greet", {
-      name: greetInputEl.value,
-    });
+function parseRoute(hash: string): ParsedRoute {
+  const clean = hash.startsWith('#') ? hash.slice(1) : hash;
+  const parts = clean.split('/');
+  return { page: parts[0] || 'home', id: parts[1] };
+}
+
+async function renderPage(container: HTMLElement, route: ParsedRoute): Promise<void> {
+  switch (route.page) {
+    case 'home':
+      await renderHomePage(container);
+      break;
+    case 'meeting':
+      if (route.id) {
+        await renderMeetingPage(container, route.id);
+      } else {
+        await renderHomePage(container);
+      }
+      break;
+    case 'record':
+      await renderRecordPage(container);
+      break;
+    case 'settings':
+      await renderSettingsPage(container);
+      break;
+    default:
+      await renderHomePage(container);
   }
 }
 
-window.addEventListener("DOMContentLoaded", () => {
-  greetInputEl = document.querySelector("#greet-input");
-  greetMsgEl = document.querySelector("#greet-msg");
-  document.querySelector("#greet-form")?.addEventListener("submit", (e) => {
-    e.preventDefault();
-    greet();
-  });
+window.addEventListener('DOMContentLoaded', () => {
+  const sidebar = document.getElementById('sidebar');
+  const content = document.getElementById('content');
+  if (!sidebar || !content) return;
+
+  renderNav(sidebar);
+
+  const initialHash = window.location.hash || '#home';
+  if (!window.location.hash) {
+    window.location.hash = '#home';
+  }
+
+  const initialRoute = parseRoute(initialHash);
+  updateNavActive(initialHash);
+  renderPage(content, initialRoute);
+});
+
+window.addEventListener('hashchange', () => {
+  const content = document.getElementById('content');
+  if (!content) return;
+
+  const hash = window.location.hash;
+  const route = parseRoute(hash);
+  updateNavActive(hash);
+  renderPage(content, route);
 });
