@@ -72,11 +72,38 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
   container.appendChild(form);
 
   // ── ASR 區塊 ──
-  const asrSection = buildAsrSection(config, (updated) => { config = updated; });
+  const asrSection = buildAsrSection(config, (updated) => {
+    // 只合併 ASR 相關欄位，避免覆蓋 LLM section 的變更
+    config = {
+      ...config,
+      asr_provider: updated.asr_provider,
+      assembly_ai_key: updated.assembly_ai_key,
+      local_asr_model: updated.local_asr_model,
+    };
+  });
   form.appendChild(asrSection);
 
   // ── LLM 區塊 ──
-  const llmSection = buildLlmSection(config, (updated) => { config = updated; });
+  const llmSection = buildLlmSection(config, (updated) => {
+    // 只合併 LLM 相關欄位，避免覆蓋 ASR section 的變更
+    config = {
+      ...config,
+      llm_provider: updated.llm_provider,
+      openai_key: updated.openai_key,
+      openai_model: updated.openai_model,
+      claude_key: updated.claude_key,
+      claude_model: updated.claude_model,
+      gemini_key: updated.gemini_key,
+      gemini_model: updated.gemini_model,
+      openrouter_key: updated.openrouter_key,
+      openrouter_model: updated.openrouter_model,
+      ollama_endpoint: updated.ollama_endpoint,
+      ollama_model: updated.ollama_model,
+      custom_endpoint: updated.custom_endpoint,
+      custom_api_key: updated.custom_api_key,
+      custom_model: updated.custom_model,
+    };
+  });
   form.appendChild(llmSection);
 
   // ── 儲存按鈕 ──
@@ -286,7 +313,8 @@ function buildLlmSection(
 
   // ── Ollama ──
   const ollamaSection = buildOllamaSection(config, (updated) => {
-    config = updated;
+    // 只合併 ollama 專屬欄位，避免覆蓋 llm_provider 等其他 LLM 欄位
+    config = { ...config, ollama_endpoint: updated.ollama_endpoint, ollama_model: updated.ollama_model };
     onChange(config);
   });
   section.appendChild(ollamaSection);

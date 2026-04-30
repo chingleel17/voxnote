@@ -7,6 +7,9 @@ use crate::config::AppConfig;
 pub async fn call_llm(config: &AppConfig, system_prompt: &str, user_content: &str) -> Result<String> {
     match config.llm_provider.as_str() {
         "openai" => {
+            if config.openai_key.is_empty() {
+                return Err(anyhow!("OpenAI API Key 未設定"));
+            }
             openai_compat_call(
                 "https://api.openai.com/v1/chat/completions",
                 &config.openai_key,
@@ -17,6 +20,9 @@ pub async fn call_llm(config: &AppConfig, system_prompt: &str, user_content: &st
             .await
         }
         "openrouter" => {
+            if config.openrouter_key.is_empty() {
+                return Err(anyhow!("OpenRouter API Key 未設定"));
+            }
             openai_compat_call(
                 "https://openrouter.ai/api/v1/chat/completions",
                 &config.openrouter_key,
@@ -27,6 +33,12 @@ pub async fn call_llm(config: &AppConfig, system_prompt: &str, user_content: &st
             .await
         }
         "ollama" => {
+            if config.ollama_endpoint.is_empty() {
+                return Err(anyhow!("Ollama Endpoint 未設定"));
+            }
+            if config.ollama_model.is_empty() {
+                return Err(anyhow!("Ollama 模型未選擇"));
+            }
             let url = format!(
                 "{}/v1/chat/completions",
                 config.ollama_endpoint.trim_end_matches('/')
@@ -34,6 +46,12 @@ pub async fn call_llm(config: &AppConfig, system_prompt: &str, user_content: &st
             openai_compat_call(&url, "", &config.ollama_model, system_prompt, user_content).await
         }
         "custom" => {
+            if config.custom_endpoint.is_empty() {
+                return Err(anyhow!("自訂端點 URL 未設定"));
+            }
+            if config.custom_model.is_empty() {
+                return Err(anyhow!("自訂端點模型名稱未設定"));
+            }
             openai_compat_call(
                 &config.custom_endpoint,
                 &config.custom_api_key,

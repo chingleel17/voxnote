@@ -33,7 +33,7 @@ impl Default for AppConfig {
             asr_provider: "assemblyai".into(),
             assembly_ai_key: String::new(),
             local_asr_model: "base".into(),
-            llm_provider: "gemini".into(),
+            llm_provider: "openai".into(),
             openai_key: String::new(),
             openai_model: "gpt-4.1-mini".into(),
             claude_key: String::new(),

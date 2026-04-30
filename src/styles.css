@@ -346,7 +346,7 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
    ============================================================ */
 #toast-container {
   position: fixed;
-  bottom: 24px;
+  top: 24px;
   right: 24px;
   z-index: 2000;
   display: flex;
@@ -361,12 +361,12 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
   font-weight: 500;
   box-shadow: var(--shadow-lg);
   opacity: 0;
-  transform: translateX(20px);
+  transform: translateY(-10px);
   transition: opacity 0.2s ease, transform 0.2s ease;
   max-width: 340px;
 }
 
-.toast-visible { opacity: 1; transform: translateX(0); }
+.toast-visible { opacity: 1; transform: translateY(0); }
 
 .toast-success { background: #166534; color: #bbf7d0; border-left: 3px solid var(--color-success); }
 .toast-error { background: #7f1d1d; color: #fecaca; border-left: 3px solid var(--color-error); }

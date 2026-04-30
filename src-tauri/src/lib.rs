@@ -53,6 +53,7 @@ pub fn run() {
             // recording
             get_recording,
             save_recording,
+            write_recording_file,
             // settings
             get_settings,
             save_settings,

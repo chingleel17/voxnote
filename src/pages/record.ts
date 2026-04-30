@@ -1,6 +1,6 @@
 import type { MeetingWithDetails } from '../types';
 import { getMeetings } from '../api/meetings';
-import { saveRecording } from '../api/recordings';
+import { writeRecordingFile } from '../api/recordings';
 import { showToast } from '../components/toast';
 
 interface RecordingState {
@@ -11,6 +11,7 @@ interface RecordingState {
   timerInterval: number | null;
   audioBlob: Blob | null;
   audioBlobUrl: string | null;
+  uploadedFile: File | null;
   analyser: AnalyserNode | null;
   animationId: number | null;
 }
@@ -23,6 +24,7 @@ const state: RecordingState = {
   timerInterval: null,
   audioBlob: null,
   audioBlobUrl: null,
+  uploadedFile: null,
   analyser: null,
   animationId: null,
 };
@@ -44,6 +46,8 @@ function stopAll(): void {
     URL.revokeObjectURL(state.audioBlobUrl);
     state.audioBlobUrl = null;
   }
+  state.audioBlob = null;
+  state.uploadedFile = null;
 }
 
 function drawWaveform(canvas: HTMLCanvasElement, analyser: AnalyserNode): void {
@@ -81,6 +85,37 @@ function drawWaveform(canvas: HTMLCanvasElement, analyser: AnalyserNode): void {
   }
 
   draw();
+}
+
+/** 從 AudioBuffer 降採樣後繪製靜態波形 */
+function drawStaticWaveform(canvas: HTMLCanvasElement, audioBuffer: AudioBuffer): void {
+  const ctxOrNull = canvas.getContext('2d');
+  if (!ctxOrNull) return;
+  const ctx = ctxOrNull;
+
+  const channelData = audioBuffer.getChannelData(0);
+  const step = Math.ceil(channelData.length / canvas.width);
+
+  ctx.fillStyle = '#0f1117';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = '#6366f1';
+  ctx.beginPath();
+
+  for (let i = 0; i < canvas.width; i++) {
+    let max = 0;
+    for (let j = 0; j < step; j++) {
+      const sample = channelData[i * step + j] ?? 0;
+      if (Math.abs(sample) > max) max = Math.abs(sample);
+    }
+    const y = ((1 - max) * canvas.height) / 2;
+    if (i === 0) {
+      ctx.moveTo(i, y);
+    } else {
+      ctx.lineTo(i, y);
+    }
+  }
+  ctx.stroke();
 }
 
 export async function renderRecordPage(container: HTMLElement): Promise<void> {
@@ -299,26 +334,77 @@ export async function renderRecordPage(container: HTMLElement): Promise<void> {
       showToast('尚無錄音檔案', 'warning');
       return;
     }
-    const elapsed = Math.floor((Date.now() - state.startTime) / 1000);
+
+    saveBtn.disabled = true;
+    saveBtn.textContent = '儲存中…';
+
     try {
-      await saveRecording(meetingId, state.audioBlobUrl, elapsed > 0 ? elapsed : null);
-      showToast('錄音已儲存，請前往會議詳情確認', 'success');
+      // 計算時長：錄音模式有 startTime，上傳模式取 null
+      const durationSeconds =
+        state.audioBlob && state.startTime > 0
+          ? Math.floor((Date.now() - state.startTime) / 1000)
+          : null;
+
+      // 取得副檔名
+      const ext = state.uploadedFile
+        ? (state.uploadedFile.name.split('.').pop() ?? 'webm')
+        : 'webm';
+      const fileName = `${meetingId}_${Date.now()}.${ext}`;
+
+      // 讀取音訊位元組
+      const response = await fetch(state.audioBlobUrl);
+      const buffer = await response.arrayBuffer();
+      const fileData = Array.from(new Uint8Array(buffer));
+
+      await writeRecordingFile(meetingId, fileData, fileName, durationSeconds);
+      showToast('錄音已儲存', 'success');
       window.location.hash = `#meeting/${meetingId}`;
     } catch (err) {
       showToast(`儲存失敗：${String(err)}`, 'error');
+      saveBtn.disabled = false;
+      saveBtn.textContent = '儲存錄音';
     }
   });
 
   // 上傳音訊
   uploadBtn.addEventListener('click', () => fileInput.click());
 
-  fileInput.addEventListener('change', () => {
+  fileInput.addEventListener('change', async () => {
     const file = fileInput.files?.[0];
     if (!file) return;
+
     if (state.audioBlobUrl) URL.revokeObjectURL(state.audioBlobUrl);
     state.audioBlobUrl = URL.createObjectURL(file);
+    state.uploadedFile = file;
+    state.audioBlob = null;
+    state.startTime = 0;
+
     audioPlayer.src = state.audioBlobUrl;
     playerSection.classList.remove('hidden');
+    playerTitle.textContent = '已載入音訊，請確認後儲存：';
+
+    // 停止錄音動態波形
+    if (state.animationId !== null) {
+      cancelAnimationFrame(state.animationId);
+      state.animationId = null;
+    }
+
+    // 繪製靜態波形
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const audioCtx = new AudioContext();
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+      drawStaticWaveform(canvas, audioBuffer);
+      await audioCtx.close();
+    } catch {
+      // 解碼失敗時清空 canvas（不影響儲存功能）
+      const c = canvas.getContext('2d');
+      if (c) {
+        c.fillStyle = '#0f1117';
+        c.fillRect(0, 0, canvas.width, canvas.height);
+      }
+    }
+
     showToast('音訊已載入', 'success');
   });
 }
