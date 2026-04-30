@@ -3,7 +3,8 @@ export interface ModalOptions {
   content: string | HTMLElement;
   confirmText?: string;
   cancelText?: string;
-  onConfirm?: () => void | Promise<void>;
+  /** 回傳 false 可阻止 modal 關閉（用於驗證失敗） */
+  onConfirm?: () => boolean | void | Promise<boolean | void>;
   onCancel?: () => void;
 }
 
@@ -64,7 +65,11 @@ export function openModal(options: ModalOptions): void {
     confirmBtn.textContent = options.confirmText || '確認';
     confirmBtn.addEventListener('click', async () => {
       confirmBtn.disabled = true;
-      await options.onConfirm?.();
+      const result = await options.onConfirm?.();
+      if (result === false) {
+        confirmBtn.disabled = false;
+        return;
+      }
       closeModal();
     });
     footer.appendChild(confirmBtn);

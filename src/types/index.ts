@@ -1,55 +1,56 @@
 export interface Category {
   id: string;
   name: string;
-  createdAt: string;
+  created_at: string;
 }
 
 export interface Meeting {
   id: string;
   title: string;
-  categoryId: string | null;
-  createdAt: string;
-  updatedAt: string;
+  category_id: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface MeetingWithDetails {
   id: string;
   title: string;
-  categoryId: string | null;
-  categoryName: string | null;
+  category_id: string | null;
+  category_name: string | null;
   participants: string[];
-  hasTranscript: boolean;
-  hasSummary: boolean;
-  createdAt: string;
-  updatedAt: string;
+  has_transcript: boolean;
+  has_summary: boolean;
+  tags: Tag[];
+  created_at: string;
+  updated_at: string;
 }
 
 export interface Transcript {
   id: string;
-  meetingId: string;
-  originalContent: string | null;
-  proofreadContent: string | null;
-  activeVersion: 'original' | 'proofread';
-  proofreadProvider: string | null;
-  proofreadAt: string | null;
-  createdAt: string;
-  updatedAt: string;
+  meeting_id: string;
+  original_content: string | null;
+  proofread_content: string | null;
+  active_version: 'original' | 'proofread';
+  proofread_provider: string | null;
+  proofread_at: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface Summary {
   id: string;
-  meetingId: string;
+  meeting_id: string;
   content: string;
   provider: string | null;
-  createdAt: string;
+  created_at: string;
 }
 
 export interface Recording {
   id: string;
-  meetingId: string;
-  filePath: string | null;
-  durationSeconds: number | null;
-  createdAt: string;
+  meeting_id: string;
+  file_path: string | null;
+  duration_seconds: number | null;
+  created_at: string;
 }
 
 export interface AppConfig {
@@ -57,6 +58,8 @@ export interface AppConfig {
   asr_provider: 'assemblyai' | 'local';
   assembly_ai_key: string;
   local_asr_model: 'tiny' | 'base' | 'small' | 'medium' | 'large';
+  asr_language: string;       // "zh" | "en" | "auto"
+  speaker_detection: boolean; // 說話人偵測
 
   // LLM
   llm_provider: 'openai' | 'claude' | 'gemini' | 'openrouter' | 'ollama' | 'custom';
@@ -75,14 +78,46 @@ export interface AppConfig {
   custom_model: string;
 }
 
+export interface SavedParticipant {
+  id: string;
+  name: string;
+  usage_count: number;
+  created_at: string;
+}
+
+export interface MeetingTemplate {
+  id: string;
+  name: string;
+  title: string;
+  category_id: string | null;
+  participants: string[];
+  created_at: string;
+}
+
+export interface CreateTemplateRequest {
+  name: string;
+  title: string;
+  category_id: string | null;
+  participants: string[];
+}
+
 export interface CreateMeetingRequest {
   title: string;
-  categoryId: string | null;
+  category_id: string | null;
   participants: string[];
+  tag_ids?: string[];
 }
 
 export interface UpdateMeetingRequest {
   title: string;
-  categoryId: string | null;
+  category_id: string | null;
   participants: string[];
+  tag_ids?: string[];
+}
+
+export interface Tag {
+  id: string;
+  name: string;
+  color: string;
+  created_at: string;
 }

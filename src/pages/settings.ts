@@ -79,6 +79,8 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
       asr_provider: updated.asr_provider,
       assembly_ai_key: updated.assembly_ai_key,
       local_asr_model: updated.local_asr_model,
+      asr_language: updated.asr_language,
+      speaker_detection: updated.speaker_detection,
     };
   });
   form.appendChild(asrSection);
@@ -219,6 +221,51 @@ function buildAsrSection(
   };
   detectBtn.addEventListener('click', () => void runDetect());
   void runDetect();
+
+  // 語言設定（共用）
+  section.appendChild(
+    buildSelectGroup(
+      '轉錄語言',
+      [
+        { value: 'zh', label: '中文（繁體/簡體）' },
+        { value: 'en', label: '英文' },
+        { value: 'ja', label: '日文' },
+        { value: 'ko', label: '韓文' },
+        { value: 'auto', label: '自動偵測' },
+      ],
+      config.asr_language || 'zh',
+      (v) => {
+        config = { ...config, asr_language: v };
+        onChange(config);
+      }
+    )
+  );
+
+  // 說話人偵測（僅 AssemblyAI 支援）
+  const speakerGroup = document.createElement('div');
+  speakerGroup.className = 'form-group';
+  const speakerLabel = document.createElement('label');
+  speakerLabel.textContent = '說話人偵測（AssemblyAI）';
+  const speakerToggle = document.createElement('label');
+  speakerToggle.className = 'toggle-switch';
+  const speakerInput = document.createElement('input');
+  speakerInput.type = 'checkbox';
+  speakerInput.checked = config.speaker_detection !== false;
+  speakerInput.addEventListener('change', () => {
+    config = { ...config, speaker_detection: speakerInput.checked };
+    onChange(config);
+  });
+  const speakerSlider = document.createElement('span');
+  speakerSlider.className = 'toggle-slider';
+  speakerToggle.appendChild(speakerInput);
+  speakerToggle.appendChild(speakerSlider);
+  const speakerHint = document.createElement('small');
+  speakerHint.className = 'form-hint';
+  speakerHint.textContent = '啟用後逐字稿將包含時間軸與講者標籤';
+  speakerGroup.appendChild(speakerLabel);
+  speakerGroup.appendChild(speakerToggle);
+  speakerGroup.appendChild(speakerHint);
+  section.appendChild(speakerGroup);
 
   // 可見性控制
   const updateAsrVisibility = (provider: string): void => {

@@ -13,6 +13,8 @@ use commands::{
     recording_cmds::*,
     settings_cmds::*,
     summary_cmds::*,
+    tag_cmds::*,
+    template_cmds::*,
     transcript_cmds::*,
 };
 
@@ -66,6 +68,18 @@ pub fn run() {
             // asr
             detect_local_asr_tools,
             start_transcription,
+            // templates & saved participants
+            get_saved_participants,
+            upsert_saved_participant,
+            delete_saved_participant,
+            get_meeting_templates,
+            create_meeting_template,
+            delete_meeting_template,
+            // tags
+            get_tags,
+            create_tag,
+            delete_tag,
+            set_meeting_tags,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

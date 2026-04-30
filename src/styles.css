@@ -195,6 +195,38 @@ input, select, textarea { font-family: inherit; font-size: inherit; }
    ============================================================ */
 .form-group { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
 .form-group label { font-size: 13px; color: var(--color-text-secondary); font-weight: 500; }
+.form-hint { font-size: 11px; color: var(--color-text-muted); }
+
+/* Toggle switch */
+.toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 40px;
+  height: 22px;
+  cursor: pointer;
+}
+.toggle-switch input { opacity: 0; width: 0; height: 0; }
+.toggle-slider {
+  position: absolute;
+  inset: 0;
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border);
+  border-radius: 22px;
+  transition: background var(--transition);
+}
+.toggle-slider::before {
+  content: '';
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--color-text-muted);
+  top: 2px;
+  left: 2px;
+  transition: transform var(--transition), background var(--transition);
+}
+.toggle-switch input:checked + .toggle-slider { background: var(--color-accent); border-color: var(--color-accent); }
+.toggle-switch input:checked + .toggle-slider::before { transform: translateX(18px); background: #fff; }
 
 .form-control {
   padding: 8px 12px;
@@ -511,13 +543,40 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
   border: 1px solid var(--color-border);
   border-radius: var(--radius);
   padding: 14px;
-  max-height: 300px;
+  max-height: 360px;
   overflow-y: auto;
-  white-space: pre-wrap;
   font-size: 14px;
   line-height: 1.8;
   color: var(--color-text);
 }
+/* 帶時間軸的逐字稿行 */
+.transcript-row {
+  display: flex;
+  gap: 10px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--color-border-subtle, rgba(255,255,255,0.04));
+  line-height: 1.6;
+}
+.transcript-row:last-child { border-bottom: none; }
+.transcript-time {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: #6366f1;
+  font-variant-numeric: tabular-nums;
+  padding-top: 2px;
+  cursor: pointer;
+}
+.transcript-text { flex: 1; }
+.transcript-speaker {
+  font-weight: 600;
+  margin-right: 4px;
+}
+/* 各講者顏色 */
+.speaker-A { color: #6366f1; }
+.speaker-B { color: #22c55e; }
+.speaker-C { color: #f59e0b; }
+.speaker-D { color: #ec4899; }
+.speaker-E { color: #14b8a6; }
 
 /* 摘要 Markdown */
 .markdown-body { line-height: 1.7; }
@@ -571,6 +630,7 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
 
 .record-player { margin-top: 16px; }
 .record-player.hidden { display: none; }
+.record-player .btn-primary { margin-top: 14px; }
 .hidden { display: none !important; }
 
 .player-hint {
@@ -586,9 +646,19 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
   gap: 10px;
   background: var(--color-surface);
   border: 1px solid var(--color-border);
-  border-radius: 50px;
-  padding: 8px 16px;
+  border-radius: 14px;
+  padding: 10px 14px;
   margin-top: 8px;
+}
+
+.player-waveform {
+  flex: 1;
+  display: block;
+  height: 56px;
+  cursor: pointer;
+  border-radius: 6px;
+  overflow: hidden;
+  min-width: 0;
 }
 
 .player-play-btn {
@@ -631,40 +701,6 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
   min-width: 38px;
   font-variant-numeric: tabular-nums;
 }
-
-.player-progress {
-  flex: 1;
-  height: 4px;
-  background: var(--color-border);
-  border-radius: 4px;
-  cursor: pointer;
-  position: relative;
-  transition: height 0.15s;
-}
-.player-progress:hover { height: 6px; }
-
-.player-progress-fill {
-  height: 100%;
-  background: var(--color-accent);
-  border-radius: 4px;
-  width: 0%;
-  position: relative;
-  pointer-events: none;
-}
-.player-progress-fill::after {
-  content: '';
-  position: absolute;
-  right: -5px;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 12px;
-  height: 12px;
-  background: var(--color-accent);
-  border-radius: 50%;
-  opacity: 0;
-  transition: opacity 0.15s;
-}
-.player-progress:hover .player-progress-fill::after { opacity: 1; }
 
 /* ============================================================
    設定頁
@@ -756,3 +792,268 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--color-text-muted); }
+
+/* ============================================================
+   參與者編輯器
+   ============================================================ */
+.participant-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.participant-editor-header label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+}
+
+.participant-select-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.participant-select-row .form-control {
+  flex: 1;
+}
+
+.participant-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.participant-list-item {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.participant-list-item .participant-input {
+  flex: 1;
+}
+
+.btn-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-error);
+  cursor: pointer;
+  transition: background var(--transition);
+  flex-shrink: 0;
+}
+
+.btn-icon:hover {
+  background: rgba(239, 68, 68, 0.12);
+}
+
+.participant-add-btn {
+  align-self: flex-start;
+  color: var(--color-accent);
+  font-size: 13px;
+  padding: 4px 8px;
+}
+
+.participant-add-btn:hover {
+  background: var(--color-accent-light);
+  color: var(--color-accent);
+}
+
+/* ============================================================
+   範本選擇列 / 儲存為範本
+   ============================================================ */
+.template-select-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.template-select-row .form-control {
+  flex: 1;
+}
+
+.save-as-template-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.save-as-template-row input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--color-accent);
+  cursor: pointer;
+}
+
+.save-as-template-row label {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+
+.save-as-template-row .form-control {
+  flex: 1;
+  min-width: 140px;
+}
+
+/* ============================================================
+   標籤（Tags）系統
+   ============================================================ */
+
+/* 卡片上的 tag chip */
+.meeting-card-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.tag-chip {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+  cursor: pointer;
+  transition: opacity var(--transition);
+  user-select: none;
+}
+
+.tag-chip:hover { opacity: 0.8; }
+
+/* 首頁標籤篩選列 */
+.tag-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.tag-filter-chip {
+  padding: 3px 12px;
+  border-radius: 14px;
+  border: 1px solid var(--color-border);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.tag-filter-chip.active {
+  background: var(--tag-color, var(--color-accent));
+  border-color: transparent;
+  color: #fff;
+  font-weight: 600;
+}
+
+.tag-filter-chip:hover:not(.active) {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+
+.tag-manage-btn {
+  margin-left: auto;
+}
+
+/* 標籤管理器 modal */
+.tag-manager {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.tag-manager-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.tag-manager-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-secondary);
+}
+
+.tag-swatch {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.tag-manager-add-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-border);
+}
+
+.tag-manager-add-row .form-control {
+  width: 100%;
+}
+
+/* 顏色選擇器 */
+.tag-color-picker {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.color-dot {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  cursor: pointer;
+  transition: transform var(--transition), border-color var(--transition);
+}
+
+.color-dot.selected {
+  border-color: var(--color-text);
+  transform: scale(1.2);
+}
+
+/* 編輯 modal 內的標籤 checkbox 列表 */
+.tag-checkbox-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.tag-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.tag-checkbox-row input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--color-accent);
+  cursor: pointer;
+}
+

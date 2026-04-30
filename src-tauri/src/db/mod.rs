@@ -4,10 +4,13 @@ use tauri::AppHandle;
 
 pub mod category;
 pub mod meeting;
+pub mod meeting_template;
 pub mod models;
 pub mod participant;
 pub mod recording;
+pub mod saved_participant;
 pub mod summary;
+pub mod tag;
 pub mod transcript;
 
 const MIGRATION_SQL: &str = r#"
@@ -62,6 +65,38 @@ CREATE TABLE IF NOT EXISTS recordings (
     duration_seconds INTEGER,
     created_at TEXT NOT NULL,
     FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS saved_participants (
+    id TEXT PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL,
+    usage_count INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS meeting_templates (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    title TEXT NOT NULL,
+    category_id TEXT,
+    participants_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS tags (
+    id TEXT PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL,
+    color TEXT NOT NULL DEFAULT '#6366f1',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS meeting_tags (
+    meeting_id TEXT NOT NULL,
+    tag_id TEXT NOT NULL,
+    PRIMARY KEY (meeting_id, tag_id),
+    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE,
+    FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
 );
 "#;
 

@@ -4,4 +4,6 @@ pub mod meeting_cmds;
 pub mod recording_cmds;
 pub mod settings_cmds;
 pub mod summary_cmds;
+pub mod tag_cmds;
+pub mod template_cmds;
 pub mod transcript_cmds;

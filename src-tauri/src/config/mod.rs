@@ -9,6 +9,8 @@ pub struct AppConfig {
     pub asr_provider: String,
     pub assembly_ai_key: String,
     pub local_asr_model: String, // "tiny" | "base" | "small" | "medium" | "large"
+    pub asr_language: String,    // "zh" | "en" | "auto"
+    pub speaker_detection: bool, // 是否啟用說話人偵測
 
     // LLM 供應商："openai" | "claude" | "gemini" | "openrouter" | "ollama" | "custom"
     pub llm_provider: String,
@@ -33,6 +35,8 @@ impl Default for AppConfig {
             asr_provider: "assemblyai".into(),
             assembly_ai_key: String::new(),
             local_asr_model: "base".into(),
+            asr_language: "zh".into(),
+            speaker_detection: true,
             llm_provider: "openai".into(),
             openai_key: String::new(),
             openai_model: "gpt-4.1-mini".into(),

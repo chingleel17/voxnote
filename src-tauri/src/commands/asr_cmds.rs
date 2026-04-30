@@ -33,13 +33,19 @@ pub async fn start_transcription(
 
     let text = match config.asr_provider.as_str() {
         "assemblyai" => {
-            transcribe_assemblyai(&config.assembly_ai_key, &file_path, emit_progress)
-                .await
-                .map_err(|e| e.to_string())?
+            transcribe_assemblyai(
+                &config.assembly_ai_key,
+                &file_path,
+                &config.asr_language,
+                config.speaker_detection,
+                emit_progress,
+            )
+            .await
+            .map_err(|e| e.to_string())?
         }
         "local" => {
             emit_progress("啟動本地 Whisper...".into());
-            transcribe_local_whisper("whisper", &config.local_asr_model, &file_path)
+            transcribe_local_whisper("whisper", &config.local_asr_model, &file_path, &config.asr_language)
                 .await
                 .map_err(|e| e.to_string())?
         }

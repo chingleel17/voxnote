@@ -45,6 +45,8 @@ fn probe_command(name: &str) -> Option<LocalAsrInfo> {
 pub async fn transcribe_assemblyai(
     api_key: &str,
     file_path: &str,
+    language: &str,
+    speaker_detection: bool,
     progress_cb: impl Fn(String),
 ) -> Result<String> {
     if api_key.is_empty() {
@@ -77,10 +79,18 @@ pub async fn transcribe_assemblyai(
 
     // 2. 建立轉錄任務
     progress_cb("建立轉錄任務...".into());
+    let mut req_body = json!({ "audio_url": upload_url });
+    if !language.is_empty() && language != "auto" {
+        req_body["language_code"] = json!(language);
+    }
+    if speaker_detection {
+        req_body["speaker_labels"] = json!(true);
+    }
+
     let task_resp = client
         .post("https://api.assemblyai.com/v2/transcript")
         .header("authorization", api_key)
-        .json(&json!({ "audio_url": upload_url }))
+        .json(&req_body)
         .send()
         .await?;
 
@@ -111,11 +121,30 @@ pub async fn transcribe_assemblyai(
 
         match status {
             "completed" => {
+                progress_cb("轉錄完成".into());
+                // 若有說話人偵測，使用 utterances 格式
+                if speaker_detection {
+                    if let Some(utterances) = poll_json["utterances"].as_array() {
+                        if !utterances.is_empty() {
+                            let lines: Vec<String> = utterances
+                                .iter()
+                                .map(|u| {
+                                    let start_ms = u["start"].as_u64().unwrap_or(0);
+                                    let speaker = u["speaker"].as_str().unwrap_or("?");
+                                    let text = u["text"].as_str().unwrap_or("");
+                                    let mm = start_ms / 60000;
+                                    let ss = (start_ms % 60000) / 1000;
+                                    format!("[{:02}:{:02} 講者{}] {}", mm, ss, speaker, text)
+                                })
+                                .collect();
+                            return Ok(lines.join("\n"));
+                        }
+                    }
+                }
                 let text = poll_json["text"]
                     .as_str()
                     .ok_or_else(|| anyhow!("轉錄結果為空"))?
                     .to_string();
-                progress_cb("轉錄完成".into());
                 return Ok(text);
             }
             "error" => {
@@ -134,12 +163,20 @@ pub async fn transcribe_local_whisper(
     engine: &str,
     model: &str,
     file_path: &str,
+    language: &str,
 ) -> Result<String> {
     let engine = if engine.is_empty() { "whisper" } else { engine };
     let model = if model.is_empty() { "base" } else { model };
 
+    let mut args = vec![file_path, "--model", model];
+    let lang_str: String;
+    if !language.is_empty() && language != "auto" {
+        lang_str = language.to_string();
+        args.extend(["--language", &lang_str]);
+    }
+
     let output = tokio::process::Command::new(engine)
-        .args([file_path, "--model", model, "--output_format", "txt", "--output_dir", "/tmp"])
+        .args(&args)
         .output()
         .await?;
 
@@ -148,17 +185,58 @@ pub async fn transcribe_local_whisper(
         return Err(anyhow!("Whisper 執行失敗：{}", stderr));
     }
 
-    // Whisper 輸出 txt 檔案，但也會在 stdout 輸出文字
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     if stdout.trim().is_empty() {
         return Err(anyhow!("Whisper 未產生輸出，請確認音訊檔案有效"));
     }
 
-    // 過濾掉時間戳行（[00:00.000 --> 00:01.000]）
-    let text: Vec<&str> = stdout
-        .lines()
-        .filter(|l| !l.trim_start().starts_with('['))
-        .collect();
+    // 解析 Whisper 輸出，保留時間戳格式：[MM:SS] text
+    Ok(parse_whisper_stdout(&stdout))
+}
 
-    Ok(text.join("\n").trim().to_string())
+fn parse_whisper_stdout(stdout: &str) -> String {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            // Whisper 輸出格式：[00:00.000 --> 00:03.000]  text
+            if line.starts_with('[') {
+                if let Some(rest) = line.strip_prefix('[') {
+                    if let Some(bracket_end) = rest.find(']') {
+                        let timestamp = &rest[..bracket_end];
+                        let start_part = timestamp.split(" --> ").next().unwrap_or("").trim();
+                        let formatted = format_whisper_timestamp(start_part);
+                        let text = rest[bracket_end + 1..].trim();
+                        if !text.is_empty() {
+                            return Some(format!("[{}] {}", formatted, text));
+                        }
+                    }
+                }
+                None
+            } else if !line.is_empty() {
+                Some(line.to_string())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_whisper_timestamp(ts: &str) -> String {
+    // "00:00.000" 或 "01:23.456" 或 "01:23:45.678"
+    let parts: Vec<&str> = ts.split(':').collect();
+    match parts.len() {
+        2 => {
+            let mm: u64 = parts[0].parse().unwrap_or(0);
+            let ss: f64 = parts[1].parse().unwrap_or(0.0);
+            format!("{:02}:{:02}", mm, ss as u64)
+        }
+        3 => {
+            let hh: u64 = parts[0].parse().unwrap_or(0);
+            let mm: u64 = parts[1].parse().unwrap_or(0);
+            format!("{:02}:{:02}", hh * 60 + mm, 0u64)
+        }
+        _ => ts.to_string(),
+    }
 }

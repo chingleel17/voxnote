@@ -23,17 +23,15 @@ pub async fn upsert_transcript_original(
     let now = Utc::now().to_rfc3339();
     let existing = get_transcript(pool, meeting_id).await?;
 
-    if let Some(existing) = existing {
-        if existing.original_content.is_none() {
-            sqlx::query(
-                "UPDATE transcripts SET original_content = ?, updated_at = ? WHERE meeting_id = ?",
-            )
-            .bind(content)
-            .bind(&now)
-            .bind(meeting_id)
-            .execute(pool)
-            .await?;
-        }
+    if existing.is_some() {
+        sqlx::query(
+            "UPDATE transcripts SET original_content = ?, updated_at = ? WHERE meeting_id = ?",
+        )
+        .bind(content)
+        .bind(&now)
+        .bind(meeting_id)
+        .execute(pool)
+        .await?;
     } else {
         let id = Uuid::new_v4().to_string();
         sqlx::query(

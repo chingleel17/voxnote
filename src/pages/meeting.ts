@@ -1,10 +1,17 @@
-import type { MeetingWithDetails, Transcript, Summary, Recording } from '../types';
+import type { MeetingWithDetails, Transcript, Summary, Recording, SavedParticipant, CreateTemplateRequest, Tag } from '../types';
 import { getMeeting, updateMeeting } from '../api/meetings';
 import { getTranscript, switchTranscriptVersion } from '../api/transcripts';
 import { getSummary } from '../api/summaries';
 import { getRecording } from '../api/recordings';
+import { startTranscription } from '../api/settings';
+import { getSavedParticipants, upsertSavedParticipant } from '../api/participants';
+import { createTemplate } from '../api/templates';
+import { getTags } from '../api/tags';
 import { openModal } from '../components/modal';
 import { showToast } from '../components/toast';
+import { createWaveformPlayer } from '../components/audioPlayer';
+import { buildParticipantEditor } from '../components/participantEditor';
+import { convertFileSrc } from '@tauri-apps/api/core';
 
 /** 簡易 Markdown → HTML 轉換（僅支援 h1-h3、粗體、清單） */
 function renderMarkdown(md: string): string {
@@ -25,7 +32,8 @@ function renderMarkdown(md: string): string {
 function buildTranscriptSection(
   transcript: Transcript | null,
   meetingId: string,
-  onRefresh: () => void
+  onRefresh: () => void,
+  recording: Recording | null = null
 ): HTMLElement {
   const section = document.createElement('section');
   section.className = 'detail-section';
@@ -37,11 +45,34 @@ function buildTranscriptSection(
   header.appendChild(heading);
   section.appendChild(header);
 
-  if (!transcript || (!transcript.originalContent && !transcript.proofreadContent)) {
+  if (!transcript || (!transcript.original_content && !transcript.proofread_content)) {
     const empty = document.createElement('p');
     empty.className = 'empty-hint';
-    empty.textContent = '尚無逐字稿，請先完成錄音並轉譯。';
+    empty.textContent = recording?.file_path
+      ? '尚無逐字稿，點擊下方按鈕開始轉譯錄音。'
+      : '尚無逐字稿，請先完成錄音並轉譯。';
     section.appendChild(empty);
+
+    if (recording?.file_path) {
+      const filePath = recording.file_path;
+      const transcribeBtn = document.createElement('button');
+      transcribeBtn.className = 'btn btn-primary btn-sm';
+      transcribeBtn.textContent = '產生逐字稿';
+      transcribeBtn.addEventListener('click', async () => {
+        transcribeBtn.disabled = true;
+        transcribeBtn.textContent = '轉譯中…';
+        try {
+          await startTranscription(meetingId, filePath);
+          showToast('逐字稿已生成', 'success');
+          onRefresh();
+        } catch (err) {
+          showToast(`轉譯失敗：${String(err)}`, 'error');
+          transcribeBtn.disabled = false;
+          transcribeBtn.textContent = '產生逐字稿';
+        }
+      });
+      section.appendChild(transcribeBtn);
+    }
     return section;
   }
 
@@ -50,13 +81,13 @@ function buildTranscriptSection(
   tabs.className = 'version-tabs';
 
   const originalBtn = document.createElement('button');
-  originalBtn.className = `tab-btn${transcript.activeVersion === 'original' ? ' active' : ''}`;
+  originalBtn.className = `tab-btn${transcript.active_version === 'original' ? ' active' : ''}`;
   originalBtn.textContent = '原始版';
 
   const proofreadBtn = document.createElement('button');
-  proofreadBtn.className = `tab-btn${transcript.activeVersion === 'proofread' ? ' active' : ''}`;
+  proofreadBtn.className = `tab-btn${transcript.active_version === 'proofread' ? ' active' : ''}`;
   proofreadBtn.textContent = '校稿版';
-  if (!transcript.proofreadContent) {
+  if (!transcript.proofread_content) {
     proofreadBtn.disabled = true;
     proofreadBtn.title = '尚未校稿';
   }
@@ -69,14 +100,58 @@ function buildTranscriptSection(
   const content = document.createElement('div');
   content.className = 'transcript-content';
 
+  function renderTranscriptText(text: string): void {
+    content.innerHTML = '';
+    // 偵測是否有時間軸格式：[MM:SS 講者X] 或 [MM:SS]
+    const utteranceRe = /^\[(\d{2}:\d{2})(?:\s+(講者\w+))?\]\s+(.*)$/;
+    const lines = text.split('\n');
+    const hasTimestamps = lines.some((l) => utteranceRe.test(l.trim()));
+
+    if (hasTimestamps) {
+      for (const line of lines) {
+        const m = line.trim().match(utteranceRe);
+        if (m) {
+          const [, time, speaker, body] = m;
+          const row = document.createElement('div');
+          row.className = 'transcript-row';
+
+          const timeEl = document.createElement('span');
+          timeEl.className = 'transcript-time';
+          timeEl.textContent = time;
+
+          const textEl = document.createElement('span');
+          textEl.className = 'transcript-text';
+          if (speaker) {
+            const speakerEl = document.createElement('span');
+            speakerEl.className = `transcript-speaker speaker-${speaker.replace('講者', '')}`;
+            speakerEl.textContent = speaker + '：';
+            textEl.appendChild(speakerEl);
+            textEl.appendChild(document.createTextNode(body));
+          } else {
+            textEl.textContent = body;
+          }
+          row.appendChild(timeEl);
+          row.appendChild(textEl);
+          content.appendChild(row);
+        } else if (line.trim()) {
+          const p = document.createElement('p');
+          p.textContent = line;
+          content.appendChild(p);
+        }
+      }
+    } else {
+      content.textContent = text;
+    }
+  }
+
   function showVersion(version: 'original' | 'proofread'): void {
-    const text = version === 'original' ? transcript?.originalContent : transcript?.proofreadContent;
-    content.textContent = text ?? '';
+    const text = version === 'original' ? transcript?.original_content : transcript?.proofread_content;
+    renderTranscriptText(text ?? '');
     originalBtn.classList.toggle('active', version === 'original');
     proofreadBtn.classList.toggle('active', version === 'proofread');
   }
 
-  showVersion(transcript.activeVersion);
+  showVersion(transcript.active_version);
 
   originalBtn.addEventListener('click', async () => {
     try {
@@ -88,7 +163,7 @@ function buildTranscriptSection(
   });
 
   proofreadBtn.addEventListener('click', async () => {
-    if (!transcript.proofreadContent) return;
+    if (!transcript.proofread_content) return;
     try {
       await switchTranscriptVersion(meetingId, 'proofread');
       showVersion('proofread');
@@ -116,12 +191,17 @@ function buildTranscriptSection(
   exportBtn.className = 'btn btn-secondary btn-sm';
   exportBtn.textContent = '匯出 TXT';
   exportBtn.addEventListener('click', () => {
-    const blob = new Blob([content.textContent ?? ''], { type: 'text/plain;charset=utf-8' });
+    const text = transcript.active_version === 'original'
+      ? (transcript.original_content ?? '')
+      : (transcript.proofread_content ?? transcript.original_content ?? '');
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
     a.download = 'transcript.txt';
+    document.body.appendChild(a);
     a.click();
+    document.body.removeChild(a);
     URL.revokeObjectURL(url);
   });
 
@@ -134,6 +214,30 @@ function buildTranscriptSection(
   });
 
   actions.appendChild(proofreadActionBtn);
+
+  // 重新生成按鈕（需要有錄音檔才能重新轉譯）
+  if (recording?.file_path) {
+    const filePath = recording.file_path;
+    const regenBtn = document.createElement('button');
+    regenBtn.className = 'btn btn-secondary btn-sm';
+    regenBtn.textContent = '重新生成';
+    regenBtn.addEventListener('click', async () => {
+      if (!confirm('確定要重新生成逐字稿嗎？原始版本將被覆蓋。')) return;
+      regenBtn.disabled = true;
+      regenBtn.textContent = '轉譯中…';
+      try {
+        await startTranscription(meetingId, filePath);
+        showToast('逐字稿已重新生成', 'success');
+        onRefresh();
+      } catch (err) {
+        showToast(`轉譯失敗：${String(err)}`, 'error');
+        regenBtn.disabled = false;
+        regenBtn.textContent = '重新生成';
+      }
+    });
+    actions.appendChild(regenBtn);
+  }
+
   actions.appendChild(copyBtn);
   actions.appendChild(exportBtn);
   section.appendChild(actions);
@@ -219,7 +323,7 @@ function buildRecordingSection(recording: Recording | null): HTMLElement {
   header.appendChild(heading);
   section.appendChild(header);
 
-  if (!recording || !recording.filePath) {
+  if (!recording || !recording.file_path) {
     const hint = document.createElement('p');
     hint.className = 'empty-hint';
     hint.textContent = '尚無錄音檔案。';
@@ -233,23 +337,25 @@ function buildRecordingSection(recording: Recording | null): HTMLElement {
     });
     section.appendChild(goBtn);
   } else {
-    const audio = document.createElement('audio');
-    audio.controls = true;
-    audio.className = 'audio-player';
-    // filePath 可能是本地路徑或 blob URL
-    audio.src = recording.filePath.startsWith('blob:')
-      ? recording.filePath
-      : `asset://${recording.filePath}`;
-
-    if (recording.durationSeconds !== null) {
+    if (recording.duration_seconds !== null) {
       const dur = document.createElement('p');
       dur.className = 'audio-duration';
-      const minutes = Math.floor(recording.durationSeconds / 60);
-      const seconds = recording.durationSeconds % 60;
+      const minutes = Math.floor(recording.duration_seconds / 60);
+      const seconds = recording.duration_seconds % 60;
       dur.textContent = `時長：${minutes}:${String(seconds).padStart(2, '0')}`;
       section.appendChild(dur);
     }
-    section.appendChild(audio);
+
+    const audioEl = document.createElement('audio');
+    audioEl.preload = 'metadata';
+    audioEl.style.display = 'none';
+    audioEl.src = recording.file_path.startsWith('blob:')
+      ? recording.file_path
+      : convertFileSrc(recording.file_path);
+
+    const playerEl = createWaveformPlayer(audioEl);
+    section.appendChild(audioEl);
+    section.appendChild(playerEl);
   }
 
   return section;
@@ -262,13 +368,17 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
   let transcript: Transcript | null = null;
   let summary: Summary | null = null;
   let recording: Recording | null = null;
+  let savedParticipants: SavedParticipant[] = [];
+  let allTags: Tag[] = [];
 
   try {
-    [meeting, transcript, summary, recording] = await Promise.all([
+    [meeting, transcript, summary, recording, savedParticipants, allTags] = await Promise.all([
       getMeeting(meetingId),
       getTranscript(meetingId),
       getSummary(meetingId),
       getRecording(meetingId),
+      getSavedParticipants(),
+      getTags(),
     ]);
   } catch (err) {
     container.innerHTML = `<div class="error-state">載入失敗：${String(err)}</div>`;
@@ -313,9 +423,15 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
     printBtn.textContent = '匯出 PDF';
     printBtn.addEventListener('click', () => window.print());
 
+    const saveAsTplBtn = document.createElement('button');
+    saveAsTplBtn.className = 'btn btn-ghost btn-sm';
+    saveAsTplBtn.textContent = '儲存為範本';
+    saveAsTplBtn.addEventListener('click', () => openSaveTemplateModal());
+
     topBar.appendChild(backBtn);
     topBar.appendChild(titleArea);
     topBar.appendChild(editBtn);
+    topBar.appendChild(saveAsTplBtn);
     topBar.appendChild(printBtn);
     container.appendChild(topBar);
 
@@ -336,11 +452,29 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
       container.appendChild(partSection);
     }
 
+    // 標籤顯示
+    if (meeting.tags && meeting.tags.length > 0) {
+      const tagsBar = document.createElement('div');
+      tagsBar.className = 'participants-bar';
+      const tagsLabel = document.createElement('span');
+      tagsLabel.className = 'participants-label';
+      tagsLabel.textContent = '標籤：';
+      tagsBar.appendChild(tagsLabel);
+      for (const tag of meeting.tags) {
+        const chip = document.createElement('span');
+        chip.className = 'tag-chip';
+        chip.style.backgroundColor = tag.color;
+        chip.textContent = tag.name;
+        tagsBar.appendChild(chip);
+      }
+      container.appendChild(tagsBar);
+    }
+
     // 錄音區塊
     container.appendChild(buildRecordingSection(recording));
 
     // 逐字稿區塊
-    container.appendChild(buildTranscriptSection(transcript, meetingId, () => build()));
+    container.appendChild(buildTranscriptSection(transcript, meetingId, () => build(), recording));
 
     // 摘要區塊
     container.appendChild(buildSummarySection(summary, () => build()));
@@ -363,19 +497,52 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
     titleGroup.appendChild(titleLabel);
     titleGroup.appendChild(titleInput);
 
-    const partGroup = document.createElement('div');
-    partGroup.className = 'form-group';
-    const partLabel = document.createElement('label');
-    partLabel.textContent = '參與者（以逗號分隔）';
-    const partInput = document.createElement('input');
-    partInput.type = 'text';
-    partInput.className = 'form-control';
-    partInput.value = meeting.participants.join(', ');
-    partGroup.appendChild(partLabel);
-    partGroup.appendChild(partInput);
+    // 參與者列表編輯器
+    const { el: partEditorEl, getParticipants } = buildParticipantEditor(
+      meeting.participants,
+      savedParticipants
+    );
+
+    // 標籤選擇
+    const currentTagIds = new Set(meeting.tags.map((t) => t.id));
+    let selectedTagIds: Set<string> = new Set(currentTagIds);
+    const tagGroup = document.createElement('div');
+    tagGroup.className = 'form-group';
+    const tagLabel = document.createElement('label');
+    tagLabel.textContent = '標籤';
+    tagGroup.appendChild(tagLabel);
+    if (allTags.length === 0) {
+      const hint = document.createElement('p');
+      hint.className = 'empty-hint';
+      hint.textContent = '尚無標籤，請先在首頁管理標籤。';
+      tagGroup.appendChild(hint);
+    } else {
+      const tagCheckboxes = document.createElement('div');
+      tagCheckboxes.className = 'tag-checkbox-list';
+      for (const tag of allTags) {
+        const row = document.createElement('label');
+        row.className = 'tag-checkbox-row';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = selectedTagIds.has(tag.id);
+        cb.addEventListener('change', () => {
+          if (cb.checked) selectedTagIds.add(tag.id);
+          else selectedTagIds.delete(tag.id);
+        });
+        const swatch = document.createElement('span');
+        swatch.className = 'tag-swatch';
+        swatch.style.backgroundColor = tag.color;
+        row.appendChild(cb);
+        row.appendChild(swatch);
+        row.appendChild(document.createTextNode(tag.name));
+        tagCheckboxes.appendChild(row);
+      }
+      tagGroup.appendChild(tagCheckboxes);
+    }
 
     form.appendChild(titleGroup);
-    form.appendChild(partGroup);
+    form.appendChild(partEditorEl);
+    form.appendChild(tagGroup);
 
     openModal({
       title: '編輯會議',
@@ -384,22 +551,67 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
       cancelText: '取消',
       onConfirm: async () => {
         const title = titleInput.value.trim();
-        if (!title || !meeting) return;
-        const participants = partInput.value
-          .split(',')
-          .map((s) => s.trim())
-          .filter((s) => s.length > 0);
+        if (!title || !meeting) return false;
+        const participants = getParticipants();
         try {
           const updated = await updateMeeting(meeting.id, {
             title,
-            categoryId: meeting.categoryId,
+            category_id: meeting.category_id,
             participants,
+            tag_ids: Array.from(selectedTagIds),
           });
           meeting = updated;
+          // 將參與者加入常用清單
+          await Promise.all(participants.map((name) => upsertSavedParticipant(name)));
           showToast('已儲存', 'success');
           build();
         } catch (err) {
           showToast(`儲存失敗：${String(err)}`, 'error');
+          return false;
+        }
+      },
+    });
+  }
+
+  function openSaveTemplateModal(): void {
+    if (!meeting) return;
+
+    const form = document.createElement('div');
+    form.className = 'form-group-list';
+
+    const nameGroup = document.createElement('div');
+    nameGroup.className = 'form-group';
+    const nameLabel = document.createElement('label');
+    nameLabel.textContent = '範本名稱';
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.className = 'form-control';
+    nameInput.value = meeting.title;
+    nameInput.placeholder = '請輸入範本名稱';
+    nameGroup.appendChild(nameLabel);
+    nameGroup.appendChild(nameInput);
+    form.appendChild(nameGroup);
+
+    openModal({
+      title: '儲存為範本',
+      content: form,
+      confirmText: '儲存',
+      cancelText: '取消',
+      onConfirm: async () => {
+        const name = nameInput.value.trim();
+        if (!name || !meeting) return false;
+        const req: CreateTemplateRequest = {
+          name,
+          title: meeting.title,
+          category_id: meeting.category_id,
+          participants: meeting.participants,
+        };
+        try {
+          await createTemplate(req);
+          showToast('已儲存為範本', 'success');
+        } catch (err) {
+          showToast(`儲存失敗：${String(err)}`, 'error');
+          return false;
         }
       },
     });

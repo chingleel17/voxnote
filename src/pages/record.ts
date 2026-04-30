@@ -1,7 +1,10 @@
 import type { MeetingWithDetails } from '../types';
 import { getMeetings } from '../api/meetings';
-import { writeRecordingFile } from '../api/recordings';
+import { saveRecording } from '../api/recordings';
 import { showToast } from '../components/toast';
+import { createWaveformPlayer } from '../components/audioPlayer';
+import { writeFile, mkdir, BaseDirectory } from '@tauri-apps/plugin-fs';
+import { appDataDir, join } from '@tauri-apps/api/path';
 
 interface RecordingState {
   mediaRecorder: MediaRecorder | null;
@@ -123,86 +126,6 @@ function formatTime(secs: number): string {
   const m = Math.floor(secs / 60);
   const s = Math.floor(secs % 60);
   return `${m}:${String(s).padStart(2, '0')}`;
-}
-
-const ICON_PLAY = `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>`;
-const ICON_PAUSE = `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>`;
-const ICON_VOL_ON = `<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/></svg>`;
-const ICON_VOL_OFF = `<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg>`;
-
-function buildCustomPlayer(audioEl: HTMLAudioElement): HTMLElement {
-  const playerEl = document.createElement('div');
-  playerEl.className = 'custom-player';
-
-  const playBtn = document.createElement('button');
-  playBtn.className = 'player-play-btn';
-  playBtn.innerHTML = ICON_PLAY;
-
-  const currentTimeEl = document.createElement('span');
-  currentTimeEl.className = 'player-time';
-  currentTimeEl.textContent = '0:00';
-
-  const progressBar = document.createElement('div');
-  progressBar.className = 'player-progress';
-  const progressFill = document.createElement('div');
-  progressFill.className = 'player-progress-fill';
-  progressBar.appendChild(progressFill);
-
-  const durationEl = document.createElement('span');
-  durationEl.className = 'player-time';
-  durationEl.textContent = '0:00';
-
-  const volumeBtn = document.createElement('button');
-  volumeBtn.className = 'player-volume-btn';
-  volumeBtn.innerHTML = ICON_VOL_ON;
-
-  playerEl.appendChild(playBtn);
-  playerEl.appendChild(currentTimeEl);
-  playerEl.appendChild(progressBar);
-  playerEl.appendChild(durationEl);
-  playerEl.appendChild(volumeBtn);
-
-  playBtn.addEventListener('click', () => {
-    if (audioEl.paused) void audioEl.play();
-    else audioEl.pause();
-  });
-
-  audioEl.addEventListener('play', () => { playBtn.innerHTML = ICON_PAUSE; });
-  audioEl.addEventListener('pause', () => { playBtn.innerHTML = ICON_PLAY; });
-  audioEl.addEventListener('ended', () => {
-    playBtn.innerHTML = ICON_PLAY;
-    progressFill.style.width = '0%';
-    currentTimeEl.textContent = '0:00';
-  });
-
-  audioEl.addEventListener('loadedmetadata', () => {
-    durationEl.textContent = formatTime(audioEl.duration);
-    currentTimeEl.textContent = '0:00';
-    progressFill.style.width = '0%';
-  });
-
-  audioEl.addEventListener('timeupdate', () => {
-    currentTimeEl.textContent = formatTime(audioEl.currentTime);
-    if (audioEl.duration) {
-      progressFill.style.width = `${(audioEl.currentTime / audioEl.duration) * 100}%`;
-    }
-  });
-
-  progressBar.addEventListener('click', (e: MouseEvent) => {
-    const rect = progressBar.getBoundingClientRect();
-    if (audioEl.duration) {
-      audioEl.currentTime = ((e.clientX - rect.left) / rect.width) * audioEl.duration;
-    }
-  });
-
-  let muted = false;
-  volumeBtn.addEventListener('click', () => {
-    muted = !muted;
-    audioEl.muted = muted;
-    volumeBtn.innerHTML = muted ? ICON_VOL_OFF : ICON_VOL_ON;
-  });
-
-  return playerEl;
 }
 
 export async function renderRecordPage(container: HTMLElement): Promise<void> {
@@ -332,7 +255,7 @@ export async function renderRecordPage(container: HTMLElement): Promise<void> {
   const audioEl = document.createElement('audio');
   audioEl.preload = 'metadata';
   audioEl.style.display = 'none';
-  const customPlayerEl = buildCustomPlayer(audioEl);
+  let customPlayerEl = createWaveformPlayer(audioEl);
 
   const saveBtn = document.createElement('button');
   saveBtn.className = 'btn btn-primary';
@@ -446,12 +369,18 @@ export async function renderRecordPage(container: HTMLElement): Promise<void> {
         : 'webm';
       const fileName = `${meetingId}_${Date.now()}.${ext}`;
 
-      // 讀取音訊位元組
+      // 讀取音訊 bytes 並直接用 fs plugin 寫檔（避免大型 IPC JSON 序列化）
       const response = await fetch(state.audioBlobUrl);
       const buffer = await response.arrayBuffer();
-      const fileData = Array.from(new Uint8Array(buffer));
+      const bytes = new Uint8Array(buffer);
 
-      await writeRecordingFile(meetingId, fileData, fileName, durationSeconds);
+      await mkdir('recordings', { baseDir: BaseDirectory.AppData, recursive: true });
+      await writeFile(`recordings/${fileName}`, bytes, { baseDir: BaseDirectory.AppData });
+
+      // 取得完整磁碟路徑後更新 DB
+      const dataDir = await appDataDir();
+      const filePath = await join(dataDir, 'recordings', fileName);
+      await saveRecording(meetingId, filePath, durationSeconds);
       showToast('錄音已儲存', 'success');
       window.location.hash = `#meeting/${meetingId}`;
     } catch (err) {

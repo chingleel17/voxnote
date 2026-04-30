@@ -4,6 +4,7 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use super::models::{CreateMeetingRequest, MeetingWithDetails, UpdateMeetingRequest};
+use super::tag::{get_meeting_tags, set_meeting_tags};
 
 const MEETING_SELECT_SQL: &str = r#"
     SELECT
@@ -40,6 +41,7 @@ fn row_to_meeting(row: &sqlx::sqlite::SqliteRow) -> MeetingWithDetails {
         participants,
         has_transcript: has_transcript != 0,
         has_summary: has_summary != 0,
+        tags: vec![],
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -48,13 +50,22 @@ fn row_to_meeting(row: &sqlx::sqlite::SqliteRow) -> MeetingWithDetails {
 pub async fn get_meetings(pool: &SqlitePool) -> Result<Vec<MeetingWithDetails>> {
     let sql = format!("{} ORDER BY m.created_at DESC", MEETING_SELECT_SQL);
     let rows = sqlx::query(&sql).fetch_all(pool).await?;
-    Ok(rows.iter().map(row_to_meeting).collect())
+    let mut meetings: Vec<MeetingWithDetails> = rows.iter().map(row_to_meeting).collect();
+    for m in &mut meetings {
+        m.tags = get_meeting_tags(pool, &m.id).await.unwrap_or_default();
+    }
+    Ok(meetings)
 }
 
 pub async fn get_meeting(pool: &SqlitePool, id: &str) -> Result<Option<MeetingWithDetails>> {
     let sql = format!("{} HAVING m.id = ?", MEETING_SELECT_SQL);
     let row = sqlx::query(&sql).bind(id).fetch_optional(pool).await?;
-    Ok(row.as_ref().map(row_to_meeting))
+    let mut meeting = match row.as_ref().map(row_to_meeting) {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+    meeting.tags = get_meeting_tags(pool, &meeting.id).await.unwrap_or_default();
+    Ok(Some(meeting))
 }
 
 pub async fn create_meeting(
@@ -86,6 +97,12 @@ pub async fn create_meeting(
     }
 
     tx.commit().await?;
+
+    if let Some(tag_ids) = &req.tag_ids {
+        if !tag_ids.is_empty() {
+            let _ = set_meeting_tags(pool, &id, tag_ids).await;
+        }
+    }
 
     get_meeting(pool, &id)
         .await?
@@ -126,6 +143,10 @@ pub async fn update_meeting(
 
     tx.commit().await?;
 
+    if let Some(tag_ids) = &req.tag_ids {
+        let _ = set_meeting_tags(pool, id, tag_ids).await;
+    }
+
     get_meeting(pool, id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("會議更新後無法取得"))
@@ -138,3 +159,4 @@ pub async fn delete_meeting(pool: &SqlitePool, id: &str) -> Result<()> {
         .await?;
     Ok(())
 }
+

@@ -25,6 +25,7 @@ pub struct MeetingWithDetails {
     pub participants: Vec<String>,
     pub has_transcript: bool,
     pub has_summary: bool,
+    pub tags: Vec<Tag>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -67,11 +68,38 @@ pub struct Recording {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct SavedParticipant {
+    pub id: String,
+    pub name: String,
+    pub usage_count: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingTemplate {
+    pub id: String,
+    pub name: String,
+    pub title: String,
+    pub category_id: Option<String>,
+    pub participants: Vec<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateTemplateRequest {
+    pub name: String,
+    pub title: String,
+    pub category_id: Option<String>,
+    pub participants: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateMeetingRequest {
     pub title: String,
     pub category_id: Option<String>,
     pub participants: Vec<String>,
+    pub tag_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,4 +107,13 @@ pub struct UpdateMeetingRequest {
     pub title: String,
     pub category_id: Option<String>,
     pub participants: Vec<String>,
+    pub tag_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Tag {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+    pub created_at: String,
 }
