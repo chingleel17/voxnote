@@ -118,6 +118,93 @@ function drawStaticWaveform(canvas: HTMLCanvasElement, audioBuffer: AudioBuffer)
   ctx.stroke();
 }
 
+function formatTime(secs: number): string {
+  if (!isFinite(secs) || isNaN(secs)) return '0:00';
+  const m = Math.floor(secs / 60);
+  const s = Math.floor(secs % 60);
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+const ICON_PLAY = `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>`;
+const ICON_PAUSE = `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>`;
+const ICON_VOL_ON = `<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/></svg>`;
+const ICON_VOL_OFF = `<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg>`;
+
+function buildCustomPlayer(audioEl: HTMLAudioElement): HTMLElement {
+  const playerEl = document.createElement('div');
+  playerEl.className = 'custom-player';
+
+  const playBtn = document.createElement('button');
+  playBtn.className = 'player-play-btn';
+  playBtn.innerHTML = ICON_PLAY;
+
+  const currentTimeEl = document.createElement('span');
+  currentTimeEl.className = 'player-time';
+  currentTimeEl.textContent = '0:00';
+
+  const progressBar = document.createElement('div');
+  progressBar.className = 'player-progress';
+  const progressFill = document.createElement('div');
+  progressFill.className = 'player-progress-fill';
+  progressBar.appendChild(progressFill);
+
+  const durationEl = document.createElement('span');
+  durationEl.className = 'player-time';
+  durationEl.textContent = '0:00';
+
+  const volumeBtn = document.createElement('button');
+  volumeBtn.className = 'player-volume-btn';
+  volumeBtn.innerHTML = ICON_VOL_ON;
+
+  playerEl.appendChild(playBtn);
+  playerEl.appendChild(currentTimeEl);
+  playerEl.appendChild(progressBar);
+  playerEl.appendChild(durationEl);
+  playerEl.appendChild(volumeBtn);
+
+  playBtn.addEventListener('click', () => {
+    if (audioEl.paused) void audioEl.play();
+    else audioEl.pause();
+  });
+
+  audioEl.addEventListener('play', () => { playBtn.innerHTML = ICON_PAUSE; });
+  audioEl.addEventListener('pause', () => { playBtn.innerHTML = ICON_PLAY; });
+  audioEl.addEventListener('ended', () => {
+    playBtn.innerHTML = ICON_PLAY;
+    progressFill.style.width = '0%';
+    currentTimeEl.textContent = '0:00';
+  });
+
+  audioEl.addEventListener('loadedmetadata', () => {
+    durationEl.textContent = formatTime(audioEl.duration);
+    currentTimeEl.textContent = '0:00';
+    progressFill.style.width = '0%';
+  });
+
+  audioEl.addEventListener('timeupdate', () => {
+    currentTimeEl.textContent = formatTime(audioEl.currentTime);
+    if (audioEl.duration) {
+      progressFill.style.width = `${(audioEl.currentTime / audioEl.duration) * 100}%`;
+    }
+  });
+
+  progressBar.addEventListener('click', (e: MouseEvent) => {
+    const rect = progressBar.getBoundingClientRect();
+    if (audioEl.duration) {
+      audioEl.currentTime = ((e.clientX - rect.left) / rect.width) * audioEl.duration;
+    }
+  });
+
+  let muted = false;
+  volumeBtn.addEventListener('click', () => {
+    muted = !muted;
+    audioEl.muted = muted;
+    volumeBtn.innerHTML = muted ? ICON_VOL_OFF : ICON_VOL_ON;
+  });
+
+  return playerEl;
+}
+
 export async function renderRecordPage(container: HTMLElement): Promise<void> {
   stopAll();
   container.innerHTML = '';
@@ -225,8 +312,13 @@ export async function renderRecordPage(container: HTMLElement): Promise<void> {
   fileInput.accept = 'audio/*';
   fileInput.style.display = 'none';
 
+  const reselectBtn = document.createElement('button');
+  reselectBtn.className = 'btn btn-ghost hidden';
+  reselectBtn.textContent = '重新選擇';
+
   controlRow.appendChild(recordBtn);
   controlRow.appendChild(uploadBtn);
+  controlRow.appendChild(reselectBtn);
   controlRow.appendChild(fileInput);
   wrapper.appendChild(controlRow);
 
@@ -236,16 +328,19 @@ export async function renderRecordPage(container: HTMLElement): Promise<void> {
   const playerTitle = document.createElement('p');
   playerTitle.className = 'player-hint';
   playerTitle.textContent = '錄音完成，請確認後儲存：';
-  const audioPlayer = document.createElement('audio');
-  audioPlayer.controls = true;
-  audioPlayer.className = 'audio-player';
+
+  const audioEl = document.createElement('audio');
+  audioEl.preload = 'metadata';
+  audioEl.style.display = 'none';
+  const customPlayerEl = buildCustomPlayer(audioEl);
 
   const saveBtn = document.createElement('button');
   saveBtn.className = 'btn btn-primary';
   saveBtn.textContent = '儲存錄音';
 
   playerSection.appendChild(playerTitle);
-  playerSection.appendChild(audioPlayer);
+  playerSection.appendChild(audioEl);
+  playerSection.appendChild(customPlayerEl);
   playerSection.appendChild(saveBtn);
   wrapper.appendChild(playerSection);
 
@@ -291,7 +386,7 @@ export async function renderRecordPage(container: HTMLElement): Promise<void> {
     state.mediaRecorder.onstop = () => {
       state.audioBlob = new Blob(state.audioChunks, { type: 'audio/webm' });
       state.audioBlobUrl = URL.createObjectURL(state.audioBlob);
-      audioPlayer.src = state.audioBlobUrl;
+      audioEl.src = state.audioBlobUrl;
       playerSection.classList.remove('hidden');
     };
 
@@ -379,9 +474,20 @@ export async function renderRecordPage(container: HTMLElement): Promise<void> {
     state.audioBlob = null;
     state.startTime = 0;
 
-    audioPlayer.src = state.audioBlobUrl;
+    // 切換控制區：隱藏錄音按鈕，顯示重新選擇
+    recordBtn.classList.add('hidden');
+    micGroup.classList.add('hidden');
+    reselectBtn.classList.remove('hidden');
+
+    // 設定音訊來源並顯示播放器
+    audioEl.src = state.audioBlobUrl;
     playerSection.classList.remove('hidden');
     playerTitle.textContent = '已載入音訊，請確認後儲存：';
+
+    // Timer 顯示音訊時長
+    audioEl.addEventListener('loadedmetadata', () => {
+      timer.textContent = formatTime(audioEl.duration);
+    }, { once: true });
 
     // 停止錄音動態波形
     if (state.animationId !== null) {
@@ -389,7 +495,18 @@ export async function renderRecordPage(container: HTMLElement): Promise<void> {
       state.animationId = null;
     }
 
-    // 繪製靜態波形
+    // 波形分析中提示
+    const waveCtx = canvas.getContext('2d');
+    if (waveCtx) {
+      waveCtx.fillStyle = '#0f1117';
+      waveCtx.fillRect(0, 0, canvas.width, canvas.height);
+      waveCtx.fillStyle = '#6366f1';
+      waveCtx.font = '14px sans-serif';
+      waveCtx.textAlign = 'center';
+      waveCtx.fillText('波形分析中…', canvas.width / 2, canvas.height / 2 + 5);
+    }
+
+    // 繪製靜態波形（非同步，不阻塞 UI）
     try {
       const arrayBuffer = await file.arrayBuffer();
       const audioCtx = new AudioContext();
@@ -397,7 +514,6 @@ export async function renderRecordPage(container: HTMLElement): Promise<void> {
       drawStaticWaveform(canvas, audioBuffer);
       await audioCtx.close();
     } catch {
-      // 解碼失敗時清空 canvas（不影響儲存功能）
       const c = canvas.getContext('2d');
       if (c) {
         c.fillStyle = '#0f1117';
@@ -406,5 +522,26 @@ export async function renderRecordPage(container: HTMLElement): Promise<void> {
     }
 
     showToast('音訊已載入', 'success');
+  });
+
+  // 重新選擇：恢復錄音控制
+  reselectBtn.addEventListener('click', () => {
+    reselectBtn.classList.add('hidden');
+    recordBtn.classList.remove('hidden');
+    micGroup.classList.remove('hidden');
+    playerSection.classList.add('hidden');
+    timer.textContent = '00:00';
+    if (state.audioBlobUrl) {
+      URL.revokeObjectURL(state.audioBlobUrl);
+      state.audioBlobUrl = null;
+    }
+    state.uploadedFile = null;
+    audioEl.src = '';
+    const c = canvas.getContext('2d');
+    if (c) {
+      c.fillStyle = '#0f1117';
+      c.fillRect(0, 0, canvas.width, canvas.height);
+    }
+    fileInput.value = '';
   });
 }
