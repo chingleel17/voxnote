@@ -19,6 +19,12 @@ type TranscriptVersion = 'original' | 'proofread' | 'manual';
 type ManualBaseVersion = 'original' | 'proofread';
 
 const transcriptUtteranceRe = /^\[(\d{2}:\d{2})(?:\s+(講者[A-Za-z0-9]+))?\]\s+(.*)$/;
+const MERGED_BREAK_SEPARATOR = '\n\n--- ☕ 中場休息 ---\n\n';
+
+function parseTimeToSeconds(timeStr: string): number {
+  const [minutesPart, secondsPart] = timeStr.split(':');
+  return parseInt(minutesPart ?? '0', 10) * 60 + parseInt(secondsPart ?? '0', 10);
+}
 
 function getTranscriptVersionText(transcript: Transcript, version: TranscriptVersion): string {
   switch (version) {
@@ -57,17 +63,72 @@ function extractSpeakerLabels(...texts: Array<string | null | undefined>): strin
   return Array.from(speakers).sort((a, b) => a.localeCompare(b));
 }
 
+function getSpeakerMappingKey(recordingId: string, speakerLabel: string): string {
+  return `${recordingId}::${speakerLabel}`;
+}
+
 function buildSpeakerMappingLookup(speakerMappings: SpeakerMapping[]): Map<string, string> {
-  return new Map(speakerMappings.map((mapping) => [mapping.speaker_label, mapping.participant_name]));
+  return new Map(
+    speakerMappings
+      .filter((mapping) => Boolean(mapping.recording_id))
+      .map((mapping) => [getSpeakerMappingKey(mapping.recording_id!, mapping.speaker_label), mapping.participant_name]),
+  );
+}
+
+function getMappedSpeakerName(
+  mappingBySpeaker: Map<string, string>,
+  recordingId: string,
+  speakerLabel: string,
+): string {
+  return mappingBySpeaker.get(getSpeakerMappingKey(recordingId, speakerLabel)) ?? speakerLabel;
 }
 
 function getSpeakerClassName(speakerLabel: string): string {
   return `speaker-${speakerLabel.replace('講者', '').replace(/[^A-Za-z0-9_-]/g, '')}`;
 }
 
-function applySpeakerMappingsToText(text: string, speakerMappings: SpeakerMapping[]): string {
-  const mappingBySpeaker = buildSpeakerMappingLookup(speakerMappings);
+function getRecordingTranscriptText(recording: Recording, version: TranscriptVersion): string | null {
+  switch (version) {
+    case 'original':
+      return recording.segment_transcript;
+    case 'proofread':
+      return recording.segment_proofread ?? recording.segment_transcript;
+    case 'manual':
+      return null;
+  }
+}
 
+function hasScopedTranscriptText(recordings: Recording[], version: TranscriptVersion): boolean {
+  if (version === 'original') {
+    return recordings.some((recording) => Boolean(recording.segment_transcript));
+  }
+
+  if (version === 'proofread') {
+    return recordings.some((recording) => Boolean(recording.segment_proofread));
+  }
+
+  return false;
+}
+
+function getGeneratedTranscriptSegments(recordings: Recording[], version: TranscriptVersion): Array<{
+  recording: Recording;
+  segmentIndex: number;
+  text: string;
+}> {
+  return recordings
+    .filter((recording) => Boolean(recording.file_path))
+    .map((recording, index) => ({
+      recording,
+      segmentIndex: index + 1,
+      text: getRecordingTranscriptText(recording, version) ?? '',
+    }))
+    .filter((segment) => Boolean(segment.text.trim()));
+}
+
+function mapSpeakerLabelsInText(
+  text: string,
+  mapSpeakerLabel: (speakerLabel: string) => string,
+): string {
   return text.split('\n').map((line) => {
     const match = line.trim().match(transcriptUtteranceRe);
     if (!match) return line;
@@ -75,22 +136,73 @@ function applySpeakerMappingsToText(text: string, speakerMappings: SpeakerMappin
     const [, time, speaker, body] = match;
     if (!speaker) return line;
 
-    const mappedSpeaker = mappingBySpeaker.get(speaker) ?? speaker;
-    return `[${time} ${mappedSpeaker}] ${body}`;
+    return `[${time} ${mapSpeakerLabel(speaker)}] ${body}`;
   }).join('\n');
 }
 
-function renderTranscriptTextInto(
+function buildGeneratedTranscriptText(
+  recordings: Recording[],
+  version: TranscriptVersion,
+  speakerMappings: SpeakerMapping[],
+): string {
+  const mappingBySpeaker = buildSpeakerMappingLookup(speakerMappings);
+  const segments = getGeneratedTranscriptSegments(recordings, version);
+
+  return segments.map(({ recording, text }, index) => {
+    const mappedText = mapSpeakerLabelsInText(
+      text,
+      (speakerLabel) => getMappedSpeakerName(mappingBySpeaker, recording.id, speakerLabel),
+    );
+    if (index === 0) return mappedText;
+    return `${recording.no_break_before ? '\n\n' : MERGED_BREAK_SEPARATOR}${mappedText}`;
+  }).join('');
+}
+
+function getTranscriptDisplayText(
+  transcript: Transcript,
+  recordings: Recording[],
+  version: TranscriptVersion,
+  speakerMappings: SpeakerMapping[],
+): string {
+  if (version !== 'manual' && hasScopedTranscriptText(recordings, version)) {
+    return buildGeneratedTranscriptText(recordings, version, speakerMappings);
+  }
+
+  return getTranscriptVersionText(transcript, version);
+}
+
+function hasProofreadVersionAvailable(transcript: Transcript | null, recordings: Recording[]): boolean {
+  return Boolean(transcript?.proofread_content) || hasScopedTranscriptText(recordings, 'proofread');
+}
+
+function getSegmentProofreadProgress(recordings: Recording[]): { proofreadCount: number; transcribedCount: number } {
+  const transcribedCount = recordings.filter((recording) => Boolean(recording.segment_transcript)).length;
+  const proofreadCount = recordings.filter((recording) => Boolean(recording.segment_proofread)).length;
+  return { proofreadCount, transcribedCount };
+}
+
+function buildProcessingLabel(meetingTitle: string, actionLabel: string, segmentIndex?: number): string {
+  const parts = [meetingTitle.trim() || '未命名會議'];
+  if (segmentIndex !== undefined) {
+    parts.push(`段落${segmentIndex}`);
+  }
+  parts.push(actionLabel);
+  return parts.join('-');
+}
+
+function renderTranscriptSegmentInto(
   container: HTMLElement,
   text: string,
-  mappingBySpeaker: Map<string, string>,
+  mapSpeakerLabel: (speakerLabel: string) => string = (speakerLabel) => speakerLabel,
+  onTimeClick?: (timeInSeconds: number) => void,
 ): void {
-  container.innerHTML = '';
   const lines = text.split('\n');
   const hasTimestamps = lines.some((line) => transcriptUtteranceRe.test(line.trim()));
 
   if (!hasTimestamps) {
-    container.textContent = text;
+    const paragraph = document.createElement('p');
+    paragraph.textContent = text;
+    container.appendChild(paragraph);
     return;
   }
 
@@ -104,11 +216,15 @@ function renderTranscriptTextInto(
       const timeEl = document.createElement('span');
       timeEl.className = 'transcript-time';
       timeEl.textContent = time;
+      if (onTimeClick) {
+        timeEl.title = '點擊跳轉至此時間點播放';
+        timeEl.addEventListener('click', () => onTimeClick(parseTimeToSeconds(time)));
+      }
 
       const textEl = document.createElement('span');
       textEl.className = 'transcript-text';
       if (speaker) {
-        const displaySpeaker = mappingBySpeaker.get(speaker) ?? speaker;
+        const displaySpeaker = mapSpeakerLabel(speaker);
         const speakerEl = document.createElement('span');
         speakerEl.className = `transcript-speaker ${getSpeakerClassName(speaker)}`;
         speakerEl.textContent = `${displaySpeaker}：`;
@@ -126,6 +242,45 @@ function renderTranscriptTextInto(
       p.textContent = line;
       container.appendChild(p);
     }
+  }
+}
+
+function renderTranscriptTextInto(
+  container: HTMLElement,
+  text: string,
+  mapSpeakerLabel: (speakerLabel: string) => string = (speakerLabel) => speakerLabel,
+  onTimeClick?: (timeInSeconds: number) => void,
+): void {
+  container.innerHTML = '';
+  renderTranscriptSegmentInto(container, text, mapSpeakerLabel, onTimeClick);
+}
+
+function renderGeneratedTranscriptInto(
+  container: HTMLElement,
+  recordings: Recording[],
+  version: TranscriptVersion,
+  speakerMappings: SpeakerMapping[],
+  getTimeClickHandler?: (recordingId: string) => (timeInSeconds: number) => void,
+): void {
+  container.innerHTML = '';
+
+  const mappingBySpeaker = buildSpeakerMappingLookup(speakerMappings);
+  const segments = getGeneratedTranscriptSegments(recordings, version);
+
+  for (const [index, { recording, text }] of segments.entries()) {
+    if (index > 0 && !recording.no_break_before) {
+      const divider = document.createElement('div');
+      divider.className = 'recording-break-divider';
+      divider.textContent = '☕ 中場休息';
+      container.appendChild(divider);
+    }
+
+    renderTranscriptSegmentInto(
+      container,
+      text,
+      (speakerLabel) => getMappedSpeakerName(mappingBySpeaker, recording.id, speakerLabel),
+      getTimeClickHandler?.(recording.id),
+    );
   }
 }
 
@@ -150,7 +305,11 @@ function moveRecording<T>(items: T[], fromIndex: number, toIndex: number): T[] {
   return next;
 }
 
-function chooseManualBaseVersion(transcript: Transcript, preferred: ManualBaseVersion): Promise<ManualBaseVersion | null> {
+function chooseManualBaseVersion(
+  transcript: Transcript,
+  preferred: ManualBaseVersion,
+  canUseProofread = Boolean(transcript.proofread_content),
+): Promise<ManualBaseVersion | null> {
   return new Promise((resolve) => {
     const content = document.createElement('div');
     content.className = 'form-group-list';
@@ -165,7 +324,6 @@ function chooseManualBaseVersion(transcript: Transcript, preferred: ManualBaseVe
     options.className = 'transcript-base-options';
 
     let selected: ManualBaseVersion = preferred;
-    const canUseProofread = Boolean(transcript.proofread_content);
 
     const buildOption = (
       value: ManualBaseVersion,
@@ -252,13 +410,15 @@ function renderMarkdown(md: string): string {
 
 function buildTranscriptSection(
   transcript: Transcript | null,
+  recordings: Recording[],
   meetingId: string,
+  meetingTitle: string,
   participants: string[],
   speakerMappings: SpeakerMapping[],
-  onSpeakerMappingChanged: (speakerLabel: string, participantName: string | null) => Promise<void>,
+  onSpeakerMappingChanged: (recordingId: string, speakerLabel: string, participantName: string | null) => Promise<void>,
   onSaveManualTranscript: (content: string, baseVersion: ManualBaseVersion) => Promise<Transcript>,
   onRefresh: () => void,
-): HTMLElement {
+): { el: HTMLElement; refreshMappings: (newMappings: SpeakerMapping[]) => void } {
   const proofreadKey = `proofread:${meetingId}`;
   const section = document.createElement('section');
   section.className = 'detail-section';
@@ -275,12 +435,34 @@ function buildTranscriptSection(
     empty.className = 'empty-hint';
     empty.textContent = '尚無逐字稿，請在上方錄音區塊點擊「產生逐字稿」。';
     section.appendChild(empty);
-    return section;
+    return { el: section, refreshMappings: () => {} };
   }
 
   const loadedTranscript = transcript;
+  const isProofreadVersionAvailable = (): boolean => hasProofreadVersionAvailable(loadedTranscript, recordings);
   const mappingBySpeaker = buildSpeakerMappingLookup(speakerMappings);
-  let currentVersion: TranscriptVersion = loadedTranscript.active_version;
+  let localMappings: SpeakerMapping[] = speakerMappings;
+
+  // 優先使用 DB 記錄的 active_version，但需確認對應內容確實存在
+  const dbVersion = loadedTranscript.active_version as TranscriptVersion;
+  const initialVersion: TranscriptVersion =
+    (dbVersion === 'manual' && loadedTranscript.manual_content) ? 'manual' :
+    (dbVersion === 'proofread' && isProofreadVersionAvailable()) ? 'proofread' :
+    loadedTranscript.manual_content ? 'manual' :
+    isProofreadVersionAvailable() ? 'proofread' :
+    'original';
+  let currentVersion: TranscriptVersion = initialVersion;
+  const proofreadProgress = getSegmentProofreadProgress(recordings);
+  const hasPartialProofread = proofreadProgress.proofreadCount > 0
+    && proofreadProgress.transcribedCount > proofreadProgress.proofreadCount;
+  const recordingSpeakerGroups = recordings
+    .filter((recording) => Boolean(recording.file_path))
+    .map((recording, index) => ({
+      recording,
+      segmentIndex: index + 1,
+      speakerLabels: extractSpeakerLabels(recording.segment_transcript, recording.segment_proofread),
+    }))
+    .filter((group) => group.speakerLabels.length > 0);
 
   // 版本切換 Tab
   const tabs = document.createElement('div');
@@ -294,7 +476,7 @@ function buildTranscriptSection(
     title?: string,
   ): HTMLButtonElement => {
     const button = document.createElement('button');
-    button.className = `tab-btn${loadedTranscript.active_version === version ? ' active' : ''}`;
+    button.className = `tab-btn${currentVersion === version ? ' active' : ''}`;
     button.textContent = label;
     button.disabled = disabled;
     if (title) button.title = title;
@@ -307,8 +489,8 @@ function buildTranscriptSection(
   const proofreadBtn = buildTabButton(
     'proofread',
     '校稿版',
-    !loadedTranscript.proofread_content,
-    !loadedTranscript.proofread_content ? '尚未校稿' : undefined,
+    !isProofreadVersionAvailable(),
+    !isProofreadVersionAvailable() ? '尚未校稿' : undefined,
   );
   const manualBtn = buildTabButton(
     'manual',
@@ -321,15 +503,10 @@ function buildTranscriptSection(
   // 內容顯示
   const content = document.createElement('div');
   content.className = 'transcript-content';
-  const speakerLabels = extractSpeakerLabels(
-    loadedTranscript.original_content,
-    loadedTranscript.proofread_content,
-    loadedTranscript.manual_content,
-  );
 
   const replaceTranscript = (updated: Transcript): void => {
     Object.assign(loadedTranscript, updated);
-    if (loadedTranscript.proofread_content) {
+    if (isProofreadVersionAvailable()) {
       proofreadBtn.disabled = false;
       proofreadBtn.title = '';
     }
@@ -339,7 +516,7 @@ function buildTranscriptSection(
     }
   };
 
-  if (speakerLabels.length > 0) {
+  if (recordingSpeakerGroups.length > 0) {
     const mappingPanel = document.createElement('div');
     mappingPanel.className = 'speaker-mapping-panel';
 
@@ -354,68 +531,142 @@ function buildTranscriptSection(
       hint.textContent = '請先在編輯會議新增參與者後，再設定講者對應。';
       mappingPanel.appendChild(hint);
     } else {
-      const mappingList = document.createElement('div');
-      mappingList.className = 'speaker-mapping-list';
+      for (const { recording, segmentIndex, speakerLabels } of recordingSpeakerGroups) {
+        const groupTitle = document.createElement('div');
+        groupTitle.className = 'speaker-mapping-title';
+        groupTitle.textContent = recording.original_file_name
+          ? `段落 ${segmentIndex}（${recording.original_file_name}）`
+          : `段落 ${segmentIndex}`;
+        mappingPanel.appendChild(groupTitle);
 
-      for (const speakerLabel of speakerLabels) {
-        const row = document.createElement('label');
-        row.className = 'speaker-mapping-row';
+        const mappingList = document.createElement('div');
+        mappingList.className = 'speaker-mapping-list';
 
-        const label = document.createElement('span');
-        label.className = `transcript-speaker ${getSpeakerClassName(speakerLabel)}`;
-        label.textContent = speakerLabel;
+        for (const speakerLabel of speakerLabels) {
+          const row = document.createElement('label');
+          row.className = 'speaker-mapping-row';
 
-        const select = document.createElement('select');
-        select.className = 'form-control speaker-mapping-select';
-        const currentParticipant = mappingBySpeaker.get(speakerLabel) ?? '';
+          const label = document.createElement('span');
+          label.className = `transcript-speaker ${getSpeakerClassName(speakerLabel)}`;
+          label.textContent = speakerLabel;
 
-        const emptyOption = document.createElement('option');
-        emptyOption.value = '';
-        emptyOption.textContent = '未指定';
-        select.appendChild(emptyOption);
+          const select = document.createElement('select');
+          select.className = 'form-control speaker-mapping-select';
+          let currentParticipant = mappingBySpeaker.get(getSpeakerMappingKey(recording.id, speakerLabel)) ?? '';
 
-        for (const participant of participants) {
-          const option = document.createElement('option');
-          option.value = participant;
-          option.textContent = participant;
-          select.appendChild(option);
-        }
+          const emptyOption = document.createElement('option');
+          emptyOption.value = '';
+          emptyOption.textContent = '未指定';
+          select.appendChild(emptyOption);
 
-        if (currentParticipant && !participants.includes(currentParticipant)) {
-          const staleOption = document.createElement('option');
-          staleOption.value = currentParticipant;
-          staleOption.textContent = `${currentParticipant}（不在參與者）`;
-          select.appendChild(staleOption);
-        }
-
-        select.value = currentParticipant;
-        select.addEventListener('change', async () => {
-          const nextParticipant = select.value || null;
-          select.disabled = true;
-          try {
-            await onSpeakerMappingChanged(speakerLabel, nextParticipant);
-            showToast('講者對應已更新', 'success');
-          } catch (err) {
-            select.value = currentParticipant;
-            select.disabled = false;
-            showToast(`講者對應儲存失敗：${String(err)}`, 'error');
+          for (const participant of participants) {
+            const option = document.createElement('option');
+            option.value = participant;
+            option.textContent = participant;
+            select.appendChild(option);
           }
-        });
 
-        row.appendChild(label);
-        row.appendChild(select);
-        mappingList.appendChild(row);
+          if (currentParticipant && !participants.includes(currentParticipant)) {
+            const staleOption = document.createElement('option');
+            staleOption.value = currentParticipant;
+            staleOption.textContent = `${currentParticipant}（不在參與者）`;
+            select.appendChild(staleOption);
+          }
+
+          select.value = currentParticipant;
+          select.addEventListener('change', async () => {
+            const nextParticipant = select.value || null;
+            select.disabled = true;
+            try {
+              await onSpeakerMappingChanged(recording.id, speakerLabel, nextParticipant);
+              currentParticipant = nextParticipant ?? '';
+              showToast('講者對應已更新', 'success');
+            } catch (err) {
+              select.value = currentParticipant;
+              showToast(`講者對應儲存失敗：${String(err)}`, 'error');
+            } finally {
+              select.disabled = false;
+            }
+          });
+
+          row.appendChild(label);
+          row.appendChild(select);
+          mappingList.appendChild(row);
+        }
+
+        mappingPanel.appendChild(mappingList);
       }
-
-      mappingPanel.appendChild(mappingList);
     }
 
     section.appendChild(mappingPanel);
   }
 
+  const getTimeClickHandler = (recordingId: string): (timeInSeconds: number) => void => {
+    return (timeInSeconds: number) => {
+      const audioEl = document.querySelector<HTMLAudioElement>(
+        `audio[data-recording-id="${CSS.escape(recordingId)}"]`,
+      );
+      if (!audioEl) return;
+      const target = isFinite(audioEl.duration) ? Math.min(timeInSeconds, audioEl.duration) : timeInSeconds;
+      audioEl.currentTime = target;
+      void audioEl.play().catch(() => { /* 忽略播放中斷 */ });
+    };
+  };
+
+  const getFallbackTimeClickHandler = (): ((timeInSeconds: number) => void) | undefined => {
+    const firstRec = recordings.find((r) => r.file_path);
+    return firstRec ? getTimeClickHandler(firstRec.id) : undefined;
+  };
+
+  const getTextMapSpeakerLabel = (): (speakerLabel: string) => string => {
+    // 從各錄音的 segment_transcript 解析出每個錄音實際存在的講者標籤
+    // （localMappings 只包含有設定過的項目，未設定的講者不在裡面）
+    const recIdsWithLabel = new Map<string, Set<string>>(); // speakerLabel → Set<recordingId>
+    for (const recording of recordings) {
+      const text = recording.segment_transcript ?? '';
+      for (const line of text.split('\n')) {
+        const match = line.trim().match(transcriptUtteranceRe);
+        const label = match?.[2];
+        if (label) {
+          if (!recIdsWithLabel.has(label)) recIdsWithLabel.set(label, new Set());
+          recIdsWithLabel.get(label)!.add(recording.id);
+        }
+      }
+    }
+
+    // localMappings 快查：recordingId::speakerLabel → participantName
+    const mappingMap = new Map<string, string>();
+    for (const m of localMappings) {
+      if (m.recording_id) {
+        mappingMap.set(`${m.recording_id}::${m.speaker_label}`, m.participant_name?.trim() ?? '');
+      }
+    }
+
+    // 只有所有含該標籤的錄音都指定同一個非空名稱時才套用，
+    // 避免 Recording1 未指定 講者C 卻被 Recording2 的對應污染
+    const lookup = new Map<string, string>();
+    for (const [label, recIds] of recIdsWithLabel) {
+      const names = new Set([...recIds].map((id) => mappingMap.get(`${id}::${label}`) ?? ''));
+      const nonEmpty = [...names].filter((n) => n !== '');
+      if (nonEmpty.length === 1 && names.size === 1) {
+        lookup.set(label, nonEmpty[0]);
+      }
+    }
+    return (speakerLabel) => lookup.get(speakerLabel) ?? speakerLabel;
+  };
+
   function showVersion(version: TranscriptVersion): void {
     currentVersion = version;
-    renderTranscriptTextInto(content, getTranscriptVersionText(loadedTranscript, version), mappingBySpeaker);
+    if (version !== 'manual' && hasScopedTranscriptText(recordings, version)) {
+      renderGeneratedTranscriptInto(content, recordings, version, localMappings, getTimeClickHandler);
+    } else {
+      renderTranscriptTextInto(
+        content,
+        getTranscriptVersionText(loadedTranscript, version),
+        getTextMapSpeakerLabel(),
+        getFallbackTimeClickHandler(),
+      );
+    }
     for (const [tabVersion, button] of tabButtons) {
       button.classList.toggle('active', tabVersion === version);
     }
@@ -425,10 +676,16 @@ function buildTranscriptSection(
     preferredBaseVersion: ManualBaseVersion,
     openEditorAfterSave = false,
   ): Promise<boolean> {
-    const chosenBaseVersion = await chooseManualBaseVersion(loadedTranscript, preferredBaseVersion);
+    const chosenBaseVersion = await chooseManualBaseVersion(
+      loadedTranscript,
+      preferredBaseVersion,
+      isProofreadVersionAvailable(),
+    );
     if (!chosenBaseVersion) return false;
 
-    const baseText = getTranscriptVersionText(loadedTranscript, chosenBaseVersion);
+    const baseText = chosenBaseVersion === 'proofread'
+      ? getTranscriptDisplayText(loadedTranscript, recordings, 'proofread', localMappings)
+      : getTranscriptVersionText(loadedTranscript, chosenBaseVersion);
     if (!baseText) {
       showToast('所選版本目前沒有可建立的逐字稿內容', 'error');
       return false;
@@ -502,7 +759,7 @@ function buildTranscriptSection(
       versionTabs.innerHTML = '';
 
       const manualExists = Boolean(loadedTranscript.manual_content);
-      const canUseProofread = Boolean(loadedTranscript.proofread_content);
+      const canUseProofread = isProofreadVersionAvailable();
       const versions: Array<{ version: TranscriptVersion; enabled: boolean; title?: string }> = [
         { version: 'original', enabled: true },
         { version: 'proofread', enabled: canUseProofread, title: canUseProofread ? undefined : '尚未校稿' },
@@ -577,17 +834,23 @@ function buildTranscriptSection(
 
       const viewer = document.createElement('div');
       viewer.className = 'transcript-content transcript-fullscreen-content';
-      renderTranscriptTextInto(viewer, getTranscriptVersionText(loadedTranscript, overlayVersion), mappingBySpeaker);
+      if (overlayVersion !== 'manual' && hasScopedTranscriptText(recordings, overlayVersion)) {
+        renderGeneratedTranscriptInto(viewer, recordings, overlayVersion, localMappings, getTimeClickHandler);
+      } else {
+        renderTranscriptTextInto(
+          viewer,
+          getTranscriptVersionText(loadedTranscript, overlayVersion),
+          getTextMapSpeakerLabel(),
+          getFallbackTimeClickHandler(),
+        );
+      }
       body.appendChild(viewer);
 
       const copyBtn = document.createElement('button');
       copyBtn.className = 'btn btn-secondary';
       copyBtn.textContent = '複製目前版本';
       copyBtn.addEventListener('click', () => {
-        const text = applySpeakerMappingsToText(
-          getTranscriptVersionText(loadedTranscript, overlayVersion),
-          speakerMappings,
-        );
+        const text = getTranscriptDisplayText(loadedTranscript, recordings, overlayVersion, localMappings);
         navigator.clipboard.writeText(text).then(() => showToast('已複製到剪貼簿', 'success'));
       });
       footer.appendChild(copyBtn);
@@ -607,7 +870,7 @@ function buildTranscriptSection(
         createBtn.className = 'btn btn-primary';
         createBtn.textContent = '建立手動編輯版';
         createBtn.addEventListener('click', async () => {
-          const preferredBaseVersion: ManualBaseVersion = overlayVersion === 'proofread' && loadedTranscript.proofread_content
+          const preferredBaseVersion: ManualBaseVersion = overlayVersion === 'proofread' && isProofreadVersionAvailable()
             ? 'proofread'
             : 'original';
           const created = await ensureManualVersion(preferredBaseVersion);
@@ -638,7 +901,7 @@ function buildTranscriptSection(
     renderFullscreen();
   }
 
-  showVersion(loadedTranscript.active_version);
+  showVersion(initialVersion);
 
   originalBtn.addEventListener('click', async () => {
     try {
@@ -650,7 +913,7 @@ function buildTranscriptSection(
   });
 
   proofreadBtn.addEventListener('click', async () => {
-    if (!loadedTranscript.proofread_content) return;
+    if (!isProofreadVersionAvailable()) return;
     try {
       await switchTranscriptVersion(meetingId, 'proofread');
       showVersion('proofread');
@@ -693,7 +956,7 @@ function buildTranscriptSection(
       return;
     }
 
-    const preferredBaseVersion: ManualBaseVersion = loadedTranscript.proofread_content ? 'proofread' : 'original';
+    const preferredBaseVersion: ManualBaseVersion = isProofreadVersionAvailable() ? 'proofread' : 'original';
     await ensureManualVersion(preferredBaseVersion, true);
   });
 
@@ -701,10 +964,7 @@ function buildTranscriptSection(
   copyBtn.className = 'btn btn-secondary btn-sm';
   copyBtn.textContent = '複製';
   copyBtn.addEventListener('click', () => {
-    const text = applySpeakerMappingsToText(
-      getTranscriptVersionText(loadedTranscript, currentVersion),
-      speakerMappings,
-    );
+    const text = getTranscriptDisplayText(loadedTranscript, recordings, currentVersion, localMappings);
     navigator.clipboard.writeText(text).then(() => {
       showToast('已複製到剪貼簿', 'success');
     });
@@ -714,10 +974,7 @@ function buildTranscriptSection(
   exportBtn.className = 'btn btn-secondary btn-sm';
   exportBtn.textContent = '匯出 TXT';
   exportBtn.addEventListener('click', () => {
-    const text = applySpeakerMappingsToText(
-      getTranscriptVersionText(loadedTranscript, currentVersion),
-      speakerMappings,
-    );
+    const text = getTranscriptDisplayText(loadedTranscript, recordings, currentVersion, localMappings);
     const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -731,8 +988,8 @@ function buildTranscriptSection(
 
   const proofreadActionBtn = document.createElement('button');
   proofreadActionBtn.className = 'btn btn-primary btn-sm';
-  const isProofreading = isProcessing(proofreadKey);
-  proofreadActionBtn.textContent = isProofreading ? '校稿中…' : (loadedTranscript.proofread_content ? '重新校稿' : 'AI 校稿');
+  const isProofreading = isProcessing(proofreadKey) || loadedTranscript.proofread_status === 'running';
+  proofreadActionBtn.textContent = isProofreading ? '校稿中…' : (isProofreadVersionAvailable() ? '重新校稿' : 'AI 校稿');
   proofreadActionBtn.disabled = isProofreading;
 
   if (isProofreading) {
@@ -741,7 +998,7 @@ function buildTranscriptSection(
 
   proofreadActionBtn.addEventListener('click', async () => {
     if (isProcessing(proofreadKey)) return;
-    startProcessing(proofreadKey, 'AI 校稿中');
+    startProcessing(proofreadKey, buildProcessingLabel(meetingTitle, 'AI校稿中'));
     proofreadActionBtn.disabled = true;
     proofreadActionBtn.textContent = '校稿中…';
     showToast('AI 校稿執行中，請稍候…', 'info');
@@ -750,13 +1007,15 @@ function buildTranscriptSection(
       const result = await proofreadTranscript(meetingId);
       loadedTranscript.proofread_content = result.content;
       proofreadBtn.disabled = false;
+      proofreadBtn.title = '';
       await switchTranscriptVersion(meetingId, 'proofread');
       loadedTranscript.active_version = 'proofread';
+      showVersion('proofread');
       showToast('AI 校稿完成，已切換至校稿版', 'success');
       finishProcessing(proofreadKey);
     } catch (err) {
       showToast(`AI 校稿失敗：${String(err)}`, 'error');
-      proofreadActionBtn.textContent = loadedTranscript.proofread_content ? '重新校稿' : 'AI 校稿';
+      proofreadActionBtn.textContent = isProofreadVersionAvailable() ? '重新校稿' : 'AI 校稿';
       proofreadActionBtn.disabled = false;
       finishProcessing(proofreadKey, false);
     }
@@ -769,12 +1028,37 @@ function buildTranscriptSection(
   actions.appendChild(exportBtn);
   section.appendChild(actions);
 
-  return section;
+  if (hasPartialProofread) {
+    const hint = document.createElement('p');
+    hint.className = 'form-hint';
+    hint.textContent = `目前已完成 ${proofreadProgress.proofreadCount}/${proofreadProgress.transcribedCount} 段校稿；未校稿段落會先顯示原始逐字稿。`;
+    section.appendChild(hint);
+  }
+
+  if (loadedTranscript.proofread_status === 'interrupted') {
+    const hint = document.createElement('p');
+    hint.className = 'form-hint';
+    hint.textContent = loadedTranscript.proofread_error ?? '上次校稿已中斷，請重新觸發校稿。';
+    section.appendChild(hint);
+  } else if (loadedTranscript.proofread_status === 'failed' && loadedTranscript.proofread_error) {
+    const hint = document.createElement('p');
+    hint.className = 'form-hint';
+    hint.textContent = `上次校稿失敗：${loadedTranscript.proofread_error}`;
+    section.appendChild(hint);
+  }
+
+  function refreshMappings(newMappings: SpeakerMapping[]): void {
+    localMappings = newMappings;
+    showVersion(currentVersion);
+  }
+
+  return { el: section, refreshMappings };
 }
 
 function buildSummarySection(
   summary: Summary | null,
   meetingId: string,
+  meetingTitle: string,
   onRefresh: () => void,
 ): HTMLElement {
   const summaryKey = `summary:${meetingId}`;
@@ -813,7 +1097,7 @@ function buildSummarySection(
 
   generateBtn.addEventListener('click', async () => {
     if (isProcessing(summaryKey)) return;
-    startProcessing(summaryKey, 'AI 摘要生成中');
+    startProcessing(summaryKey, buildProcessingLabel(meetingTitle, 'AI摘要生成中'));
     generateBtn.disabled = true;
     generateBtn.textContent = '生成中…';
     showToast('AI 摘要生成中，請稍候…', 'info');
@@ -870,10 +1154,11 @@ function buildSummarySection(
 function buildRecordingSection(
   recordings: Recording[],
   meetingId: string,
+  meetingTitle: string,
   isCollapsed: boolean,
   onCollapseChanged: (collapsed: boolean) => void,
   onTranscribed: (recordingId: string) => void,
-  onDeleted: (id: string) => void,
+  onDeleted: (id: string) => Promise<void>,
   onReordered: (recordingId: string, direction: -1 | 1) => Promise<void>,
   onSegmentProofread: (recordingId: string) => Promise<void>,
   onBreakChanged: () => void,
@@ -961,10 +1246,18 @@ function buildRecordingSection(
 
     segWrap.appendChild(segHeader);
 
+    if (rec.original_file_name) {
+      const originalFileName = document.createElement('div');
+      originalFileName.className = 'form-hint';
+      originalFileName.textContent = `原始檔名：${rec.original_file_name}`;
+      segWrap.appendChild(originalFileName);
+    }
+
     // 播放器
     const audioEl = document.createElement('audio');
     audioEl.preload = 'metadata';
     audioEl.style.display = 'none';
+    audioEl.dataset.recordingId = rec.id;
     audioEl.src = rec.file_path!.startsWith('blob:')
       ? rec.file_path!
       : convertFileSrc(rec.file_path!);
@@ -1017,7 +1310,7 @@ function buildRecordingSection(
     transcribeBtn.addEventListener('click', async () => {
       const key = `transcribe:${rec.id}`;
       if (isProcessing(key)) return;
-      startProcessing(key, `段落 ${segIndex} 轉譯中`);
+      startProcessing(key, buildProcessingLabel(meetingTitle, '轉譯中', segIndex));
       transcribeBtn.disabled = true;
       transcribeBtn.textContent = '轉譯中…';
       statusBadge.className = 'recording-segment-status processing';
@@ -1054,7 +1347,7 @@ function buildRecordingSection(
       segmentProofreadBtn.disabled = isSegmentProofreading;
       segmentProofreadBtn.addEventListener('click', async () => {
         if (isProcessing(segmentProofreadKey)) return;
-        startProcessing(segmentProofreadKey, `段落 ${segIndex} 校稿中`);
+        startProcessing(segmentProofreadKey, buildProcessingLabel(meetingTitle, 'AI校稿中', segIndex));
         segmentProofreadBtn.disabled = true;
         segmentProofreadBtn.textContent = '校稿此段中…';
         showToast(`段落 ${segIndex} 校稿中，請稍候…`, 'info');
@@ -1080,7 +1373,7 @@ function buildRecordingSection(
       try {
         await deleteRecording(rec.id);
         showToast('錄音段落已刪除', 'success');
-        onDeleted(rec.id);
+        await onDeleted(rec.id);
       } catch (err) {
         showToast(`刪除失敗：${String(err)}`, 'error');
       }
@@ -1149,6 +1442,7 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
   let allTags: Tag[] = [];
   let speakerMappings: SpeakerMapping[] = [];
   let isRecordingListCollapsed = false;
+  let currentTranscriptSection: { el: HTMLElement; refreshMappings: (m: SpeakerMapping[]) => void } | null = null;
 
   try {
     [meeting, transcript, summary, recordings, savedParticipants, allTags, speakerMappings] = await Promise.all([
@@ -1220,6 +1514,20 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
     topBar.appendChild(printBtn);
     container.appendChild(topBar);
 
+    // 會議日期
+    const displayDate = meeting.meeting_date ?? meeting.created_at;
+    const dateBar = document.createElement('div');
+    dateBar.className = 'participants-bar';
+    const dateBarLabel = document.createElement('span');
+    dateBarLabel.className = 'participants-label';
+    dateBarLabel.textContent = '日期：';
+    const dateChip = document.createElement('span');
+    dateChip.className = 'participant-chip';
+    dateChip.textContent = new Date(displayDate).toLocaleDateString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit' });
+    dateBar.appendChild(dateBarLabel);
+    dateBar.appendChild(dateChip);
+    container.appendChild(dateBar);
+
     // 參與者
     if (meeting.participants.length > 0) {
       const partSection = document.createElement('div');
@@ -1259,6 +1567,7 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
     container.appendChild(buildRecordingSection(
       recordings,
       meetingId,
+      meeting.title,
       isRecordingListCollapsed,
       (collapsed) => {
         isRecordingListCollapsed = collapsed;
@@ -1285,8 +1594,11 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
         } catch { /* ignore */ }
         build();
       },
-      (deletedId) => {
-        recordings = recordings.filter((r) => r.id !== deletedId);
+      async () => {
+        [transcript, recordings] = await Promise.all([
+          getTranscript(meetingId),
+          getRecordings(meetingId),
+        ]);
         build();
       },
       async (recordingId, direction) => {
@@ -1315,6 +1627,8 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
           getTranscript(meetingId),
           getRecordings(meetingId),
         ]);
+        finishProcessing(`proofread-segment:${recordingId}`, false);
+        if (window.location.hash !== `#meeting/${meetingId}`) return;
         build();
       },
       async () => {
@@ -1328,25 +1642,31 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
     ));
 
     // 逐字稿區塊
-    container.appendChild(buildTranscriptSection(
+    const transcriptSectionResult = buildTranscriptSection(
       transcript,
+      recordings,
       meetingId,
+      meeting.title,
       meeting.participants,
       speakerMappings,
-      async (speakerLabel, participantName) => {
+      async (recordingId, speakerLabel, participantName) => {
         if (participantName) {
-          const saved = await upsertSpeakerMapping(meetingId, speakerLabel, participantName);
-          const existingIndex = speakerMappings.findIndex((mapping) => mapping.speaker_label === speakerLabel);
+          const saved = await upsertSpeakerMapping(meetingId, recordingId, speakerLabel, participantName);
+          const existingIndex = speakerMappings.findIndex(
+            (mapping) => mapping.recording_id === recordingId && mapping.speaker_label === speakerLabel,
+          );
           if (existingIndex >= 0) {
             speakerMappings[existingIndex] = saved;
           } else {
             speakerMappings.push(saved);
           }
         } else {
-          await deleteSpeakerMapping(meetingId, speakerLabel);
-          speakerMappings = speakerMappings.filter((mapping) => mapping.speaker_label !== speakerLabel);
+          await deleteSpeakerMapping(meetingId, recordingId, speakerLabel);
+          speakerMappings = speakerMappings.filter(
+            (mapping) => !(mapping.recording_id === recordingId && mapping.speaker_label === speakerLabel),
+          );
         }
-        build();
+        currentTranscriptSection?.refreshMappings(speakerMappings);
       },
       async (content, baseVersion) => {
         transcript = await saveTranscriptManual(meetingId, content, baseVersion);
@@ -1355,14 +1675,19 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
       async () => {
         if (window.location.hash !== `#meeting/${meetingId}`) return;
         try {
-          transcript = await getTranscript(meetingId);
+          [transcript, recordings] = await Promise.all([
+            getTranscript(meetingId),
+            getRecordings(meetingId),
+          ]);
         } catch { /* ignore */ }
         build();
       },
-    ));
+    );
+    currentTranscriptSection = transcriptSectionResult;
+    container.appendChild(transcriptSectionResult.el);
 
     // 摘要區塊
-    container.appendChild(buildSummarySection(summary, meetingId, async () => {
+    container.appendChild(buildSummarySection(summary, meetingId, meeting.title, async () => {
       if (window.location.hash !== `#meeting/${meetingId}`) return;
       try {
         summary = await getSummary(meetingId);
@@ -1387,6 +1712,19 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
     titleInput.value = meeting.title;
     titleGroup.appendChild(titleLabel);
     titleGroup.appendChild(titleInput);
+
+    // 會議日期
+    const dateGroup = document.createElement('div');
+    dateGroup.className = 'form-group';
+    const dateLabel = document.createElement('label');
+    dateLabel.textContent = '會議日期';
+    const dateInput = document.createElement('input');
+    dateInput.type = 'date';
+    dateInput.className = 'form-control';
+    const currentDate = meeting.meeting_date ?? meeting.created_at;
+    dateInput.value = currentDate.substring(0, 10);
+    dateGroup.appendChild(dateLabel);
+    dateGroup.appendChild(dateInput);
 
     // 參與者列表編輯器
     const { el: partEditorEl, getParticipants } = buildParticipantEditor(
@@ -1438,6 +1776,7 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
     }
 
     form.appendChild(titleGroup);
+    form.appendChild(dateGroup);
     form.appendChild(partEditorEl);
     form.appendChild(tagGroup);
 
@@ -1456,6 +1795,7 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
             category_id: meeting.category_id,
             participants,
             tag_ids: Array.from(selectedTagIds),
+            meeting_date: dateInput.value || null,
           });
           meeting = updated;
           // 將參與者加入常用清單

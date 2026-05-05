@@ -6,7 +6,6 @@ pub mod category;
 pub mod meeting;
 pub mod meeting_template;
 pub mod models;
-pub mod participant;
 pub mod recording;
 pub mod saved_participant;
 pub mod speaker_mapping;
@@ -48,11 +47,27 @@ CREATE TABLE IF NOT EXISTS speaker_mappings (
     FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS recording_speaker_mappings (
+    id TEXT PRIMARY KEY,
+    meeting_id TEXT NOT NULL,
+    recording_id TEXT NOT NULL,
+    speaker_label TEXT NOT NULL,
+    participant_name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(recording_id, speaker_label),
+    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE,
+    FOREIGN KEY (recording_id) REFERENCES recordings(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS transcripts (
     id TEXT PRIMARY KEY,
     meeting_id TEXT UNIQUE NOT NULL,
     original_content TEXT,
     proofread_content TEXT,
+    proofread_status TEXT NOT NULL DEFAULT 'idle',
+    proofread_error TEXT,
+    proofread_started_at TEXT,
     manual_content TEXT,
     manual_base_version TEXT,
     manual_updated_at TEXT,
@@ -77,6 +92,7 @@ CREATE TABLE IF NOT EXISTS recordings (
     id TEXT PRIMARY KEY,
     meeting_id TEXT NOT NULL,
     file_path TEXT,
+    original_file_name TEXT,
     duration_seconds INTEGER,
     sort_order INTEGER NOT NULL DEFAULT 0,
     segment_transcript TEXT,
@@ -145,6 +161,9 @@ pub async fn init_db(app: &AppHandle) -> Result<SqlitePool> {
     let _ = sqlx::query("ALTER TABLE recordings ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
         .execute(&pool)
         .await;
+    let _ = sqlx::query("ALTER TABLE recordings ADD COLUMN original_file_name TEXT")
+        .execute(&pool)
+        .await;
     let _ = sqlx::query("ALTER TABLE recordings ADD COLUMN segment_transcript TEXT")
         .execute(&pool)
         .await;
@@ -157,12 +176,27 @@ pub async fn init_db(app: &AppHandle) -> Result<SqlitePool> {
     let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN manual_content TEXT")
         .execute(&pool)
         .await;
+    let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN proofread_status TEXT NOT NULL DEFAULT 'idle'")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN proofread_error TEXT")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN proofread_started_at TEXT")
+        .execute(&pool)
+        .await;
     let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN manual_base_version TEXT")
         .execute(&pool)
         .await;
     let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN manual_updated_at TEXT")
         .execute(&pool)
         .await;
+
+    let _ = sqlx::query("ALTER TABLE meetings ADD COLUMN meeting_date TEXT")
+        .execute(&pool)
+        .await;
+
+    transcript::recover_interrupted_proofreads(&pool).await?;
 
     Ok(pool)
 }

@@ -7,15 +7,6 @@ pub struct Category {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct Meeting {
-    pub id: String,
-    pub title: String,
-    pub category_id: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeetingWithDetails {
     pub id: String,
@@ -26,21 +17,16 @@ pub struct MeetingWithDetails {
     pub has_transcript: bool,
     pub has_summary: bool,
     pub tags: Vec<Tag>,
+    pub meeting_date: Option<String>,
     pub created_at: String,
     pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct Participant {
-    pub id: String,
-    pub meeting_id: String,
-    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct SpeakerMapping {
     pub id: String,
     pub meeting_id: String,
+    pub recording_id: Option<String>,
     pub speaker_label: String,
     pub participant_name: String,
     pub created_at: String,
@@ -53,6 +39,9 @@ pub struct Transcript {
     pub meeting_id: String,
     pub original_content: Option<String>,
     pub proofread_content: Option<String>,
+    pub proofread_status: String,
+    pub proofread_error: Option<String>,
+    pub proofread_started_at: Option<String>,
     pub manual_content: Option<String>,
     pub manual_base_version: Option<String>,
     pub manual_updated_at: Option<String>,
@@ -77,6 +66,7 @@ pub struct Recording {
     pub id: String,
     pub meeting_id: String,
     pub file_path: Option<String>,
+    pub original_file_name: Option<String>,
     pub duration_seconds: Option<i64>,
     pub sort_order: i64,
     pub segment_transcript: Option<String>,
@@ -132,6 +122,7 @@ pub struct UpdateMeetingRequest {
     pub category_id: Option<String>,
     pub participants: Vec<String>,
     pub tag_ids: Option<Vec<String>>,
+    pub meeting_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

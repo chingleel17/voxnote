@@ -18,7 +18,13 @@ export function renderNav(container: HTMLElement): void {
 
   const brand = document.createElement('div');
   brand.className = 'nav-brand';
-  brand.textContent = 'VoxNote';
+
+  const brandLogo = document.createElement('img');
+  brandLogo.className = 'nav-brand-logo';
+  brandLogo.src = '/logo.png';
+  brandLogo.alt = 'VoxNote';
+
+  brand.appendChild(brandLogo);
   container.appendChild(brand);
 
   const list = document.createElement('ul');
