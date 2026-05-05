@@ -128,7 +128,7 @@ function formatTime(secs: number): string {
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 
-export async function renderRecordPage(container: HTMLElement): Promise<void> {
+export async function renderRecordPage(container: HTMLElement, preselectedMeetingId?: string): Promise<void> {
   stopAll();
   container.innerHTML = '';
 
@@ -172,6 +172,11 @@ export async function renderRecordPage(container: HTMLElement): Promise<void> {
   meetingGroup.appendChild(meetingLabel);
   meetingGroup.appendChild(meetingSelect);
   wrapper.appendChild(meetingGroup);
+
+  // 自動選取預設會議
+  if (preselectedMeetingId) {
+    meetingSelect.value = preselectedMeetingId;
+  }
 
   // 麥克風選擇
   const micGroup = document.createElement('div');

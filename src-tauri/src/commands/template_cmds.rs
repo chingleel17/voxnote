@@ -3,7 +3,7 @@ use tauri::State;
 
 use crate::db::{
     meeting_template, saved_participant,
-    models::{CreateTemplateRequest, MeetingTemplate, SavedParticipant},
+    models::{CreateTemplateRequest, MeetingTemplate, SavedParticipant, UpdateTemplateRequest},
 };
 
 #[tauri::command]
@@ -36,6 +36,17 @@ pub async fn delete_saved_participant(
 }
 
 #[tauri::command]
+pub async fn update_saved_participant(
+    id: String,
+    name: String,
+    pool: State<'_, SqlitePool>,
+) -> Result<SavedParticipant, String> {
+    saved_participant::update_saved_participant(&pool, &id, &name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn get_meeting_templates(
     pool: State<'_, SqlitePool>,
 ) -> Result<Vec<MeetingTemplate>, String> {
@@ -60,6 +71,17 @@ pub async fn delete_meeting_template(
     pool: State<'_, SqlitePool>,
 ) -> Result<(), String> {
     meeting_template::delete_template(&pool, &id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn update_meeting_template(
+    id: String,
+    request: UpdateTemplateRequest,
+    pool: State<'_, SqlitePool>,
+) -> Result<MeetingTemplate, String> {
+    meeting_template::update_template(&pool, &id, request)
         .await
         .map_err(|e| e.to_string())
 }

@@ -9,3 +9,6 @@ export const upsertSavedParticipant = (name: string) =>
 
 export const deleteSavedParticipant = (id: string) =>
   invoke<void>('delete_saved_participant', { id });
+
+export const updateSavedParticipant = (id: string, name: string) =>
+  invoke<SavedParticipant>('update_saved_participant', { id, name });

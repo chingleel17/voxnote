@@ -27,6 +27,10 @@ pub struct AppConfig {
     pub custom_endpoint: String,
     pub custom_api_key: String,
     pub custom_model: String,
+
+    // AI Prompt 自訂（空字串代表使用內建預設 Prompt）
+    pub proofread_prompt: String,
+    pub summary_prompt: String,
 }
 
 impl Default for AppConfig {
@@ -51,6 +55,8 @@ impl Default for AppConfig {
             custom_endpoint: String::new(),
             custom_api_key: String::new(),
             custom_model: String::new(),
+            proofread_prompt: String::new(),
+            summary_prompt: String::new(),
         }
     }
 }

@@ -1,7 +1,14 @@
+use std::time::Duration;
+
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
 use crate::config::AppConfig;
+
+/// 雲端 API（OpenAI / Claude / Gemini）超時設定
+const CLOUD_TIMEOUT_SECS: u64 = 120;
+/// 本地 Ollama / 自訂端點超時設定（模型首次載入可能需要較長時間）
+const LOCAL_TIMEOUT_SECS: u64 = 600;
 
 // 統一 LLM 呼叫入口
 pub async fn call_llm(config: &AppConfig, system_prompt: &str, user_content: &str) -> Result<String> {
@@ -16,6 +23,7 @@ pub async fn call_llm(config: &AppConfig, system_prompt: &str, user_content: &st
                 &config.openai_model,
                 system_prompt,
                 user_content,
+                CLOUD_TIMEOUT_SECS,
             )
             .await
         }
@@ -29,6 +37,7 @@ pub async fn call_llm(config: &AppConfig, system_prompt: &str, user_content: &st
                 &config.openrouter_model,
                 system_prompt,
                 user_content,
+                CLOUD_TIMEOUT_SECS,
             )
             .await
         }
@@ -43,7 +52,7 @@ pub async fn call_llm(config: &AppConfig, system_prompt: &str, user_content: &st
                 "{}/v1/chat/completions",
                 config.ollama_endpoint.trim_end_matches('/')
             );
-            openai_compat_call(&url, "", &config.ollama_model, system_prompt, user_content).await
+            openai_compat_call(&url, "", &config.ollama_model, system_prompt, user_content, LOCAL_TIMEOUT_SECS).await
         }
         "custom" => {
             if config.custom_endpoint.is_empty() {
@@ -58,6 +67,7 @@ pub async fn call_llm(config: &AppConfig, system_prompt: &str, user_content: &st
                 &config.custom_model,
                 system_prompt,
                 user_content,
+                LOCAL_TIMEOUT_SECS,
             )
             .await
         }
@@ -78,6 +88,7 @@ async fn openai_compat_call(
     model: &str,
     system_prompt: &str,
     user_content: &str,
+    timeout_secs: u64,
 ) -> Result<String> {
     if url.is_empty() {
         return Err(anyhow!("端點 URL 未設定"));
@@ -86,7 +97,9 @@ async fn openai_compat_call(
         return Err(anyhow!("模型名稱未設定"));
     }
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()?;
     let body = json!({
         "model": model,
         "messages": [
@@ -101,7 +114,15 @@ async fn openai_compat_call(
         req = req.bearer_auth(api_key);
     }
 
-    let resp = req.send().await?;
+    let resp = req.send().await.map_err(|e| {
+        if e.is_timeout() {
+            anyhow!("請求逾時（{}秒），請確認 LLM 服務是否正常運作", timeout_secs)
+        } else if e.is_connect() {
+            anyhow!("無法連接到 LLM 服務（{}），請確認服務已啟動並確認端點設定", url)
+        } else {
+            anyhow!("HTTP 請求失敗：{}", e)
+        }
+    })?;
     let status = resp.status();
     let text = resp.text().await?;
 
@@ -138,8 +159,18 @@ async fn gemini_call(api_key: &str, model: &str, system_prompt: &str, user_conte
         "generationConfig": { "temperature": 0.3 }
     });
 
-    let client = reqwest::Client::new();
-    let resp = client.post(&url).json(&body).send().await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(CLOUD_TIMEOUT_SECS))
+        .build()?;
+    let resp = client.post(&url).json(&body).send().await.map_err(|e| {
+        if e.is_timeout() {
+            anyhow!("Gemini 請求逾時（{}秒）", CLOUD_TIMEOUT_SECS)
+        } else if e.is_connect() {
+            anyhow!("無法連接到 Gemini API，請確認網路連線")
+        } else {
+            anyhow!("Gemini HTTP 請求失敗：{}", e)
+        }
+    })?;
     let status = resp.status();
     let text = resp.text().await?;
 
@@ -171,14 +202,25 @@ async fn claude_call(api_key: &str, model: &str, system_prompt: &str, user_conte
         ]
     });
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(CLOUD_TIMEOUT_SECS))
+        .build()?;
     let resp = client
         .post("https://api.anthropic.com/v1/messages")
         .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01")
         .json(&body)
         .send()
-        .await?;
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                anyhow!("Claude 請求逾時（{}秒）", CLOUD_TIMEOUT_SECS)
+            } else if e.is_connect() {
+                anyhow!("無法連接到 Claude API，請確認網路連線")
+            } else {
+                anyhow!("Claude HTTP 請求失敗：{}", e)
+            }
+        })?;
 
     let status = resp.status();
     let text = resp.text().await?;

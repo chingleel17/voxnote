@@ -108,6 +108,16 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
   });
   form.appendChild(llmSection);
 
+  // ── AI Prompt 自訂區塊 ──
+  const promptSection = buildAiPromptSection(config, (updated) => {
+    config = {
+      ...config,
+      proofread_prompt: updated.proofread_prompt,
+      summary_prompt: updated.summary_prompt,
+    };
+  });
+  form.appendChild(promptSection);
+
   // ── 儲存按鈕 ──
   const saveRow = document.createElement('div');
   saveRow.className = 'settings-save-row';
@@ -527,6 +537,83 @@ function buildOllamaSection(
   };
 
   return wrapper;
+}
+
+// ─────────────────────────────────────────────
+// AI Prompt 自訂區塊
+// ─────────────────────────────────────────────
+function buildAiPromptSection(
+  config: AppConfig,
+  onChange: (c: AppConfig) => void
+): HTMLElement {
+  const section = document.createElement('section');
+  section.className = 'settings-section';
+
+  const heading = document.createElement('h3');
+  heading.className = 'settings-section-title';
+  heading.textContent = 'AI Prompt 自訂';
+  section.appendChild(heading);
+
+  const hint = document.createElement('p');
+  hint.className = 'form-hint';
+  hint.style.marginBottom = '16px';
+  hint.textContent = '留空代表使用內建預設 Prompt。自訂後請點「儲存設定」使其生效。';
+  section.appendChild(hint);
+
+  // 校稿 Prompt
+  const proofreadGroup = document.createElement('div');
+  proofreadGroup.className = 'form-group';
+  const proofreadLabel = document.createElement('label');
+  proofreadLabel.textContent = '校稿 Prompt（AI 校稿用）';
+  const proofreadTextarea = document.createElement('textarea');
+  proofreadTextarea.className = 'form-control';
+  proofreadTextarea.rows = 6;
+  proofreadTextarea.value = config.proofread_prompt ?? '';
+  proofreadTextarea.placeholder = [
+    '你是一位專業的中文會議記錄校對員。',
+    '請校正以下逐字稿中的錯字（同音字、漏字、多字、標點錯誤）。',
+    '保留所有時間標記 [MM:SS] 不得刪除或修改。',
+    '保留所有講者標記（例如「講者A：」）不得刪除。',
+    '必須輸出完整的全部逐字稿內容，嚴禁使用任何省略標記。',
+    '只輸出修正後的完整逐字稿，不要加任何說明或前後文。',
+  ].join('\n');
+  proofreadTextarea.addEventListener('input', () => {
+    config = { ...config, proofread_prompt: proofreadTextarea.value };
+    onChange(config);
+  });
+  proofreadGroup.appendChild(proofreadLabel);
+  proofreadGroup.appendChild(proofreadTextarea);
+  section.appendChild(proofreadGroup);
+
+  // 總結 Prompt
+  const summaryGroup = document.createElement('div');
+  summaryGroup.className = 'form-group';
+  const summaryLabel = document.createElement('label');
+  summaryLabel.textContent = '總結 Prompt（AI 生成會議總結用）';
+  const summaryTextarea = document.createElement('textarea');
+  summaryTextarea.className = 'form-control';
+  summaryTextarea.rows = 8;
+  summaryTextarea.value = config.summary_prompt ?? '';
+  summaryTextarea.placeholder = [
+    '你是一位專業的會議記錄助理。請根據以下逐字稿生成結構清晰的會議摘要。',
+    '使用繁體中文，以 Markdown 格式輸出，包含以下章節（若無相關內容可省略該章節）：',
+    '## 會議摘要',
+    '## 參與人員',
+    '## 主要議題',
+    '## 決議事項',
+    '## 待辦事項（TODO）',
+    '## 重要時間點（含 [MM:SS] 時間標記）',
+    '## 專有名詞說明',
+  ].join('\n');
+  summaryTextarea.addEventListener('input', () => {
+    config = { ...config, summary_prompt: summaryTextarea.value };
+    onChange(config);
+  });
+  summaryGroup.appendChild(summaryLabel);
+  summaryGroup.appendChild(summaryTextarea);
+  section.appendChild(summaryGroup);
+
+  return section;
 }
 
 // ─────────────────────────────────────────────

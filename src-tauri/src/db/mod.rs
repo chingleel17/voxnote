@@ -9,6 +9,7 @@ pub mod models;
 pub mod participant;
 pub mod recording;
 pub mod saved_participant;
+pub mod speaker_mapping;
 pub mod summary;
 pub mod tag;
 pub mod transcript;
@@ -36,11 +37,25 @@ CREATE TABLE IF NOT EXISTS participants (
     FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS speaker_mappings (
+    id TEXT PRIMARY KEY,
+    meeting_id TEXT NOT NULL,
+    speaker_label TEXT NOT NULL,
+    participant_name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(meeting_id, speaker_label),
+    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS transcripts (
     id TEXT PRIMARY KEY,
     meeting_id TEXT UNIQUE NOT NULL,
     original_content TEXT,
     proofread_content TEXT,
+    manual_content TEXT,
+    manual_base_version TEXT,
+    manual_updated_at TEXT,
     active_version TEXT NOT NULL DEFAULT 'original',
     proofread_provider TEXT,
     proofread_at TEXT,
@@ -63,6 +78,9 @@ CREATE TABLE IF NOT EXISTS recordings (
     meeting_id TEXT NOT NULL,
     file_path TEXT,
     duration_seconds INTEGER,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    segment_transcript TEXT,
+    segment_proofread TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
 );
@@ -122,6 +140,29 @@ pub async fn init_db(app: &AppHandle) -> Result<SqlitePool> {
             sqlx::query(trimmed).execute(&pool).await?;
         }
     }
+
+    // 向下相容 ALTER TABLE（舊資料庫補欄位，重複欄位錯誤可忽略）
+    let _ = sqlx::query("ALTER TABLE recordings ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE recordings ADD COLUMN segment_transcript TEXT")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE recordings ADD COLUMN segment_proofread TEXT")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE recordings ADD COLUMN no_break_before INTEGER NOT NULL DEFAULT 0")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN manual_content TEXT")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN manual_base_version TEXT")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN manual_updated_at TEXT")
+        .execute(&pool)
+        .await;
 
     Ok(pool)
 }

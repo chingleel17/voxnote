@@ -38,11 +38,24 @@ pub struct Participant {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct SpeakerMapping {
+    pub id: String,
+    pub meeting_id: String,
+    pub speaker_label: String,
+    pub participant_name: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Transcript {
     pub id: String,
     pub meeting_id: String,
     pub original_content: Option<String>,
     pub proofread_content: Option<String>,
+    pub manual_content: Option<String>,
+    pub manual_base_version: Option<String>,
+    pub manual_updated_at: Option<String>,
     pub active_version: String,
     pub proofread_provider: Option<String>,
     pub proofread_at: Option<String>,
@@ -65,6 +78,10 @@ pub struct Recording {
     pub meeting_id: String,
     pub file_path: Option<String>,
     pub duration_seconds: Option<i64>,
+    pub sort_order: i64,
+    pub segment_transcript: Option<String>,
+    pub segment_proofread: Option<String>,
+    pub no_break_before: i64,
     pub created_at: String,
 }
 
@@ -91,6 +108,13 @@ pub struct CreateTemplateRequest {
     pub name: String,
     pub title: String,
     pub category_id: Option<String>,
+    pub participants: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateTemplateRequest {
+    pub name: String,
+    pub title: String,
     pub participants: Vec<String>,
 }
 

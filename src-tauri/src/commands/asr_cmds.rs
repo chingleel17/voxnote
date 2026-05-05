@@ -4,7 +4,7 @@ use tauri::{AppHandle, Emitter, State};
 use crate::{
     asr::{detect_local_asr, transcribe_assemblyai, transcribe_local_whisper, LocalAsrInfo},
     config::load_config,
-    db::transcript,
+    db::{recording, transcript},
 };
 
 #[tauri::command]
@@ -12,9 +12,11 @@ pub async fn detect_local_asr_tools() -> Result<Vec<LocalAsrInfo>, String> {
     Ok(detect_local_asr())
 }
 
+/// 轉譯指定錄音段落，完成後自動合併所有段落至逐字稿
 #[tauri::command]
 pub async fn start_transcription(
     meeting_id: String,
+    recording_id: String,
     file_path: String,
     app: AppHandle,
     pool: State<'_, SqlitePool>,
@@ -52,9 +54,36 @@ pub async fn start_transcription(
         other => return Err(format!("未知的 ASR 供應商：{}", other)),
     };
 
-    transcript::upsert_transcript_original(&pool, &meeting_id, &text)
+    // 儲存此段落的轉譯結果
+    recording::update_segment_transcript(&pool, &recording_id, &text)
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(text)
+    // 取得所有已轉譯段落並合併
+    let segments = recording::get_segment_transcripts_with_break(&pool, &meeting_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let merged = recording::merge_segment_texts(&segments);
+
+    transcript::upsert_transcript_original(&pool, &meeting_id, &merged)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if let Some(proofread_merged) = recording::get_merged_proofread_text(&pool, &meeting_id)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        let provider = transcript::get_transcript(&pool, &meeting_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|item| item.proofread_provider)
+            .unwrap_or_else(|| "segment-proofread".to_string());
+
+        transcript::update_proofread(&pool, &meeting_id, &proofread_merged, &provider)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(merged)
 }

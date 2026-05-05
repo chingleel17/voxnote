@@ -3,6 +3,7 @@ import { renderHomePage } from './pages/home';
 import { renderMeetingPage } from './pages/meeting';
 import { renderRecordPage } from './pages/record';
 import { renderSettingsPage } from './pages/settings';
+import { initStatusBar } from './components/statusBar';
 
 interface ParsedRoute {
   page: string;
@@ -28,7 +29,7 @@ async function renderPage(container: HTMLElement, route: ParsedRoute): Promise<v
       }
       break;
     case 'record':
-      await renderRecordPage(container);
+      await renderRecordPage(container, route.id);
       break;
     case 'settings':
       await renderSettingsPage(container);
@@ -44,6 +45,7 @@ window.addEventListener('DOMContentLoaded', () => {
   if (!sidebar || !content) return;
 
   renderNav(sidebar);
+  initStatusBar();
 
   const initialHash = window.location.hash || '#home';
   if (!window.location.hash) {

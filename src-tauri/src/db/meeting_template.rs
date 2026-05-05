@@ -3,7 +3,7 @@ use chrono::Utc;
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
-use super::models::{CreateTemplateRequest, MeetingTemplate};
+use super::models::{CreateTemplateRequest, MeetingTemplate, UpdateTemplateRequest};
 
 fn row_to_template(row: &sqlx::sqlite::SqliteRow) -> MeetingTemplate {
     let participants_json: String = row.try_get("participants_json").unwrap_or_default();
@@ -63,4 +63,29 @@ pub async fn delete_template(pool: &SqlitePool, id: &str) -> Result<()> {
         .execute(pool)
         .await?;
     Ok(())
+}
+
+pub async fn update_template(
+    pool: &SqlitePool,
+    id: &str,
+    req: UpdateTemplateRequest,
+) -> Result<MeetingTemplate> {
+    let participants_json = serde_json::to_string(&req.participants)?;
+    sqlx::query(
+        "UPDATE meeting_templates SET name = ?, title = ?, participants_json = ? WHERE id = ?",
+    )
+    .bind(&req.name)
+    .bind(&req.title)
+    .bind(&participants_json)
+    .bind(id)
+    .execute(pool)
+    .await?;
+
+    let row = sqlx::query(
+        "SELECT id, name, title, category_id, participants_json, created_at FROM meeting_templates WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row_to_template(&row))
 }

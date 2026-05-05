@@ -1,3 +1,8 @@
+export interface ProofreadResult {
+  content: string;
+  warning: string | null;
+}
+
 export interface Category {
   id: string;
   name: string;
@@ -30,9 +35,21 @@ export interface Transcript {
   meeting_id: string;
   original_content: string | null;
   proofread_content: string | null;
-  active_version: 'original' | 'proofread';
+  manual_content: string | null;
+  manual_base_version: 'original' | 'proofread' | null;
+  manual_updated_at: string | null;
+  active_version: 'original' | 'proofread' | 'manual';
   proofread_provider: string | null;
   proofread_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SpeakerMapping {
+  id: string;
+  meeting_id: string;
+  speaker_label: string;
+  participant_name: string;
   created_at: string;
   updated_at: string;
 }
@@ -50,6 +67,10 @@ export interface Recording {
   meeting_id: string;
   file_path: string | null;
   duration_seconds: number | null;
+  sort_order: number;
+  segment_transcript: string | null;
+  segment_proofread: string | null;
+  no_break_before: number;
   created_at: string;
 }
 
@@ -76,6 +97,10 @@ export interface AppConfig {
   custom_endpoint: string;
   custom_api_key: string;
   custom_model: string;
+
+  // AI Prompt 自訂（空字串代表使用內建預設 Prompt）
+  proofread_prompt: string;
+  summary_prompt: string;
 }
 
 export interface SavedParticipant {
@@ -98,6 +123,12 @@ export interface CreateTemplateRequest {
   name: string;
   title: string;
   category_id: string | null;
+  participants: string[];
+}
+
+export interface UpdateTemplateRequest {
+  name: string;
+  title: string;
   participants: string[];
 }
 

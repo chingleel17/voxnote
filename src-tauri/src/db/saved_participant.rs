@@ -64,3 +64,42 @@ pub async fn delete_saved_participant(pool: &SqlitePool, id: &str) -> Result<()>
         .await?;
     Ok(())
 }
+
+pub async fn update_saved_participant(
+    pool: &SqlitePool,
+    id: &str,
+    name: &str,
+) -> Result<SavedParticipant> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("參與者名稱不可為空");
+    }
+
+    let duplicated = sqlx::query_as::<_, SavedParticipant>(
+        "SELECT id, name, usage_count, created_at FROM saved_participants WHERE name = ? AND id <> ?",
+    )
+    .bind(trimmed)
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    if duplicated.is_some() {
+        anyhow::bail!("常用參與者名稱已存在");
+    }
+
+    let result = sqlx::query("UPDATE saved_participants SET name = ? WHERE id = ?")
+        .bind(trimmed)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        anyhow::bail!("找不到常用參與者");
+    }
+
+    let updated = sqlx::query_as::<_, SavedParticipant>(
+        "SELECT id, name, usage_count, created_at FROM saved_participants WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+    Ok(updated)
+}

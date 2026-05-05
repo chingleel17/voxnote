@@ -1,8 +1,9 @@
 import type { SavedParticipant, MeetingTemplate, Tag, Category } from '../types';
-import { getSavedParticipants, deleteSavedParticipant, upsertSavedParticipant } from '../api/participants';
-import { getTemplates, deleteTemplate } from '../api/templates';
+import { getSavedParticipants, deleteSavedParticipant, updateSavedParticipant, upsertSavedParticipant } from '../api/participants';
+import { getTemplates, deleteTemplate, updateTemplate } from '../api/templates';
 import { getTags, createTag, deleteTag } from '../api/tags';
 import { getCategories, createCategory, deleteCategory } from '../api/meetings';
+import { openModal } from '../components/modal';
 import { showToast } from '../components/toast';
 
 type TabKey = 'participants' | 'templates' | 'tags' | 'categories';
@@ -163,8 +164,40 @@ export async function renderManagePage(container: HTMLElement): Promise<void> {
         }
       });
 
+      // 重新命名：點「重新命名」後切換成 inline input
+      const renameBtn = document.createElement('button');
+      renameBtn.className = 'btn btn-secondary btn-sm';
+      renameBtn.textContent = '重新命名';
+      renameBtn.addEventListener('click', () => {
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'form-control manage-rename-input';
+        input.value = p.name;
+        nameEl.replaceWith(input);
+        renameBtn.style.display = 'none';
+        input.focus();
+        input.select();
+
+        const doRename = async () => {
+          const newName = input.value.trim();
+          if (!newName || newName === p.name) { build(); return; }
+          try {
+            const updated = await updateSavedParticipant(p.id, newName);
+            const idx = savedParticipants.findIndex((x) => x.id === p.id);
+            if (idx >= 0) savedParticipants[idx] = updated;
+            build();
+          } catch (err) {
+            showToast(`重新命名失敗：${String(err)}`, 'error');
+            build();
+          }
+        };
+        input.addEventListener('keydown', (e) => { if (e.key === 'Enter') void doRename(); if (e.key === 'Escape') build(); });
+        input.addEventListener('blur', () => void doRename());
+      });
+
       row.appendChild(avatar);
       row.appendChild(info);
+      row.appendChild(renameBtn);
       row.appendChild(delBtn);
       list.appendChild(row);
     }
@@ -223,13 +256,99 @@ export async function renderManagePage(container: HTMLElement): Promise<void> {
         }
       });
 
+      // 編輯按鈕：開啟 modal 修改範本
+      const editBtn = document.createElement('button');
+      editBtn.className = 'btn btn-secondary btn-sm';
+      editBtn.textContent = '編輯';
+      editBtn.addEventListener('click', () => openTemplateEditModal(tpl));
+
       row.appendChild(icon);
       row.appendChild(info);
+      row.appendChild(editBtn);
       row.appendChild(delBtn);
       list.appendChild(row);
     }
     wrap.appendChild(list);
     return wrap;
+  }
+
+  // ─────────────── 模板編輯 Modal ───────────────
+  function openTemplateEditModal(tpl: MeetingTemplate): void {
+    const form = document.createElement('div');
+    form.className = 'form-group-list';
+
+    // 範本名稱
+    const nameGroup = document.createElement('div');
+    nameGroup.className = 'form-group';
+    const nameLabel = document.createElement('label');
+    nameLabel.textContent = '範本名稱';
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.className = 'form-control';
+    nameInput.value = tpl.name;
+    nameGroup.appendChild(nameLabel);
+    nameGroup.appendChild(nameInput);
+    form.appendChild(nameGroup);
+
+    // 預設會議標題
+    const titleGroup = document.createElement('div');
+    titleGroup.className = 'form-group';
+    const titleLabel = document.createElement('label');
+    titleLabel.textContent = '預設會議標題';
+    const titleInput = document.createElement('input');
+    titleInput.type = 'text';
+    titleInput.className = 'form-control';
+    titleInput.value = tpl.title;
+    titleGroup.appendChild(titleLabel);
+    titleGroup.appendChild(titleInput);
+    form.appendChild(titleGroup);
+
+    // 預設參與者（逗號/頓號分隔）
+    const partGroup = document.createElement('div');
+    partGroup.className = 'form-group';
+    const partLabel = document.createElement('label');
+    partLabel.textContent = '預設參與者（以逗號或頓號分隔）';
+    const partInput = document.createElement('input');
+    partInput.type = 'text';
+    partInput.className = 'form-control';
+    partInput.value = tpl.participants.join('、');
+    partInput.placeholder = '例如：王小明、李大華';
+    partGroup.appendChild(partLabel);
+    partGroup.appendChild(partInput);
+    form.appendChild(partGroup);
+
+    openModal({
+      title: '編輯範本',
+      content: form,
+      confirmText: '儲存',
+      cancelText: '取消',
+      onConfirm: async () => {
+        const newName = nameInput.value.trim();
+        const newTitle = titleInput.value.trim();
+        if (!newName || !newTitle) {
+          showToast('範本名稱與會議標題不可為空', 'error');
+          return false;
+        }
+        const newParticipants = partInput.value
+          .split(/[,，、]/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+        try {
+          const updated = await updateTemplate(tpl.id, {
+            name: newName,
+            title: newTitle,
+            participants: newParticipants,
+          });
+          const idx = templates.findIndex((x) => x.id === tpl.id);
+          if (idx >= 0) templates[idx] = updated;
+          build();
+        } catch (err) {
+          showToast(`儲存失敗：${String(err)}`, 'error');
+          return false;
+        }
+      },
+    });
+    nameInput.focus();
   }
 
   // ─────────────── 標籤 ───────────────

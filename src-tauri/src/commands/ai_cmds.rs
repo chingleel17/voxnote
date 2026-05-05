@@ -1,22 +1,215 @@
+use serde::Serialize;
 use sqlx::SqlitePool;
 use tauri::{AppHandle, State};
 
 use crate::{
     ai::call_llm,
     config::load_config,
-    db::{summary, transcript},
+    db::{recording, summary, transcript},
 };
 
-const PROOFREAD_SYSTEM: &str = "你是一位專業的逐字稿校對助理。請修正以下逐字稿的錯別字、語句不通順之處，並保持原本的意思和說話風格。直接輸出校正後的完整文字，不要加任何說明。";
+const PROOFREAD_SYSTEM: &str = "\
+你是一位專業的中文會議記錄校對員。\
+請校正以下逐字稿中的錯字（同音字、漏字、多字、標點錯誤）。\
+保留所有時間標記 [MM:SS] 不得刪除或修改。\
+保留所有講者標記（例如「講者A：」）不得刪除。\
+【重要】必須輸出完整的全部逐字稿內容，嚴禁使用任何省略標記，\
+例如「[略]」「[...]」「[... 略]」「[省略]」「...」「（以下略）」「（略）」等，\
+無論逐字稿有多長，都必須逐行完整輸出，不得跳過任何段落。\
+只輸出修正後的完整逐字稿，不要加任何說明或前後文。";
 
-const SUMMARY_SYSTEM: &str = "你是一位專業的會議記錄助理。請根據以下會議逐字稿，生成一份結構清晰的會議摘要，包含：主要討論議題、重要決議、待辦事項。使用繁體中文，以 Markdown 格式輸出。";
+const SUMMARY_SYSTEM: &str = "\
+你是一位專業的會議記錄助理。請根據以下逐字稿生成結構清晰的會議摘要。\
+使用繁體中文，以 Markdown 格式輸出，包含以下章節（若無相關內容可省略該章節）：\n\
+## 會議摘要\n\
+## 參與人員\n\
+## 主要議題\n\
+## 決議事項\n\
+## 待辦事項（TODO）\n\
+## 重要時間點（含 [MM:SS] 時間標記）\n\
+## 專有名詞說明";
+
+/// 逐字稿分段時，對每個片段提取重點的輕量 prompt
+const CHUNK_SUMMARY_SYSTEM: &str = "\
+你是一位專業的會議記錄助理。請根據以下會議逐字稿片段，提取關鍵資訊。\
+使用繁體中文條列式輸出，包含：決議事項、待辦事項（TODO）、主要討論重點、重要時間點（含 [MM:SS] 時間標記）。\
+請精簡扼要，不需輸出完整摘要格式，只需條列重點。";
+
+/// 各段重點合併後，生成最終完整摘要的 prompt
+const FINAL_SUMMARY_SYSTEM: &str = "\
+你是一位專業的會議記錄助理。以下是一場會議各段落的重點摘要，請根據這些資料整合生成完整的會議摘要。\
+使用繁體中文，以 Markdown 格式輸出，包含以下章節（若無相關內容可省略該章節）：\n\
+## 會議摘要\n\
+## 參與人員\n\
+## 主要議題\n\
+## 決議事項\n\
+## 待辦事項（TODO）\n\
+## 重要時間點（含 [MM:SS] 時間標記）\n\
+## 專有名詞說明";
+
+/// 將逐字稿依行分塊，每塊不超過 max_chars 字元（完整行不截斷）
+fn chunk_transcript(text: &str, max_chars: usize) -> Vec<String> {
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for line in text.lines() {
+        let line_with_nl = format!("{}\n", line);
+        if !current.is_empty() && current.len() + line_with_nl.len() > max_chars {
+            chunks.push(current.trim_end().to_string());
+            current = String::new();
+        }
+        current.push_str(&line_with_nl);
+    }
+    let trimmed = current.trim_end().to_string();
+    if !trimmed.is_empty() {
+        chunks.push(trimmed);
+    }
+    chunks
+}
+
+/// 偵測 LLM 是否使用省略標記（如 [略]、[... 略]、[...]）輸出不完整內容
+fn detect_abbreviation(text: &str) -> bool {
+    // 「略]」出現超過 3 次（允許正常用詞如「大略」「概略」）
+    let abbrev_bracket = text.matches("略]").count();
+    if abbrev_bracket > 3 {
+        return true;
+    }
+    // 「[...]」或「[…]」省略號模式
+    if text.matches("[...]").count() > 3 || text.matches("[…]").count() > 3 {
+        return true;
+    }
+    false
+}
+fn count_timestamps(text: &str) -> usize {
+    let mut count = 0;
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i + 6 < len {
+        if bytes[i] == b'['
+            && bytes[i + 3] == b':'
+            && bytes[i + 1].is_ascii_digit()
+            && bytes[i + 2].is_ascii_digit()
+            && bytes[i + 4].is_ascii_digit()
+            && bytes[i + 5].is_ascii_digit()
+        {
+            count += 1;
+            i += 6;
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+#[derive(Serialize)]
+pub struct ProofreadResult {
+    pub content: String,
+    pub warning: Option<String>,
+}
+
+async fn proofread_text(
+    config: &crate::config::AppConfig,
+    original: &str,
+) -> Result<String, String> {
+    if original.is_empty() {
+        return Err("逐字稿內容為空".into());
+    }
+
+    let proofread_system: &str = if config.proofread_prompt.is_empty() {
+        PROOFREAD_SYSTEM
+    } else {
+        &config.proofread_prompt
+    };
+
+    const CHUNK_SIZE: usize = 4000;
+    let chunks = chunk_transcript(original, CHUNK_SIZE);
+    let total_chunks = chunks.len();
+
+    let mut proofread_chunks: Vec<String> = Vec::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let chunk_result = call_llm(config, proofread_system, chunk)
+            .await
+            .map_err(|e| {
+                if total_chunks > 1 {
+                    format!("AI 校稿失敗（第{}/{}段）：{}", i + 1, total_chunks, e)
+                } else {
+                    e.to_string()
+                }
+            })?;
+
+        if detect_abbreviation(&chunk_result) {
+            let msg = if total_chunks > 1 {
+                format!(
+                    "AI 校稿失敗：第{}/{}段模型輸出了省略標記（[略]/[...]），未完整校稿。\
+                    請重試或改用支援長文本的模型。",
+                    i + 1,
+                    total_chunks
+                )
+            } else {
+                "AI 校稿失敗：模型輸出了省略標記（[略]/[...]），未完整校稿逐字稿。\
+                請嘗試重新校稿，或改用支援長文本的模型。"
+                    .to_string()
+            };
+            return Err(msg);
+        }
+
+        let chunk_orig_chars = chunk.chars().count();
+        let chunk_proof_chars = chunk_result.chars().count();
+        if chunk_orig_chars > 0 {
+            let chunk_ratio = chunk_proof_chars as f64 / chunk_orig_chars as f64;
+            if chunk_ratio < 0.45 {
+                return Err(format!(
+                    "AI 校稿失敗：第{}/{}段結果字數（{}字）異常少於原始（{}字），疑似截斷，已放棄。",
+                    i + 1,
+                    total_chunks,
+                    chunk_proof_chars,
+                    chunk_orig_chars
+                ));
+            }
+        }
+
+        proofread_chunks.push(chunk_result);
+    }
+
+    let proofread = proofread_chunks.join("\n");
+    let orig_chars = original.chars().count();
+    let proof_chars = proofread.chars().count();
+    let orig_ts = count_timestamps(original);
+    let proof_ts = count_timestamps(&proofread);
+
+    let char_ratio = if orig_chars > 0 {
+        proof_chars as f64 / orig_chars as f64
+    } else {
+        1.0
+    };
+    let ts_ratio = if orig_ts > 0 {
+        proof_ts as f64 / orig_ts as f64
+    } else {
+        1.0
+    };
+
+    if char_ratio < 0.60 {
+        return Err(format!(
+            "AI 校稿失敗：校稿結果字數（{}字）遠少於原始逐字稿（{}字），疑似截斷，已放棄此次結果。請重試或改用支援長文本的模型。",
+            proof_chars, orig_chars
+        ));
+    }
+    if orig_ts > 0 && ts_ratio < 0.70 {
+        return Err(format!(
+            "AI 校稿失敗：校稿後時間標記數量（{}個）遠少於原始（{}個），疑似內容遺失，已放棄此次結果。",
+            proof_ts, orig_ts
+        ));
+    }
+
+    Ok(proofread)
+}
 
 #[tauri::command]
 pub async fn proofread_transcript(
     meeting_id: String,
     app: AppHandle,
     pool: State<'_, SqlitePool>,
-) -> Result<String, String> {
+) -> Result<ProofreadResult, String> {
     let config = load_config(&app).map_err(|e| e.to_string())?;
 
     let t = transcript::get_transcript(&pool, &meeting_id)
@@ -25,20 +218,79 @@ pub async fn proofread_transcript(
         .ok_or("找不到逐字稿")?;
 
     let original = t.original_content.unwrap_or_default();
-    if original.is_empty() {
-        return Err("逐字稿內容為空".into());
-    }
-
-    let proofread = call_llm(&config, PROOFREAD_SYSTEM, &original)
-        .await
-        .map_err(|e| e.to_string())?;
+    let proofread = proofread_text(&config, &original).await?;
 
     let provider = config.llm_provider.clone();
     transcript::update_proofread(&pool, &meeting_id, &proofread, &provider)
         .await
         .map_err(|e| e.to_string())?;
+    recording::clear_segment_proofreads_for_meeting(&pool, &meeting_id)
+        .await
+        .map_err(|e| e.to_string())?;
 
-    Ok(proofread)
+    Ok(ProofreadResult {
+        content: proofread,
+        warning: None,
+    })
+}
+
+#[tauri::command]
+pub async fn proofread_recording_segment(
+    meeting_id: String,
+    recording_id: String,
+    app: AppHandle,
+    pool: State<'_, SqlitePool>,
+) -> Result<ProofreadResult, String> {
+    let config = load_config(&app).map_err(|e| e.to_string())?;
+    let recording_item = recording::get_recording_by_id(&pool, &recording_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("找不到錄音段落")?;
+
+    if recording_item.meeting_id != meeting_id {
+        return Err("錄音段落不屬於此會議".into());
+    }
+
+    let original_segment = recording_item
+        .segment_transcript
+        .ok_or("此錄音段落尚未產生逐字稿")?;
+
+    let proofread_segment = proofread_text(&config, &original_segment).await?;
+    recording::update_segment_proofread(&pool, &recording_id, &proofread_segment)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if transcript::get_transcript(&pool, &meeting_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .is_none()
+    {
+        let merged_original = recording::get_segment_transcripts_with_break(&pool, &meeting_id)
+            .await
+            .map_err(|e| e.to_string())
+            .map(|segments| recording::merge_segment_texts(&segments))?;
+
+        if !merged_original.is_empty() {
+            transcript::upsert_transcript_original(&pool, &meeting_id, &merged_original)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    let merged_proofread = recording::get_merged_proofread_text(&pool, &meeting_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("無法建立校稿後逐字稿")?;
+
+    let provider = config.llm_provider.clone();
+    transcript::update_proofread(&pool, &meeting_id, &merged_proofread, &provider)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(ProofreadResult {
+        content: proofread_segment,
+        warning: None,
+    })
 }
 
 #[tauri::command]
@@ -56,8 +308,9 @@ pub async fn generate_summary(
 
     // 優先使用校稿版本，若無則用原始版本
     let content = t
-        .proofread_content
+        .manual_content
         .filter(|s| !s.is_empty())
+        .or(t.proofread_content.filter(|s| !s.is_empty()))
         .or(t.original_content)
         .unwrap_or_default();
 
@@ -65,9 +318,46 @@ pub async fn generate_summary(
         return Err("逐字稿內容為空".into());
     }
 
-    let summary_text = call_llm(&config, SUMMARY_SYSTEM, &content)
-        .await
-        .map_err(|e| e.to_string())?;
+    // 使用自訂 prompt（若設定為空則用內建預設）
+    let summary_system: &str = if config.summary_prompt.is_empty() {
+        SUMMARY_SYSTEM
+    } else {
+        &config.summary_prompt
+    };
+
+    // 分塊總結：超過 20,000 字元時分段處理，避免模型靜默截斷
+    const SUMMARY_CHUNK_SIZE: usize = 20_000;
+    let summary_text = if content.len() <= SUMMARY_CHUNK_SIZE {
+        call_llm(&config, summary_system, &content)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        // 分塊：每塊用輕量 prompt 提取重點
+        let chunks = chunk_transcript(&content, SUMMARY_CHUNK_SIZE);
+        let total_chunks = chunks.len();
+        let mut chunk_summaries: Vec<String> = Vec::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let partial = call_llm(&config, CHUNK_SUMMARY_SYSTEM, chunk)
+                .await
+                .map_err(|e| format!("會議總結失敗（第{}/{}段）：{}", i + 1, total_chunks, e))?;
+            chunk_summaries.push(partial);
+        }
+        // 各段重點合併後，再做一次整合摘要
+        let combined = chunk_summaries
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("【第{}段重點】\n{}", i + 1, s))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let final_system: &str = if config.summary_prompt.is_empty() {
+            FINAL_SUMMARY_SYSTEM
+        } else {
+            &config.summary_prompt
+        };
+        call_llm(&config, final_system, &combined)
+            .await
+            .map_err(|e| e.to_string())?
+    };
 
     let provider = config.llm_provider.clone();
     summary::upsert_summary(&pool, &meeting_id, &summary_text, &provider)

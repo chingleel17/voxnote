@@ -317,7 +317,7 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 1000;
+  z-index: 1300;
   opacity: 0;
   transition: opacity var(--transition);
 }
@@ -578,6 +578,168 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
 .speaker-D { color: #ec4899; }
 .speaker-E { color: #14b8a6; }
 
+.speaker-mapping-panel {
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin-bottom: 12px;
+}
+
+.speaker-mapping-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  margin-bottom: 8px;
+}
+
+.speaker-mapping-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.speaker-mapping-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: nowrap;
+}
+
+.speaker-mapping-row .transcript-speaker {
+  white-space: nowrap;
+  flex-shrink: 0;
+  display: inline-block;
+  margin-right: 0;
+}
+
+.speaker-mapping-select {
+  min-width: 150px;
+  padding: 6px 8px;
+  font-size: 13px;
+}
+
+.transcript-base-options {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.transcript-base-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-bg-tertiary);
+}
+
+.transcript-base-option-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.transcript-fullscreen-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.82);
+  z-index: 1200;
+  padding: 20px;
+}
+
+.transcript-fullscreen-panel {
+  width: 100%;
+  height: 100%;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  display: flex;
+  flex-direction: column;
+  box-shadow: var(--shadow-lg);
+}
+
+.transcript-fullscreen-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 20px 12px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.transcript-fullscreen-title {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.transcript-fullscreen-meta {
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.transcript-fullscreen-header-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.transcript-icon-btn {
+  min-width: 32px;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.transcript-fullscreen-tabs {
+  padding: 12px 20px 0;
+}
+
+.transcript-fullscreen-body {
+  flex: 1;
+  min-height: 0;
+  padding: 12px 20px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.transcript-fullscreen-content {
+  flex: 1;
+  max-height: none;
+}
+
+.transcript-fullscreen-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 14px 20px 18px;
+  border-top: 1px solid var(--color-border);
+}
+
+.transcript-editor-hint {
+  margin-bottom: 8px;
+}
+
+.transcript-editor {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  resize: none;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-bg-tertiary);
+  color: var(--color-text);
+  padding: 14px;
+  font: inherit;
+  line-height: 1.7;
+}
+
 /* 摘要 Markdown */
 .markdown-body { line-height: 1.7; }
 .markdown-body h2 { font-size: 17px; margin: 12px 0 6px; }
@@ -590,6 +752,91 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
 /* 音訊播放器 */
 .audio-player { width: 100%; margin-top: 8px; border-radius: var(--radius); }
 .audio-duration { font-size: 12px; color: var(--color-text-muted); margin-bottom: 6px; }
+
+/* 多段錄音 */
+.recording-segment {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin-bottom: 8px;
+}
+.recording-segment-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.recording-segment-title {
+  font-weight: 600;
+  font-size: 14px;
+}
+.recording-segment-duration {
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+.recording-segment-status {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-weight: 500;
+}
+.recording-segment-status.transcribed {
+  background: #d1fae5;
+  color: #065f46;
+}
+.recording-segment-status.pending {
+  background: #fef3c7;
+  color: #92400e;
+}
+.recording-segment-status.processing {
+  background: #dbeafe;
+  color: #1e40af;
+}
+.recording-segment-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+.recording-break-divider {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  padding: 6px 0;
+  border-top: 1px dashed var(--color-border);
+  border-bottom: 1px dashed var(--color-border);
+  margin: 4px 0;
+}
+.recording-break-divider.removed {
+  opacity: 0.45;
+  border-style: dotted;
+}
+.break-toggle-btn {
+  font-size: 11px;
+  padding: 1px 6px;
+  opacity: 0.7;
+}
+.break-toggle-btn:hover {
+  opacity: 1;
+}
+.recording-collapse-btn {
+  font-size: 12px;
+  margin-left: auto;
+}
+.recording-add-btn {
+  margin-top: 10px;
+  width: 100%;
+}
+.btn-danger {
+  background: #ef4444;
+  color: #fff;
+  border: none;
+}
+.btn-danger:hover {
+  background: #dc2626;
+}
 
 /* ============================================================
    錄音頁
@@ -812,10 +1059,34 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
   display: flex;
   gap: 8px;
   align-items: center;
+  flex-wrap: wrap;
 }
 
 .participant-select-row .form-control {
   flex: 1;
+  min-width: 180px;
+}
+
+.template-select-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.template-select-row .form-control {
+  flex: 1;
+  min-width: 180px;
+}
+
+.participant-select-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.text-danger {
+  color: var(--color-error) !important;
 }
 
 .participant-list {
@@ -1057,3 +1328,46 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
   cursor: pointer;
 }
 
+
+/* ============================================================
+   全域狀態列（Status Bar）
+   ============================================================ */
+#status-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 28px;
+  background: var(--color-surface);
+  border-top: 1px solid var(--color-border);
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  z-index: 1000;
+  transition: opacity var(--transition);
+}
+#status-bar.hidden {
+  display: none;
+}
+
+/* ============================================================
+   btn-xs（超小按鈕）
+   ============================================================ */
+.btn-xs {
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+}
+
+/* ============================================================
+   Manage Page - rename input inline
+   ============================================================ */
+.manage-rename-input {
+  flex: 1;
+  max-width: 280px;
+  height: 32px;
+  padding: 4px 8px;
+  font-size: 14px;
+}

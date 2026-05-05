@@ -1,7 +1,7 @@
 import type { MeetingWithDetails, Category, CreateMeetingRequest, SavedParticipant, MeetingTemplate, CreateTemplateRequest, Tag } from '../types';
 import { getMeetings, getCategories, createMeeting, deleteMeeting } from '../api/meetings';
 import { getSavedParticipants, upsertSavedParticipant } from '../api/participants';
-import { getTemplates, createTemplate } from '../api/templates';
+import { getTemplates, createTemplate, deleteTemplate, updateTemplate } from '../api/templates';
 import { getTags, createTag, deleteTag } from '../api/tags';
 import { openModal } from '../components/modal';
 import { showToast } from '../components/toast';
@@ -15,7 +15,9 @@ function formatDate(dateStr: string): string {
 function buildCreateMeetingForm(
   categories: Category[],
   savedParticipants: SavedParticipant[],
-  templates: MeetingTemplate[]
+  templates: MeetingTemplate[],
+  onSavedParticipantsChanged?: (participants: SavedParticipant[]) => void,
+  onTemplatesChanged?: (templates: MeetingTemplate[]) => void
 ): {
   el: HTMLElement;
   getData: () => CreateMeetingRequest | null;
@@ -23,42 +25,221 @@ function buildCreateMeetingForm(
 } {
   const form = document.createElement('div');
   form.className = 'form-group-list';
+  let localTemplates = [...templates];
 
   // 套用範本下拉
-  if (templates.length > 0) {
+  if (localTemplates.length > 0) {
     const tplGroup = document.createElement('div');
     tplGroup.className = 'form-group';
     const tplLabel = document.createElement('label');
     tplLabel.textContent = '套用範本（可選）';
+    const tplRow = document.createElement('div');
+    tplRow.className = 'template-select-row';
     const tplSelect = document.createElement('select');
     tplSelect.className = 'form-control';
-    const emptyOpt = document.createElement('option');
-    emptyOpt.value = '';
-    emptyOpt.textContent = '── 不套用 ──';
-    tplSelect.appendChild(emptyOpt);
-    for (const tpl of templates) {
-      const opt = document.createElement('option');
-      opt.value = tpl.id;
-      opt.textContent = tpl.name;
-      tplSelect.appendChild(opt);
-    }
 
     // 選擇後自動套用
     tplSelect.addEventListener('change', () => {
-      const tpl = templates.find((t) => t.id === tplSelect.value);
+      const tpl = getSelectedTemplate();
       if (!tpl) return;
       titleInput.value = tpl.title;
       catSelect.value = tpl.category_id ?? '';
       // 重建參與者列表
       partEditorContainer.innerHTML = '';
-      const newEditor = buildParticipantEditor(tpl.participants, savedParticipants);
+      const newEditor = buildParticipantEditor(tpl.participants, savedParticipants, {
+        allowManageSaved: true,
+        onSavedParticipantsChanged,
+      });
       partEditorContainer.appendChild(newEditor.el);
       getParticipantsRef = newEditor.getParticipants;
+      updateTemplateActionButtons();
+    });
+
+    const editTplBtn = document.createElement('button');
+    editTplBtn.type = 'button';
+    editTplBtn.className = 'btn btn-secondary btn-sm';
+    editTplBtn.textContent = '編輯';
+    editTplBtn.addEventListener('click', () => {
+      const tpl = getSelectedTemplate();
+      if (!tpl) return;
+      openTemplateEditModal(tpl);
+    });
+
+    const deleteTplBtn = document.createElement('button');
+    deleteTplBtn.type = 'button';
+    deleteTplBtn.className = 'btn btn-danger btn-sm';
+    deleteTplBtn.textContent = '刪除';
+    deleteTplBtn.addEventListener('click', async () => {
+      const tpl = getSelectedTemplate();
+      if (!tpl) return;
+      if (!confirm(`確定要刪除範本「${tpl.name}」嗎？`)) return;
+      try {
+        await deleteTemplate(tpl.id);
+        localTemplates = localTemplates.filter((t) => t.id !== tpl.id);
+        onTemplatesChanged?.([...localTemplates]);
+        renderTemplateOptions();
+        showToast('範本已刪除', 'success');
+      } catch (err) {
+        showToast(`刪除失敗：${String(err)}`, 'error');
+      }
     });
 
     tplGroup.appendChild(tplLabel);
-    tplGroup.appendChild(tplSelect);
+    tplRow.appendChild(tplSelect);
+    tplRow.appendChild(editTplBtn);
+    tplRow.appendChild(deleteTplBtn);
+    tplGroup.appendChild(tplRow);
     form.appendChild(tplGroup);
+    renderTemplateOptions();
+
+    function renderTemplateOptions(selectedId = tplSelect.value): void {
+      tplSelect.innerHTML = '';
+      const emptyOpt = document.createElement('option');
+      emptyOpt.value = '';
+      emptyOpt.textContent = '── 不套用 ──';
+      tplSelect.appendChild(emptyOpt);
+      for (const tpl of localTemplates) {
+        const opt = document.createElement('option');
+        opt.value = tpl.id;
+        opt.textContent = tpl.name;
+        tplSelect.appendChild(opt);
+      }
+      if (selectedId && localTemplates.some((tpl) => tpl.id === selectedId)) {
+        tplSelect.value = selectedId;
+      }
+      updateTemplateActionButtons();
+    }
+
+    function getSelectedTemplate(): MeetingTemplate | undefined {
+      return localTemplates.find((tpl) => tpl.id === tplSelect.value);
+    }
+
+    function updateTemplateActionButtons(): void {
+      const hasSelected = Boolean(getSelectedTemplate());
+      editTplBtn.disabled = !hasSelected;
+      deleteTplBtn.disabled = !hasSelected;
+    }
+
+    function openTemplateEditModal(tpl: MeetingTemplate): void {
+      const editForm = document.createElement('div');
+      editForm.className = 'form-group-list';
+
+      const nameGroup = document.createElement('div');
+      nameGroup.className = 'form-group';
+      const nameLabel = document.createElement('label');
+      nameLabel.textContent = '範本名稱';
+      const nameInput = document.createElement('input');
+      nameInput.type = 'text';
+      nameInput.className = 'form-control';
+      nameInput.value = tpl.name;
+      nameGroup.appendChild(nameLabel);
+      nameGroup.appendChild(nameInput);
+      editForm.appendChild(nameGroup);
+
+      const titleGroup = document.createElement('div');
+      titleGroup.className = 'form-group';
+      const titleLabel = document.createElement('label');
+      titleLabel.textContent = '預設會議標題';
+      const templateTitleInput = document.createElement('input');
+      templateTitleInput.type = 'text';
+      templateTitleInput.className = 'form-control';
+      templateTitleInput.value = tpl.title;
+      titleGroup.appendChild(titleLabel);
+      titleGroup.appendChild(templateTitleInput);
+      editForm.appendChild(titleGroup);
+
+      const participantGroup = document.createElement('div');
+      participantGroup.className = 'form-group';
+      const participantLabel = document.createElement('label');
+      participantLabel.textContent = '預設參與者（以逗號或頓號分隔）';
+      const participantInput = document.createElement('input');
+      participantInput.type = 'text';
+      participantInput.className = 'form-control';
+      participantInput.value = tpl.participants.join('、');
+      participantGroup.appendChild(participantLabel);
+      participantGroup.appendChild(participantInput);
+      editForm.appendChild(participantGroup);
+
+      const overlay = document.createElement('div');
+      overlay.className = 'modal-overlay modal-visible';
+      overlay.style.zIndex = '1100';
+
+      const modal = document.createElement('div');
+      modal.className = 'modal';
+
+      const header = document.createElement('div');
+      header.className = 'modal-header';
+      const modalTitle = document.createElement('h3');
+      modalTitle.className = 'modal-title';
+      modalTitle.textContent = '編輯會議範本';
+      const closeBtn = document.createElement('button');
+      closeBtn.type = 'button';
+      closeBtn.className = 'modal-close';
+      closeBtn.textContent = '×';
+      closeBtn.addEventListener('click', () => overlay.remove());
+      header.appendChild(modalTitle);
+      header.appendChild(closeBtn);
+
+      const body = document.createElement('div');
+      body.className = 'modal-body';
+      body.appendChild(editForm);
+
+      const footer = document.createElement('div');
+      footer.className = 'modal-footer';
+      const cancelBtn = document.createElement('button');
+      cancelBtn.type = 'button';
+      cancelBtn.className = 'btn btn-secondary';
+      cancelBtn.textContent = '取消';
+      cancelBtn.addEventListener('click', () => overlay.remove());
+      const saveBtn = document.createElement('button');
+      saveBtn.type = 'button';
+      saveBtn.className = 'btn btn-primary';
+      saveBtn.textContent = '儲存';
+      saveBtn.addEventListener('click', async () => {
+          const name = nameInput.value.trim();
+          const templateTitle = templateTitleInput.value.trim();
+          if (!name || !templateTitle) {
+            showToast('範本名稱與會議標題不可為空', 'error');
+            return;
+          }
+          const participants = participantInput.value
+            .split(/[,，、]/)
+            .map((p) => p.trim())
+            .filter(Boolean);
+          saveBtn.disabled = true;
+          try {
+            const updated = await updateTemplate(tpl.id, {
+              name,
+              title: templateTitle,
+              participants,
+            });
+            const idx = localTemplates.findIndex((item) => item.id === tpl.id);
+            if (idx >= 0) localTemplates[idx] = updated;
+            onTemplatesChanged?.([...localTemplates]);
+            renderTemplateOptions(updated.id);
+            showToast('範本已更新', 'success');
+            overlay.remove();
+          } catch (err) {
+            showToast(`儲存失敗：${String(err)}`, 'error');
+            saveBtn.disabled = false;
+          }
+        });
+
+      footer.appendChild(cancelBtn);
+      footer.appendChild(saveBtn);
+      modal.appendChild(header);
+      modal.appendChild(body);
+      modal.appendChild(footer);
+      overlay.appendChild(modal);
+      overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) overlay.remove();
+      });
+      document.body.appendChild(overlay);
+      setTimeout(() => {
+        nameInput.focus();
+        nameInput.select();
+      }, 0);
+    }
   }
 
   // 標題輸入
@@ -95,7 +276,10 @@ function buildCreateMeetingForm(
 
   // 參與者列表編輯器
   const partEditorContainer = document.createElement('div');
-  const initialEditor = buildParticipantEditor([], savedParticipants);
+  const initialEditor = buildParticipantEditor([], savedParticipants, {
+    allowManageSaved: true,
+    onSavedParticipantsChanged,
+  });
   partEditorContainer.appendChild(initialEditor.el);
   let getParticipantsRef = initialEditor.getParticipants;
 
@@ -378,7 +562,17 @@ export async function renderHomePage(container: HTMLElement): Promise<void> {
   }
 
   function openAddModal(): void {
-    const { el, getData, getSaveAsTemplate } = buildCreateMeetingForm(categories, savedParticipants, templates);
+    const { el, getData, getSaveAsTemplate } = buildCreateMeetingForm(
+      categories,
+      savedParticipants,
+      templates,
+      (updated) => {
+        savedParticipants.splice(0, savedParticipants.length, ...updated);
+      },
+      (updated) => {
+        templates.splice(0, templates.length, ...updated);
+      }
+    );
     openModal({
       title: '新增會議',
       content: el,

@@ -12,6 +12,7 @@ use commands::{
     meeting_cmds::*,
     recording_cmds::*,
     settings_cmds::*,
+    speaker_mapping_cmds::*,
     summary_cmds::*,
     tag_cmds::*,
     template_cmds::*,
@@ -48,14 +49,24 @@ pub fn run() {
             get_transcript,
             save_transcript_original,
             save_transcript_proofread,
+            save_transcript_manual,
             switch_transcript_version,
+            // speaker mappings
+            get_speaker_mappings,
+            upsert_speaker_mapping,
+            delete_speaker_mapping,
             // summary
             get_summary,
             save_summary,
             // recording
             get_recording,
+            get_recordings,
             save_recording,
             write_recording_file,
+            delete_recording,
+            set_no_break_before,
+            reorder_recordings,
+            remerge_segments,
             // settings
             get_settings,
             save_settings,
@@ -64,6 +75,7 @@ pub fn run() {
             test_llm_connection_cmd,
             // ai
             proofread_transcript,
+            proofread_recording_segment,
             generate_summary,
             // asr
             detect_local_asr_tools,
@@ -72,9 +84,11 @@ pub fn run() {
             get_saved_participants,
             upsert_saved_participant,
             delete_saved_participant,
+            update_saved_participant,
             get_meeting_templates,
             create_meeting_template,
             delete_meeting_template,
+            update_meeting_template,
             // tags
             get_tags,
             create_tag,

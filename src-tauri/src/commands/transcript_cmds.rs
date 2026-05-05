@@ -37,6 +37,18 @@ pub async fn save_transcript_proofread(
 }
 
 #[tauri::command]
+pub async fn save_transcript_manual(
+    meeting_id: String,
+    manual_content: String,
+    base_version: String,
+    pool: State<'_, SqlitePool>,
+) -> Result<Transcript, String> {
+    transcript::update_manual(&pool, &meeting_id, &manual_content, &base_version)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn switch_transcript_version(
     meeting_id: String,
     version: String,

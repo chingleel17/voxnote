@@ -7,7 +7,7 @@ use super::models::Transcript;
 
 pub async fn get_transcript(pool: &SqlitePool, meeting_id: &str) -> Result<Option<Transcript>> {
     let row = sqlx::query_as::<_, Transcript>(
-        "SELECT id, meeting_id, original_content, proofread_content, active_version, proofread_provider, proofread_at, created_at, updated_at FROM transcripts WHERE meeting_id = ?",
+        "SELECT id, meeting_id, original_content, proofread_content, manual_content, manual_base_version, manual_updated_at, active_version, proofread_provider, proofread_at, created_at, updated_at FROM transcripts WHERE meeting_id = ?",
     )
     .bind(meeting_id)
     .fetch_optional(pool)
@@ -75,14 +75,67 @@ pub async fn update_proofread(
         .ok_or_else(|| anyhow::anyhow!("校稿更新後無法取得"))
 }
 
+pub async fn update_manual(
+    pool: &SqlitePool,
+    meeting_id: &str,
+    manual_content: &str,
+    base_version: &str,
+) -> Result<Transcript> {
+    if base_version != "original" && base_version != "proofread" {
+        return Err(anyhow::anyhow!(
+            "手動編輯來源版本必須是 'original' 或 'proofread'，收到：{}",
+            base_version
+        ));
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let existing = get_transcript(pool, meeting_id).await?;
+
+    if existing.is_some() {
+        sqlx::query(
+            "UPDATE transcripts
+             SET manual_content = ?, manual_base_version = ?, manual_updated_at = ?, active_version = 'manual', updated_at = ?
+             WHERE meeting_id = ?",
+        )
+        .bind(manual_content)
+        .bind(base_version)
+        .bind(&now)
+        .bind(&now)
+        .bind(meeting_id)
+        .execute(pool)
+        .await?;
+    } else {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO transcripts (
+                id, meeting_id, original_content, proofread_content, manual_content, manual_base_version, manual_updated_at,
+                active_version, created_at, updated_at
+            ) VALUES (?, ?, NULL, NULL, ?, ?, ?, 'manual', ?, ?)",
+        )
+        .bind(&id)
+        .bind(meeting_id)
+        .bind(manual_content)
+        .bind(base_version)
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await?;
+    }
+
+    get_transcript(pool, meeting_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("手動編輯版更新後無法取得"))
+}
+
 pub async fn switch_version(
     pool: &SqlitePool,
     meeting_id: &str,
     version: &str,
 ) -> Result<Transcript> {
-    if version != "original" && version != "proofread" {
+    if version != "original" && version != "proofread" && version != "manual" {
         return Err(anyhow::anyhow!(
-            "版本必須是 'original' 或 'proofread'，收到：{}",
+            "版本必須是 'original'、'proofread' 或 'manual'，收到：{}",
             version
         ));
     }
