@@ -7,10 +7,10 @@ use crate::db::{
 };
 
 #[tauri::command]
-pub async fn get_meetings(
-    pool: State<'_, SqlitePool>,
-) -> Result<Vec<MeetingWithDetails>, String> {
-    meeting::get_meetings(&pool).await.map_err(|e| e.to_string())
+pub async fn get_meetings(pool: State<'_, SqlitePool>) -> Result<Vec<MeetingWithDetails>, String> {
+    meeting::get_meetings(&pool)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -45,10 +45,7 @@ pub async fn update_meeting(
 }
 
 #[tauri::command]
-pub async fn delete_meeting(
-    id: String,
-    pool: State<'_, SqlitePool>,
-) -> Result<(), String> {
+pub async fn delete_meeting(id: String, pool: State<'_, SqlitePool>) -> Result<(), String> {
     meeting::delete_meeting(&pool, &id)
         .await
         .map_err(|e| e.to_string())
@@ -72,10 +69,7 @@ pub async fn create_category(
 }
 
 #[tauri::command]
-pub async fn delete_category(
-    id: String,
-    pool: State<'_, SqlitePool>,
-) -> Result<(), String> {
+pub async fn delete_category(id: String, pool: State<'_, SqlitePool>) -> Result<(), String> {
     category::delete_category(&pool, &id)
         .await
         .map_err(|e| e.to_string())

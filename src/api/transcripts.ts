@@ -10,3 +10,4 @@ export const saveTranscriptManual = (
   baseVersion: 'original' | 'proofread',
 ) => invoke<Transcript>('save_transcript_manual', { meetingId, manualContent, baseVersion });
 export const switchTranscriptVersion = (meetingId: string, version: 'original' | 'proofread' | 'manual') => invoke<Transcript>('switch_transcript_version', { meetingId, version });
+export const exportTextFileToPath = (path: string, content: string) => invoke<void>('export_text_file', { path, content });

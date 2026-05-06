@@ -101,31 +101,55 @@ fn count_timestamps(text: &str) -> usize {
     count
 }
 
+fn is_chunk_likely_incomplete(original: &str, proofread: &str) -> bool {
+    if proofread.trim().is_empty() {
+        return true;
+    }
+
+    if detect_abbreviation(proofread) {
+        return true;
+    }
+
+    let orig_chars = original.chars().count();
+    let proof_chars = proofread.chars().count();
+    if orig_chars > 0 && (proof_chars as f64 / orig_chars as f64) < 0.45 {
+        return true;
+    }
+
+    let orig_ts = count_timestamps(original);
+    let proof_ts = count_timestamps(proofread);
+    orig_ts > 0 && (proof_ts as f64 / orig_ts as f64) < 0.5
+}
+
+struct ProofreadAttempt {
+    result: ProofreadResult,
+    should_retry: bool,
+}
+
+fn is_retriable_proofread_error(message: &str) -> bool {
+    message.contains("回傳空內容")
+        || message.contains("輸出不完整")
+        || message.contains("遭截斷")
+        || message.contains("未產生正文")
+}
+
 #[derive(Serialize)]
 pub struct ProofreadResult {
     pub content: String,
     pub warning: Option<String>,
 }
 
-async fn proofread_text(
+async fn proofread_text_for_chunks(
     config: &crate::config::AppConfig,
     original: &str,
-) -> Result<String, String> {
-    if original.is_empty() {
-        return Err("逐字稿內容為空".into());
-    }
-
-    let proofread_system: &str = if config.proofread_prompt.is_empty() {
-        PROOFREAD_SYSTEM
-    } else {
-        &config.proofread_prompt
-    };
-
-    const CHUNK_SIZE: usize = 4000;
-    let chunks = chunk_transcript(original, CHUNK_SIZE);
+    proofread_system: &str,
+    chunks: Vec<String>,
+) -> Result<ProofreadAttempt, String> {
     let total_chunks = chunks.len();
 
     let mut proofread_chunks: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut should_retry = false;
     for (i, chunk) in chunks.iter().enumerate() {
         let chunk_result = call_llm(config, proofread_system, chunk)
             .await
@@ -137,20 +161,27 @@ async fn proofread_text(
                 }
             })?;
 
+        if chunk_result.trim().is_empty() {
+            should_retry = true;
+            warnings.push(format!(
+                "第{}/{}段模型回傳空內容，可能是輸出遭截斷或模型未產生正文。",
+                i + 1,
+                total_chunks
+            ));
+        }
+
         if detect_abbreviation(&chunk_result) {
             let msg = if total_chunks > 1 {
                 format!(
-                    "AI 校稿失敗：第{}/{}段模型輸出了省略標記（[略]/[...]），未完整校稿。\
-                    請重試或改用支援長文本的模型。",
+                    "第{}/{}段模型輸出了省略標記（[略]/[...]），結果可能不完整。",
                     i + 1,
                     total_chunks
                 )
             } else {
-                "AI 校稿失敗：模型輸出了省略標記（[略]/[...]），未完整校稿逐字稿。\
-                請嘗試重新校稿，或改用支援長文本的模型。"
-                    .to_string()
+                "模型輸出了省略標記（[略]/[...]），結果可能不完整。".to_string()
             };
-            return Err(msg);
+            warnings.push(msg);
+            should_retry = true;
         }
 
         let chunk_orig_chars = chunk.chars().count();
@@ -158,14 +189,35 @@ async fn proofread_text(
         if chunk_orig_chars > 0 {
             let chunk_ratio = chunk_proof_chars as f64 / chunk_orig_chars as f64;
             if chunk_ratio < 0.45 {
-                return Err(format!(
-                    "AI 校稿失敗：第{}/{}段結果字數（{}字）異常少於原始（{}字），疑似截斷，已放棄。",
+                warnings.push(format!(
+                    "第{}/{}段結果字數（{}字）明顯少於原始（{}字），可能有截斷。",
                     i + 1,
                     total_chunks,
                     chunk_proof_chars,
                     chunk_orig_chars
                 ));
+                should_retry = true;
             }
+        }
+
+        let chunk_orig_ts = count_timestamps(chunk);
+        let chunk_proof_ts = count_timestamps(&chunk_result);
+        if chunk_orig_ts > 0 {
+            let chunk_ts_ratio = chunk_proof_ts as f64 / chunk_orig_ts as f64;
+            if chunk_ts_ratio < 0.50 {
+                warnings.push(format!(
+                    "第{}/{}段時間標記數量（{}個）少於原始（{}個），可能有段落遺失或格式遭改動。",
+                    i + 1,
+                    total_chunks,
+                    chunk_proof_ts,
+                    chunk_orig_ts
+                ));
+                should_retry = true;
+            }
+        }
+
+        if is_chunk_likely_incomplete(chunk, &chunk_result) {
+            should_retry = true;
         }
 
         proofread_chunks.push(chunk_result);
@@ -189,19 +241,76 @@ async fn proofread_text(
     };
 
     if char_ratio < 0.60 {
-        return Err(format!(
-            "AI 校稿失敗：校稿結果字數（{}字）遠少於原始逐字稿（{}字），疑似截斷，已放棄此次結果。請重試或改用支援長文本的模型。",
+        warnings.push(format!(
+            "校稿結果字數（{}字）明顯少於原始逐字稿（{}字），可能有內容遺失。",
             proof_chars, orig_chars
         ));
     }
     if orig_ts > 0 && ts_ratio < 0.70 {
-        return Err(format!(
-            "AI 校稿失敗：校稿後時間標記數量（{}個）遠少於原始（{}個），疑似內容遺失，已放棄此次結果。",
+        warnings.push(format!(
+            "校稿後時間標記數量（{}個）少於原始（{}個），可能有段落遺失或格式遭改動。",
             proof_ts, orig_ts
         ));
+        should_retry = true;
     }
 
-    Ok(proofread)
+    let warning = (!warnings.is_empty()).then(|| warnings.join(" "));
+
+    Ok(ProofreadAttempt {
+        result: ProofreadResult {
+            content: proofread,
+            warning,
+        },
+        should_retry,
+    })
+}
+
+async fn proofread_text(
+    config: &crate::config::AppConfig,
+    original: &str,
+) -> Result<ProofreadResult, String> {
+    if original.is_empty() {
+        return Err("逐字稿內容為空".into());
+    }
+
+    let proofread_system: &str = if config.proofread_prompt.is_empty() {
+        PROOFREAD_SYSTEM
+    } else {
+        &config.proofread_prompt
+    };
+    const CHUNK_SIZES: [usize; 4] = [4000, 2500, 1500, 900];
+    let mut last_retry_warning: Option<String> = None;
+
+    for (attempt_index, chunk_size) in CHUNK_SIZES.iter().enumerate() {
+        let chunks = chunk_transcript(original, *chunk_size);
+        let attempt = match proofread_text_for_chunks(config, original, proofread_system, chunks)
+            .await
+        {
+            Ok(attempt) => attempt,
+            Err(err)
+                if is_retriable_proofread_error(&err) && attempt_index + 1 < CHUNK_SIZES.len() =>
+            {
+                last_retry_warning = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        if !attempt.should_retry {
+            return Ok(attempt.result);
+        }
+
+        last_retry_warning = attempt.result.warning.clone();
+        if attempt_index + 1 == CHUNK_SIZES.len() {
+            break;
+        }
+    }
+
+    Err(format!(
+        "AI 校稿結果多次重試後仍可能不完整，已停止儲存。{}",
+        last_retry_warning.unwrap_or_else(|| {
+            "請改用較小模型片段、關閉模型思考模式，或確認供應商輸出限制。".to_string()
+        })
+    ))
 }
 
 #[tauri::command]
@@ -218,20 +327,41 @@ pub async fn proofread_transcript(
         .ok_or("找不到逐字稿")?;
 
     let original = t.original_content.unwrap_or_default();
-    let proofread = proofread_text(&config, &original).await?;
-
-    let provider = config.llm_provider.clone();
-    transcript::update_proofread(&pool, &meeting_id, &proofread, &provider)
+    transcript::mark_proofread_running(&pool, &meeting_id)
         .await
         .map_err(|e| e.to_string())?;
+
+    let proofread = match proofread_text(&config, &original).await {
+        Ok(result) => result,
+        Err(err) => {
+            transcript::mark_proofread_failed(&pool, &meeting_id, &err)
+                .await
+                .map_err(|e| e.to_string())?;
+            return Err(err);
+        }
+    };
+
+    let provider = config.llm_provider.clone();
+    if let Err(e) = transcript::update_proofread(
+        &pool,
+        &meeting_id,
+        &proofread.content,
+        &provider,
+        proofread.warning.as_deref(),
+    )
+    .await
+    {
+        let error = e.to_string();
+        transcript::mark_proofread_failed(&pool, &meeting_id, &error)
+            .await
+            .map_err(|mark_err| mark_err.to_string())?;
+        return Err(error);
+    }
     recording::clear_segment_proofreads_for_meeting(&pool, &meeting_id)
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok(ProofreadResult {
-        content: proofread,
-        warning: None,
-    })
+    Ok(proofread)
 }
 
 #[tauri::command]
@@ -256,7 +386,7 @@ pub async fn proofread_recording_segment(
         .ok_or("此錄音段落尚未產生逐字稿")?;
 
     let proofread_segment = proofread_text(&config, &original_segment).await?;
-    recording::update_segment_proofread(&pool, &recording_id, &proofread_segment)
+    recording::update_segment_proofread(&pool, &recording_id, &proofread_segment.content)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -283,14 +413,17 @@ pub async fn proofread_recording_segment(
         .ok_or("無法建立校稿後逐字稿")?;
 
     let provider = config.llm_provider.clone();
-    transcript::update_proofread(&pool, &meeting_id, &merged_proofread, &provider)
-        .await
-        .map_err(|e| e.to_string())?;
+    transcript::update_proofread(
+        &pool,
+        &meeting_id,
+        &merged_proofread,
+        &provider,
+        proofread_segment.warning.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
-    Ok(ProofreadResult {
-        content: proofread_segment,
-        warning: None,
-    })
+    Ok(proofread_segment)
 }
 
 #[tauri::command]

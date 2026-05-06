@@ -3,7 +3,12 @@ import type { Recording } from '../types';
 
 export const getRecording = (meetingId: string) => invoke<Recording | null>('get_recording', { meetingId });
 export const getRecordings = (meetingId: string) => invoke<Recording[]>('get_recordings', { meetingId });
-export const saveRecording = (meetingId: string, filePath: string, durationSeconds: number | null) => invoke<Recording>('save_recording', { meetingId, filePath, durationSeconds });
+export const saveRecording = (
+  meetingId: string,
+  filePath: string,
+  originalFileName: string | null,
+  durationSeconds: number | null,
+) => invoke<Recording>('save_recording', { meetingId, filePath, originalFileName, durationSeconds });
 export const deleteRecording = (recordingId: string) => invoke<void>('delete_recording', { recordingId });
 export const setNoBreakBefore = (recordingId: string, noBreakBefore: boolean) => invoke<void>('set_no_break_before', { recordingId, noBreakBefore });
 export const reorderRecordings = (meetingId: string, recordingIds: string[]) =>
@@ -17,5 +22,6 @@ export const writeRecordingFile = (
   meetingId: string,
   fileData: number[],
   fileName: string,
+  originalFileName: string | null,
   durationSeconds: number | null,
-) => invoke<Recording>('write_recording_file', { meetingId, fileData, fileName, durationSeconds });
+) => invoke<Recording>('write_recording_file', { meetingId, fileData, fileName, originalFileName, durationSeconds });

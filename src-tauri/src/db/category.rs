@@ -25,7 +25,11 @@ pub async fn create_category(pool: &SqlitePool, name: &str) -> Result<Category> 
         .execute(pool)
         .await?;
 
-    Ok(Category { id, name: name.to_string(), created_at: now })
+    Ok(Category {
+        id,
+        name: name.to_string(),
+        created_at: now,
+    })
 }
 
 pub async fn delete_category(pool: &SqlitePool, id: &str) -> Result<()> {

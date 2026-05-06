@@ -27,12 +27,19 @@ pub async fn get_recordings(
 pub async fn save_recording(
     meeting_id: String,
     file_path: String,
+    original_file_name: Option<String>,
     duration_seconds: Option<i64>,
     pool: State<'_, SqlitePool>,
 ) -> Result<Recording, String> {
-    recording::create_recording(&pool, &meeting_id, Some(&file_path), duration_seconds)
-        .await
-        .map_err(|e| e.to_string())
+    recording::create_recording(
+        &pool,
+        &meeting_id,
+        Some(&file_path),
+        original_file_name.as_deref(),
+        duration_seconds,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// 接收音訊位元組，寫入 {app_data_dir}/recordings/ 後存路徑至 DB
@@ -41,6 +48,7 @@ pub async fn write_recording_file(
     meeting_id: String,
     file_data: Vec<u8>,
     file_name: String,
+    original_file_name: Option<String>,
     duration_seconds: Option<i64>,
     app_handle: AppHandle,
     pool: State<'_, SqlitePool>,
@@ -58,9 +66,15 @@ pub async fn write_recording_file(
 
     let file_path_str = file_path.to_string_lossy().to_string();
 
-    recording::create_recording(&pool, &meeting_id, Some(&file_path_str), duration_seconds)
-        .await
-        .map_err(|e| e.to_string())
+    recording::create_recording(
+        &pool,
+        &meeting_id,
+        Some(&file_path_str),
+        original_file_name.as_deref(),
+        duration_seconds,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -68,9 +82,16 @@ pub async fn delete_recording(
     recording_id: String,
     pool: State<'_, SqlitePool>,
 ) -> Result<(), String> {
-    recording::delete_recording(&pool, &recording_id)
+    if let Some(meeting_id) = recording::delete_recording(&pool, &recording_id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?
+    {
+        transcript::sync_generated_content_from_recordings(&pool, &meeting_id)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -94,31 +115,9 @@ pub async fn reorder_recordings(
         .await
         .map_err(|e| e.to_string())?;
 
-    let merged = recording::get_segment_transcripts_with_break(&pool, &meeting_id)
+    transcript::sync_generated_content_from_recordings(&pool, &meeting_id)
         .await
-        .map_err(|e| e.to_string())
-        .map(|segments| recording::merge_segment_texts(&segments))?;
-
-    if !merged.is_empty() {
-        transcript::upsert_transcript_original(&pool, &meeting_id, &merged)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-
-    if let Some(proofread_merged) = recording::get_merged_proofread_text(&pool, &meeting_id)
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        let provider = transcript::get_transcript(&pool, &meeting_id)
-            .await
-            .map_err(|e| e.to_string())?
-            .and_then(|item| item.proofread_provider)
-            .unwrap_or_else(|| "segment-proofread".to_string());
-
-        transcript::update_proofread(&pool, &meeting_id, &proofread_merged, &provider)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
+        .map_err(|e| e.to_string())?;
 
     Ok(reordered)
 }
@@ -132,30 +131,11 @@ pub async fn remerge_segments(
     let segments = recording::get_segment_transcripts_with_break(&pool, &meeting_id)
         .await
         .map_err(|e| e.to_string())?;
-
     let merged = recording::merge_segment_texts(&segments);
 
-    // 僅在有內容時才更新，避免覆蓋已有的逐字稿
-    if !merged.is_empty() {
-        transcript::upsert_transcript_original(&pool, &meeting_id, &merged)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-
-    if let Some(proofread_merged) = recording::get_merged_proofread_text(&pool, &meeting_id)
+    transcript::sync_generated_content_from_recordings(&pool, &meeting_id)
         .await
-        .map_err(|e| e.to_string())?
-    {
-        let provider = transcript::get_transcript(&pool, &meeting_id)
-            .await
-            .map_err(|e| e.to_string())?
-            .and_then(|item| item.proofread_provider)
-            .unwrap_or_else(|| "segment-proofread".to_string());
-
-        transcript::update_proofread(&pool, &meeting_id, &proofread_merged, &provider)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
+        .map_err(|e| e.to_string())?;
 
     Ok(merged)
 }

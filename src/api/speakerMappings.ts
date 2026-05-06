@@ -6,9 +6,10 @@ export const getSpeakerMappings = (meetingId: string) =>
 
 export const upsertSpeakerMapping = (
   meetingId: string,
+  recordingId: string,
   speakerLabel: string,
   participantName: string,
-) => invoke<SpeakerMapping>('upsert_speaker_mapping', { meetingId, speakerLabel, participantName });
+) => invoke<SpeakerMapping>('upsert_speaker_mapping', { meetingId, recordingId, speakerLabel, participantName });
 
-export const deleteSpeakerMapping = (meetingId: string, speakerLabel: string) =>
-  invoke<void>('delete_speaker_mapping', { meetingId, speakerLabel });
+export const deleteSpeakerMapping = (meetingId: string, recordingId: string, speakerLabel: string) =>
+  invoke<void>('delete_speaker_mapping', { meetingId, recordingId, speakerLabel });

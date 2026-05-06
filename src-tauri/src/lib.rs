@@ -7,16 +7,8 @@ mod config;
 mod db;
 
 use commands::{
-    ai_cmds::*,
-    asr_cmds::*,
-    meeting_cmds::*,
-    recording_cmds::*,
-    settings_cmds::*,
-    speaker_mapping_cmds::*,
-    summary_cmds::*,
-    tag_cmds::*,
-    template_cmds::*,
-    transcript_cmds::*,
+    ai_cmds::*, asr_cmds::*, meeting_cmds::*, recording_cmds::*, settings_cmds::*,
+    speaker_mapping_cmds::*, summary_cmds::*, tag_cmds::*, template_cmds::*, transcript_cmds::*,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -28,9 +20,7 @@ pub fn run() {
         .setup(|app| {
             let app_handle = app.handle().clone();
             tauri::async_runtime::block_on(async move {
-                let pool = db::init_db(&app_handle)
-                    .await
-                    .expect("資料庫初始化失敗");
+                let pool = db::init_db(&app_handle).await.expect("資料庫初始化失敗");
                 app_handle.manage(pool);
             });
             Ok(())
@@ -51,6 +41,7 @@ pub fn run() {
             save_transcript_proofread,
             save_transcript_manual,
             switch_transcript_version,
+            export_text_file,
             // speaker mappings
             get_speaker_mappings,
             upsert_speaker_mapping,

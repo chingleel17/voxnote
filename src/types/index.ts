@@ -26,6 +26,7 @@ export interface MeetingWithDetails {
   has_transcript: boolean;
   has_summary: boolean;
   tags: Tag[];
+  meeting_date: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -35,6 +36,10 @@ export interface Transcript {
   meeting_id: string;
   original_content: string | null;
   proofread_content: string | null;
+  proofread_status: 'idle' | 'running' | 'completed' | 'failed' | 'interrupted';
+  proofread_error: string | null;
+  proofread_warning: string | null;
+  proofread_started_at: string | null;
   manual_content: string | null;
   manual_base_version: 'original' | 'proofread' | null;
   manual_updated_at: string | null;
@@ -48,6 +53,7 @@ export interface Transcript {
 export interface SpeakerMapping {
   id: string;
   meeting_id: string;
+  recording_id: string | null;
   speaker_label: string;
   participant_name: string;
   created_at: string;
@@ -66,6 +72,7 @@ export interface Recording {
   id: string;
   meeting_id: string;
   file_path: string | null;
+  original_file_name: string | null;
   duration_seconds: number | null;
   sort_order: number;
   segment_transcript: string | null;
@@ -94,6 +101,7 @@ export interface AppConfig {
   openrouter_model: string;
   ollama_endpoint: string;
   ollama_model: string;
+  ollama_think_level: 'off' | 'low' | 'medium' | 'high';
   custom_endpoint: string;
   custom_api_key: string;
   custom_model: string;
@@ -144,6 +152,7 @@ export interface UpdateMeetingRequest {
   category_id: string | null;
   participants: string[];
   tag_ids?: string[];
+  meeting_date?: string | null;
 }
 
 export interface Tag {

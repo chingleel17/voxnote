@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS transcripts (
     proofread_content TEXT,
     proofread_status TEXT NOT NULL DEFAULT 'idle',
     proofread_error TEXT,
+    proofread_warning TEXT,
     proofread_started_at TEXT,
     manual_content TEXT,
     manual_base_version TEXT,
@@ -145,7 +146,10 @@ pub async fn init_db(app: &AppHandle) -> Result<SqlitePool> {
     std::fs::create_dir_all(&data_dir)?;
 
     let db_path = data_dir.join("voxnote.db");
-    let db_url = format!("sqlite:///{}?mode=rwc", db_path.to_string_lossy().replace('\\', "/"));
+    let db_url = format!(
+        "sqlite:///{}?mode=rwc",
+        db_path.to_string_lossy().replace('\\', "/")
+    );
 
     let pool = SqlitePool::connect(&db_url).await?;
 
@@ -170,16 +174,22 @@ pub async fn init_db(app: &AppHandle) -> Result<SqlitePool> {
     let _ = sqlx::query("ALTER TABLE recordings ADD COLUMN segment_proofread TEXT")
         .execute(&pool)
         .await;
-    let _ = sqlx::query("ALTER TABLE recordings ADD COLUMN no_break_before INTEGER NOT NULL DEFAULT 0")
-        .execute(&pool)
-        .await;
+    let _ =
+        sqlx::query("ALTER TABLE recordings ADD COLUMN no_break_before INTEGER NOT NULL DEFAULT 0")
+            .execute(&pool)
+            .await;
     let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN manual_content TEXT")
         .execute(&pool)
         .await;
-    let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN proofread_status TEXT NOT NULL DEFAULT 'idle'")
+    let _ = sqlx::query(
+        "ALTER TABLE transcripts ADD COLUMN proofread_status TEXT NOT NULL DEFAULT 'idle'",
+    )
+    .execute(&pool)
+    .await;
+    let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN proofread_error TEXT")
         .execute(&pool)
         .await;
-    let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN proofread_error TEXT")
+    let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN proofread_warning TEXT")
         .execute(&pool)
         .await;
     let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN proofread_started_at TEXT")

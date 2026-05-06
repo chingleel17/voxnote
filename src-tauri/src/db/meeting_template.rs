@@ -7,8 +7,7 @@ use super::models::{CreateTemplateRequest, MeetingTemplate, UpdateTemplateReques
 
 fn row_to_template(row: &sqlx::sqlite::SqliteRow) -> MeetingTemplate {
     let participants_json: String = row.try_get("participants_json").unwrap_or_default();
-    let participants: Vec<String> =
-        serde_json::from_str(&participants_json).unwrap_or_default();
+    let participants: Vec<String> = serde_json::from_str(&participants_json).unwrap_or_default();
     MeetingTemplate {
         id: row.get("id"),
         name: row.get("name"),

@@ -41,6 +41,7 @@ pub struct Transcript {
     pub proofread_content: Option<String>,
     pub proofread_status: String,
     pub proofread_error: Option<String>,
+    pub proofread_warning: Option<String>,
     pub proofread_started_at: Option<String>,
     pub manual_content: Option<String>,
     pub manual_base_version: Option<String>,

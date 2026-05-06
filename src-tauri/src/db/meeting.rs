@@ -15,6 +15,7 @@ const MEETING_SELECT_SQL: &str = r#"
         GROUP_CONCAT(p.name, ',') AS participants_concat,
         CAST(EXISTS(SELECT 1 FROM transcripts t WHERE t.meeting_id = m.id) AS INTEGER) AS has_transcript,
         CAST(EXISTS(SELECT 1 FROM summaries s WHERE s.meeting_id = m.id) AS INTEGER) AS has_summary,
+        m.meeting_date,
         m.created_at,
         m.updated_at
     FROM meetings m
@@ -42,6 +43,7 @@ fn row_to_meeting(row: &sqlx::sqlite::SqliteRow) -> MeetingWithDetails {
         has_transcript: has_transcript != 0,
         has_summary: has_summary != 0,
         tags: vec![],
+        meeting_date: row.get("meeting_date"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -64,7 +66,9 @@ pub async fn get_meeting(pool: &SqlitePool, id: &str) -> Result<Option<MeetingWi
         Some(m) => m,
         None => return Ok(None),
     };
-    meeting.tags = get_meeting_tags(pool, &meeting.id).await.unwrap_or_default();
+    meeting.tags = get_meeting_tags(pool, &meeting.id)
+        .await
+        .unwrap_or_default();
     Ok(Some(meeting))
 }
 
@@ -118,9 +122,10 @@ pub async fn update_meeting(
 
     let mut tx = pool.begin().await?;
 
-    sqlx::query("UPDATE meetings SET title = ?, category_id = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE meetings SET title = ?, category_id = ?, meeting_date = ?, updated_at = ? WHERE id = ?")
         .bind(&req.title)
         .bind(&req.category_id)
+        .bind(&req.meeting_date)
         .bind(&now)
         .bind(id)
         .execute(&mut *tx)
@@ -159,4 +164,3 @@ pub async fn delete_meeting(pool: &SqlitePool, id: &str) -> Result<()> {
         .await?;
     Ok(())
 }
-

@@ -360,7 +360,7 @@ function renderMeetingCard(
 
   const dateSpan = document.createElement('span');
   dateSpan.className = 'meeting-card-date';
-  dateSpan.textContent = formatDate(meeting.created_at);
+  dateSpan.textContent = formatDate(meeting.meeting_date ?? meeting.created_at);
   meta.appendChild(dateSpan);
 
   if (meeting.category_name) {

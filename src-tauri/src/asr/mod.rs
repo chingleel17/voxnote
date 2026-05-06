@@ -36,7 +36,11 @@ fn probe_command(name: &str) -> Option<LocalAsrInfo> {
 
     Some(LocalAsrInfo {
         engine: name.to_string(),
-        version: if first_line.is_empty() { "unknown".into() } else { first_line },
+        version: if first_line.is_empty() {
+            "unknown".into()
+        } else {
+            first_line
+        },
         available: true,
     })
 }

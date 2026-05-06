@@ -31,7 +31,7 @@ pub async fn save_transcript_proofread(
     provider: String,
     pool: State<'_, SqlitePool>,
 ) -> Result<Transcript, String> {
-    transcript::update_proofread(&pool, &meeting_id, &proofread_content, &provider)
+    transcript::update_proofread(&pool, &meeting_id, &proofread_content, &provider, None)
         .await
         .map_err(|e| e.to_string())
 }
@@ -57,4 +57,9 @@ pub async fn switch_transcript_version(
     transcript::switch_version(&pool, &meeting_id, &version)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn export_text_file(path: String, content: String) -> Result<(), String> {
+    std::fs::write(&path, content).map_err(|e| format!("無法寫入檔案：{}", e))
 }

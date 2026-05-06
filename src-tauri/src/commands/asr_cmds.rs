@@ -34,22 +34,25 @@ pub async fn start_transcription(
     };
 
     let text = match config.asr_provider.as_str() {
-        "assemblyai" => {
-            transcribe_assemblyai(
-                &config.assembly_ai_key,
+        "assemblyai" => transcribe_assemblyai(
+            &config.assembly_ai_key,
+            &file_path,
+            &config.asr_language,
+            config.speaker_detection,
+            emit_progress,
+        )
+        .await
+        .map_err(|e| e.to_string())?,
+        "local" => {
+            emit_progress("啟動本地 Whisper...".into());
+            transcribe_local_whisper(
+                "whisper",
+                &config.local_asr_model,
                 &file_path,
                 &config.asr_language,
-                config.speaker_detection,
-                emit_progress,
             )
             .await
             .map_err(|e| e.to_string())?
-        }
-        "local" => {
-            emit_progress("啟動本地 Whisper...".into());
-            transcribe_local_whisper("whisper", &config.local_asr_model, &file_path, &config.asr_language)
-                .await
-                .map_err(|e| e.to_string())?
         }
         other => return Err(format!("未知的 ASR 供應商：{}", other)),
     };
@@ -63,27 +66,11 @@ pub async fn start_transcription(
     let segments = recording::get_segment_transcripts_with_break(&pool, &meeting_id)
         .await
         .map_err(|e| e.to_string())?;
-
     let merged = recording::merge_segment_texts(&segments);
 
-    transcript::upsert_transcript_original(&pool, &meeting_id, &merged)
+    transcript::sync_generated_content_from_recordings(&pool, &meeting_id)
         .await
         .map_err(|e| e.to_string())?;
-
-    if let Some(proofread_merged) = recording::get_merged_proofread_text(&pool, &meeting_id)
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        let provider = transcript::get_transcript(&pool, &meeting_id)
-            .await
-            .map_err(|e| e.to_string())?
-            .and_then(|item| item.proofread_provider)
-            .unwrap_or_else(|| "segment-proofread".to_string());
-
-        transcript::update_proofread(&pool, &meeting_id, &proofread_merged, &provider)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
 
     Ok(merged)
 }

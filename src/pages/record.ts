@@ -385,7 +385,7 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
       // 取得完整磁碟路徑後更新 DB
       const dataDir = await appDataDir();
       const filePath = await join(dataDir, 'recordings', fileName);
-      await saveRecording(meetingId, filePath, durationSeconds);
+      await saveRecording(meetingId, filePath, state.uploadedFile?.name ?? null, durationSeconds);
       showToast('錄音已儲存', 'success');
       window.location.hash = `#meeting/${meetingId}`;
     } catch (err) {
@@ -416,7 +416,7 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
     // 設定音訊來源並顯示播放器
     audioEl.src = state.audioBlobUrl;
     playerSection.classList.remove('hidden');
-    playerTitle.textContent = '已載入音訊，請確認後儲存：';
+    playerTitle.textContent = `已載入音訊（${file.name}），請確認後儲存：`;
 
     // Timer 顯示音訊時長
     audioEl.addEventListener('loadedmetadata', () => {

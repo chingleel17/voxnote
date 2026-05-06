@@ -150,6 +150,9 @@ export function createWaveformPlayer(audioEl: HTMLAudioElement): HTMLElement {
 
   audioEl.addEventListener('play', () => {
     playBtn.innerHTML = ICON_PAUSE;
+    document.querySelectorAll<HTMLAudioElement>('audio').forEach((other) => {
+      if (other !== audioEl && !other.paused) other.pause();
+    });
   });
   audioEl.addEventListener('pause', () => {
     playBtn.innerHTML = ICON_PLAY;

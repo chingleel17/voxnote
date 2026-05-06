@@ -1,6 +1,6 @@
 import type { MeetingWithDetails, Transcript, Summary, Recording, SavedParticipant, CreateTemplateRequest, Tag, SpeakerMapping } from '../types';
 import { getMeeting, updateMeeting } from '../api/meetings';
-import { getTranscript, saveTranscriptManual, switchTranscriptVersion } from '../api/transcripts';
+import { exportTextFileToPath, getTranscript, saveTranscriptManual, saveTranscriptProofread, switchTranscriptVersion } from '../api/transcripts';
 import { getSummary } from '../api/summaries';
 import { getRecordings, deleteRecording, setNoBreakBefore, reorderRecordings, remergeSegments } from '../api/recordings';
 import { startTranscription, proofreadRecordingSegment, proofreadTranscript, generateSummary } from '../api/settings';
@@ -13,12 +13,13 @@ import { showToast } from '../components/toast';
 import { createWaveformPlayer } from '../components/audioPlayer';
 import { buildParticipantEditor } from '../components/participantEditor';
 import { convertFileSrc } from '@tauri-apps/api/core';
+import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 import { isProcessing, startProcessing, finishProcessing, onProcessingComplete } from '../utils/processingState';
 
 type TranscriptVersion = 'original' | 'proofread' | 'manual';
 type ManualBaseVersion = 'original' | 'proofread';
 
-const transcriptUtteranceRe = /^\[(\d{2}:\d{2})(?:\s+(講者[A-Za-z0-9]+))?\]\s+(.*)$/;
+const transcriptUtteranceRe = /^\[(\d{2}:\d{2})(?:\s+([^\]]+))?\]\s+(.*)$/;
 const MERGED_BREAK_SEPARATOR = '\n\n--- ☕ 中場休息 ---\n\n';
 
 function parseTimeToSeconds(timeStr: string): number {
@@ -56,7 +57,7 @@ function extractSpeakerLabels(...texts: Array<string | null | undefined>): strin
     for (const line of text.split('\n')) {
       const match = line.trim().match(transcriptUtteranceRe);
       const speaker = match?.[2];
-      if (speaker) speakers.add(speaker);
+      if (speaker?.startsWith('講者')) speakers.add(speaker);
     }
   }
 
@@ -158,6 +159,118 @@ function buildGeneratedTranscriptText(
   }).join('');
 }
 
+function buildGlobalSpeakerLabelMapper(
+  recordings: Recording[],
+  speakerMappings: SpeakerMapping[],
+): (speakerLabel: string) => string {
+  const recIdsWithLabel = new Map<string, Set<string>>();
+  for (const recording of recordings) {
+    const text = recording.segment_transcript ?? '';
+    for (const line of text.split('\n')) {
+      const match = line.trim().match(transcriptUtteranceRe);
+      const label = match?.[2];
+      if (label?.startsWith('講者')) {
+        if (!recIdsWithLabel.has(label)) recIdsWithLabel.set(label, new Set());
+        recIdsWithLabel.get(label)!.add(recording.id);
+      }
+    }
+  }
+
+  const mappingMap = new Map<string, string>();
+  for (const mapping of speakerMappings) {
+    if (mapping.recording_id) {
+      mappingMap.set(
+        `${mapping.recording_id}::${mapping.speaker_label}`,
+        mapping.participant_name?.trim() ?? '',
+      );
+    }
+  }
+
+  const lookup = new Map<string, string>();
+  for (const [label, recIds] of recIdsWithLabel) {
+    const names = new Set([...recIds].map((id) => mappingMap.get(`${id}::${label}`) ?? ''));
+    const nonEmpty = [...names].filter((name) => name !== '');
+    if (nonEmpty.length === 1 && names.size === 1) {
+      lookup.set(label, nonEmpty[0]);
+    }
+  }
+
+  return (speakerLabel) => lookup.get(speakerLabel) ?? speakerLabel;
+}
+
+function getTranscriptBaseText(
+  transcript: Transcript,
+  recordings: Recording[],
+  version: Exclude<TranscriptVersion, 'manual'>,
+): string {
+  if (hasScopedTranscriptText(recordings, version)) {
+    return buildGeneratedTranscriptText(recordings, version, []);
+  }
+
+  return getTranscriptVersionText(transcript, version);
+}
+
+function normalizeTranscriptStructure(text: string): string {
+  return text
+    .split('\n')
+    .map((line) => {
+      const trimmed = line.trim();
+      const match = trimmed.match(transcriptUtteranceRe);
+      if (!match) return trimmed;
+      const [, time, , body] = match;
+      return `[${time}] ${body}`;
+    })
+    .join('\n')
+    .trim();
+}
+
+function sanitizeFileNamePart(value: string): string {
+  return value
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function formatExportDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return sanitizeFileNamePart(value) || '未指定日期';
+  }
+
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}${month}${day}`;
+}
+
+function buildTranscriptExportFileName(meetingTitle: string, meetingDate: string): string {
+  const safeTitle = sanitizeFileNamePart(meetingTitle) || '未命名會議';
+  const safeDate = formatExportDate(meetingDate);
+  return `${safeTitle}_${safeDate}_逐字稿.txt`;
+}
+
+function buildSummaryExportFileName(meetingTitle: string, meetingDate: string): string {
+  const safeTitle = sanitizeFileNamePart(meetingTitle) || '未命名會議';
+  const safeDate = formatExportDate(meetingDate);
+  return `${safeTitle}_${safeDate}_摘要.md`;
+}
+
+function shouldFollowManualBase(
+  transcript: Transcript,
+  recordings: Recording[],
+): transcript is Transcript & { manual_content: string; manual_base_version: ManualBaseVersion } {
+  if (!transcript.manual_content || !transcript.manual_base_version) {
+    return false;
+  }
+
+  const baseText = getTranscriptBaseText(transcript, recordings, transcript.manual_base_version);
+  if (!baseText.trim()) {
+    return false;
+  }
+
+  return normalizeTranscriptStructure(transcript.manual_content) === normalizeTranscriptStructure(baseText);
+}
+
 function getTranscriptDisplayText(
   transcript: Transcript,
   recordings: Recording[],
@@ -168,11 +281,46 @@ function getTranscriptDisplayText(
     return buildGeneratedTranscriptText(recordings, version, speakerMappings);
   }
 
+  if (version === 'manual') {
+    if (!transcript.manual_content) {
+      return '';
+    }
+
+    if (shouldFollowManualBase(transcript, recordings)) {
+      return getTranscriptDisplayText(
+        transcript,
+        recordings,
+        transcript.manual_base_version,
+        speakerMappings,
+      );
+    }
+
+    return mapSpeakerLabelsInText(
+      transcript.manual_content,
+      buildGlobalSpeakerLabelMapper(recordings, speakerMappings),
+    );
+  }
+
   return getTranscriptVersionText(transcript, version);
 }
 
-function hasProofreadVersionAvailable(transcript: Transcript | null, recordings: Recording[]): boolean {
-  return Boolean(transcript?.proofread_content) || hasScopedTranscriptText(recordings, 'proofread');
+async function exportTextFile(
+  text: string,
+  defaultPath: string,
+  filterName: string,
+  extension: string,
+): Promise<boolean> {
+  const path = await saveDialog({
+    defaultPath,
+    filters: [{ name: filterName, extensions: [extension] }],
+  });
+
+  if (!path) {
+    return false;
+  }
+
+  await exportTextFileToPath(path, text);
+  return true;
 }
 
 function getSegmentProofreadProgress(recordings: Recording[]): { proofreadCount: number; transcribedCount: number } {
@@ -188,6 +336,10 @@ function buildProcessingLabel(meetingTitle: string, actionLabel: string, segment
   }
   parts.push(actionLabel);
   return parts.join('-');
+}
+
+function normalizeWarningMessage(warning: string): string {
+  return warning.replace(/\s+/g, ' ').trim();
 }
 
 function renderTranscriptSegmentInto(
@@ -413,6 +565,7 @@ function buildTranscriptSection(
   recordings: Recording[],
   meetingId: string,
   meetingTitle: string,
+  meetingDate: string,
   participants: string[],
   speakerMappings: SpeakerMapping[],
   onSpeakerMappingChanged: (recordingId: string, speakerLabel: string, participantName: string | null) => Promise<void>,
@@ -439,17 +592,19 @@ function buildTranscriptSection(
   }
 
   const loadedTranscript = transcript;
-  const isProofreadVersionAvailable = (): boolean => hasProofreadVersionAvailable(loadedTranscript, recordings);
+  const hasPersistedProofreadVersion = (): boolean => Boolean(loadedTranscript.proofread_content);
   const mappingBySpeaker = buildSpeakerMappingLookup(speakerMappings);
   let localMappings: SpeakerMapping[] = speakerMappings;
+  const mapTranscriptSpeakerLabel = (): ((speakerLabel: string) => string) =>
+    buildGlobalSpeakerLabelMapper(recordings, localMappings);
 
   // 優先使用 DB 記錄的 active_version，但需確認對應內容確實存在
   const dbVersion = loadedTranscript.active_version as TranscriptVersion;
   const initialVersion: TranscriptVersion =
     (dbVersion === 'manual' && loadedTranscript.manual_content) ? 'manual' :
-    (dbVersion === 'proofread' && isProofreadVersionAvailable()) ? 'proofread' :
+    (dbVersion === 'proofread' && hasPersistedProofreadVersion()) ? 'proofread' :
     loadedTranscript.manual_content ? 'manual' :
-    isProofreadVersionAvailable() ? 'proofread' :
+    hasPersistedProofreadVersion() ? 'proofread' :
     'original';
   let currentVersion: TranscriptVersion = initialVersion;
   const proofreadProgress = getSegmentProofreadProgress(recordings);
@@ -489,8 +644,8 @@ function buildTranscriptSection(
   const proofreadBtn = buildTabButton(
     'proofread',
     '校稿版',
-    !isProofreadVersionAvailable(),
-    !isProofreadVersionAvailable() ? '尚未校稿' : undefined,
+    !hasPersistedProofreadVersion(),
+    !hasPersistedProofreadVersion() ? '尚未校稿' : undefined,
   );
   const manualBtn = buildTabButton(
     'manual',
@@ -506,13 +661,19 @@ function buildTranscriptSection(
 
   const replaceTranscript = (updated: Transcript): void => {
     Object.assign(loadedTranscript, updated);
-    if (isProofreadVersionAvailable()) {
+    if (hasPersistedProofreadVersion()) {
       proofreadBtn.disabled = false;
       proofreadBtn.title = '';
+    } else {
+      proofreadBtn.disabled = true;
+      proofreadBtn.title = '尚未校稿';
     }
     if (loadedTranscript.manual_content) {
       manualBtn.disabled = false;
       manualBtn.title = '';
+    } else {
+      manualBtn.disabled = true;
+      manualBtn.title = '尚未建立手動編輯版';
     }
   };
 
@@ -618,52 +779,27 @@ function buildTranscriptSection(
     return firstRec ? getTimeClickHandler(firstRec.id) : undefined;
   };
 
-  const getTextMapSpeakerLabel = (): (speakerLabel: string) => string => {
-    // 從各錄音的 segment_transcript 解析出每個錄音實際存在的講者標籤
-    // （localMappings 只包含有設定過的項目，未設定的講者不在裡面）
-    const recIdsWithLabel = new Map<string, Set<string>>(); // speakerLabel → Set<recordingId>
-    for (const recording of recordings) {
-      const text = recording.segment_transcript ?? '';
-      for (const line of text.split('\n')) {
-        const match = line.trim().match(transcriptUtteranceRe);
-        const label = match?.[2];
-        if (label) {
-          if (!recIdsWithLabel.has(label)) recIdsWithLabel.set(label, new Set());
-          recIdsWithLabel.get(label)!.add(recording.id);
-        }
-      }
-    }
-
-    // localMappings 快查：recordingId::speakerLabel → participantName
-    const mappingMap = new Map<string, string>();
-    for (const m of localMappings) {
-      if (m.recording_id) {
-        mappingMap.set(`${m.recording_id}::${m.speaker_label}`, m.participant_name?.trim() ?? '');
-      }
-    }
-
-    // 只有所有含該標籤的錄音都指定同一個非空名稱時才套用，
-    // 避免 Recording1 未指定 講者C 卻被 Recording2 的對應污染
-    const lookup = new Map<string, string>();
-    for (const [label, recIds] of recIdsWithLabel) {
-      const names = new Set([...recIds].map((id) => mappingMap.get(`${id}::${label}`) ?? ''));
-      const nonEmpty = [...names].filter((n) => n !== '');
-      if (nonEmpty.length === 1 && names.size === 1) {
-        lookup.set(label, nonEmpty[0]);
-      }
-    }
-    return (speakerLabel) => lookup.get(speakerLabel) ?? speakerLabel;
-  };
-
   function showVersion(version: TranscriptVersion): void {
     currentVersion = version;
     if (version !== 'manual' && hasScopedTranscriptText(recordings, version)) {
       renderGeneratedTranscriptInto(content, recordings, version, localMappings, getTimeClickHandler);
+    } else if (
+      version === 'manual'
+      && shouldFollowManualBase(loadedTranscript, recordings)
+      && hasScopedTranscriptText(recordings, loadedTranscript.manual_base_version)
+    ) {
+      renderGeneratedTranscriptInto(
+        content,
+        recordings,
+        loadedTranscript.manual_base_version,
+        localMappings,
+        getTimeClickHandler,
+      );
     } else {
       renderTranscriptTextInto(
         content,
-        getTranscriptVersionText(loadedTranscript, version),
-        getTextMapSpeakerLabel(),
+        getTranscriptDisplayText(loadedTranscript, recordings, version, localMappings),
+        mapTranscriptSpeakerLabel(),
         getFallbackTimeClickHandler(),
       );
     }
@@ -679,13 +815,11 @@ function buildTranscriptSection(
     const chosenBaseVersion = await chooseManualBaseVersion(
       loadedTranscript,
       preferredBaseVersion,
-      isProofreadVersionAvailable(),
+      hasPersistedProofreadVersion(),
     );
     if (!chosenBaseVersion) return false;
 
-    const baseText = chosenBaseVersion === 'proofread'
-      ? getTranscriptDisplayText(loadedTranscript, recordings, 'proofread', localMappings)
-      : getTranscriptVersionText(loadedTranscript, chosenBaseVersion);
+    const baseText = getTranscriptBaseText(loadedTranscript, recordings, chosenBaseVersion);
     if (!baseText) {
       showToast('所選版本目前沒有可建立的逐字稿內容', 'error');
       return false;
@@ -751,7 +885,7 @@ function buildTranscriptSection(
 
     let overlayVersion: TranscriptVersion = initialVersion;
     let isEditing = startEditing;
-    let editorValue = getTranscriptVersionText(loadedTranscript, 'manual');
+    let editorValue = getTranscriptDisplayText(loadedTranscript, recordings, 'manual', localMappings);
 
     const renderFullscreen = (): void => {
       body.innerHTML = '';
@@ -759,7 +893,7 @@ function buildTranscriptSection(
       versionTabs.innerHTML = '';
 
       const manualExists = Boolean(loadedTranscript.manual_content);
-      const canUseProofread = isProofreadVersionAvailable();
+      const canUseProofread = hasPersistedProofreadVersion();
       const versions: Array<{ version: TranscriptVersion; enabled: boolean; title?: string }> = [
         { version: 'original', enabled: true },
         { version: 'proofread', enabled: canUseProofread, title: canUseProofread ? undefined : '尚未校稿' },
@@ -803,7 +937,7 @@ function buildTranscriptSection(
         cancelBtn.textContent = '取消';
         cancelBtn.addEventListener('click', () => {
           isEditing = false;
-          editorValue = getTranscriptVersionText(loadedTranscript, 'manual');
+          editorValue = getTranscriptDisplayText(loadedTranscript, recordings, 'manual', localMappings);
           renderFullscreen();
         });
 
@@ -817,7 +951,7 @@ function buildTranscriptSection(
             replaceTranscript(updated);
             overlayVersion = 'manual';
             isEditing = false;
-            editorValue = getTranscriptVersionText(loadedTranscript, 'manual');
+            editorValue = getTranscriptDisplayText(loadedTranscript, recordings, 'manual', localMappings);
             showVersion('manual');
             renderFullscreen();
             showToast('手動編輯版已儲存', 'success');
@@ -836,11 +970,23 @@ function buildTranscriptSection(
       viewer.className = 'transcript-content transcript-fullscreen-content';
       if (overlayVersion !== 'manual' && hasScopedTranscriptText(recordings, overlayVersion)) {
         renderGeneratedTranscriptInto(viewer, recordings, overlayVersion, localMappings, getTimeClickHandler);
+      } else if (
+        overlayVersion === 'manual'
+        && shouldFollowManualBase(loadedTranscript, recordings)
+        && hasScopedTranscriptText(recordings, loadedTranscript.manual_base_version)
+      ) {
+        renderGeneratedTranscriptInto(
+          viewer,
+          recordings,
+          loadedTranscript.manual_base_version,
+          localMappings,
+          getTimeClickHandler,
+        );
       } else {
         renderTranscriptTextInto(
           viewer,
-          getTranscriptVersionText(loadedTranscript, overlayVersion),
-          getTextMapSpeakerLabel(),
+          getTranscriptDisplayText(loadedTranscript, recordings, overlayVersion, localMappings),
+          mapTranscriptSpeakerLabel(),
           getFallbackTimeClickHandler(),
         );
       }
@@ -860,7 +1006,7 @@ function buildTranscriptSection(
         editBtn.className = 'btn btn-primary';
         editBtn.textContent = '編輯手動版';
         editBtn.addEventListener('click', () => {
-          editorValue = getTranscriptVersionText(loadedTranscript, 'manual');
+          editorValue = getTranscriptDisplayText(loadedTranscript, recordings, 'manual', localMappings);
           isEditing = true;
           renderFullscreen();
         });
@@ -870,13 +1016,13 @@ function buildTranscriptSection(
         createBtn.className = 'btn btn-primary';
         createBtn.textContent = '建立手動編輯版';
         createBtn.addEventListener('click', async () => {
-          const preferredBaseVersion: ManualBaseVersion = overlayVersion === 'proofread' && isProofreadVersionAvailable()
+          const preferredBaseVersion: ManualBaseVersion = overlayVersion === 'proofread' && hasPersistedProofreadVersion()
             ? 'proofread'
             : 'original';
           const created = await ensureManualVersion(preferredBaseVersion);
           if (created) {
             overlayVersion = 'manual';
-            editorValue = getTranscriptVersionText(loadedTranscript, 'manual');
+            editorValue = getTranscriptDisplayText(loadedTranscript, recordings, 'manual', localMappings);
             isEditing = true;
             renderFullscreen();
           }
@@ -913,7 +1059,7 @@ function buildTranscriptSection(
   });
 
   proofreadBtn.addEventListener('click', async () => {
-    if (!isProofreadVersionAvailable()) return;
+    if (!hasPersistedProofreadVersion()) return;
     try {
       await switchTranscriptVersion(meetingId, 'proofread');
       showVersion('proofread');
@@ -956,7 +1102,7 @@ function buildTranscriptSection(
       return;
     }
 
-    const preferredBaseVersion: ManualBaseVersion = isProofreadVersionAvailable() ? 'proofread' : 'original';
+    const preferredBaseVersion: ManualBaseVersion = hasPersistedProofreadVersion() ? 'proofread' : 'original';
     await ensureManualVersion(preferredBaseVersion, true);
   });
 
@@ -973,23 +1119,27 @@ function buildTranscriptSection(
   const exportBtn = document.createElement('button');
   exportBtn.className = 'btn btn-secondary btn-sm';
   exportBtn.textContent = '匯出 TXT';
-  exportBtn.addEventListener('click', () => {
+  exportBtn.addEventListener('click', async () => {
     const text = getTranscriptDisplayText(loadedTranscript, recordings, currentVersion, localMappings);
-    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'transcript.txt';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    try {
+      const exported = await exportTextFile(
+        text,
+        buildTranscriptExportFileName(meetingTitle, meetingDate),
+        '文字檔',
+        'txt',
+      );
+      if (exported) {
+        showToast('逐字稿已匯出', 'success');
+      }
+    } catch (err) {
+      showToast(`匯出失敗：${String(err)}`, 'error');
+    }
   });
 
   const proofreadActionBtn = document.createElement('button');
   proofreadActionBtn.className = 'btn btn-primary btn-sm';
   const isProofreading = isProcessing(proofreadKey) || loadedTranscript.proofread_status === 'running';
-  proofreadActionBtn.textContent = isProofreading ? '校稿中…' : (isProofreadVersionAvailable() ? '重新校稿' : 'AI 校稿');
+  proofreadActionBtn.textContent = isProofreading ? '校稿中…' : (hasPersistedProofreadVersion() ? '重新校稿' : 'AI 校稿');
   proofreadActionBtn.disabled = isProofreading;
 
   if (isProofreading) {
@@ -1006,16 +1156,22 @@ function buildTranscriptSection(
     try {
       const result = await proofreadTranscript(meetingId);
       loadedTranscript.proofread_content = result.content;
+      loadedTranscript.proofread_warning = result.warning ?? null;
       proofreadBtn.disabled = false;
       proofreadBtn.title = '';
       await switchTranscriptVersion(meetingId, 'proofread');
       loadedTranscript.active_version = 'proofread';
       showVersion('proofread');
-      showToast('AI 校稿完成，已切換至校稿版', 'success');
+      showToast(
+        result.warning
+          ? `AI 校稿已完成，但結果可能不完整：${normalizeWarningMessage(result.warning)}`
+          : 'AI 校稿完成，已切換至校稿版',
+        result.warning ? 'warning' : 'success',
+      );
       finishProcessing(proofreadKey);
     } catch (err) {
       showToast(`AI 校稿失敗：${String(err)}`, 'error');
-      proofreadActionBtn.textContent = isProofreadVersionAvailable() ? '重新校稿' : 'AI 校稿';
+      proofreadActionBtn.textContent = hasPersistedProofreadVersion() ? '重新校稿' : 'AI 校稿';
       proofreadActionBtn.disabled = false;
       finishProcessing(proofreadKey, false);
     }
@@ -1047,6 +1203,13 @@ function buildTranscriptSection(
     section.appendChild(hint);
   }
 
+  if (loadedTranscript.proofread_warning) {
+    const hint = document.createElement('p');
+    hint.className = 'form-hint';
+    hint.textContent = `校稿結果可能不完整：${normalizeWarningMessage(loadedTranscript.proofread_warning)}`;
+    section.appendChild(hint);
+  }
+
   function refreshMappings(newMappings: SpeakerMapping[]): void {
     localMappings = newMappings;
     showVersion(currentVersion);
@@ -1059,6 +1222,7 @@ function buildSummarySection(
   summary: Summary | null,
   meetingId: string,
   meetingTitle: string,
+  meetingDate: string,
   onRefresh: () => void,
 ): HTMLElement {
   const summaryKey = `summary:${meetingId}`;
@@ -1131,14 +1295,20 @@ function buildSummarySection(
   const exportBtn = document.createElement('button');
   exportBtn.className = 'btn btn-secondary btn-sm';
   exportBtn.textContent = '匯出 MD';
-  exportBtn.addEventListener('click', () => {
-    const blob = new Blob([summary?.content ?? ''], { type: 'text/markdown;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'summary.md';
-    a.click();
-    URL.revokeObjectURL(url);
+  exportBtn.addEventListener('click', async () => {
+    try {
+      const exported = await exportTextFile(
+        summary?.content ?? '',
+        buildSummaryExportFileName(meetingTitle, meetingDate),
+        'Markdown',
+        'md',
+      );
+      if (exported) {
+        showToast('摘要已匯出', 'success');
+      }
+    } catch (err) {
+      showToast(`匯出失敗：${String(err)}`, 'error');
+    }
   });
 
   actions.appendChild(generateBtn);
@@ -1160,7 +1330,7 @@ function buildRecordingSection(
   onTranscribed: (recordingId: string) => void,
   onDeleted: (id: string) => Promise<void>,
   onReordered: (recordingId: string, direction: -1 | 1) => Promise<void>,
-  onSegmentProofread: (recordingId: string) => Promise<void>,
+  onSegmentProofread: (recordingId: string) => Promise<{ warning: string | null }>,
   onBreakChanged: () => void,
 ): HTMLElement {
   const section = document.createElement('section');
@@ -1352,13 +1522,14 @@ function buildRecordingSection(
         segmentProofreadBtn.textContent = '校稿此段中…';
         showToast(`段落 ${segIndex} 校稿中，請稍候…`, 'info');
         try {
-          await onSegmentProofread(rec.id);
-          finishProcessing(segmentProofreadKey);
-          showToast(`段落 ${segIndex} 校稿完成，已更新校稿版逐字稿`, 'success');
+          const result = await onSegmentProofread(rec.id);
+          showToast(
+            result.warning
+              ? `段落 ${segIndex} 校稿已儲存，但結果可能不完整：${normalizeWarningMessage(result.warning)}`
+              : `段落 ${segIndex} 校稿完成，已更新校稿版逐字稿`,
+            result.warning ? 'warning' : 'success',
+          );
         } catch (err) {
-          finishProcessing(segmentProofreadKey, false);
-          segmentProofreadBtn.disabled = false;
-          segmentProofreadBtn.textContent = rec.segment_proofread ? '重新校稿此段' : '校稿此段';
           showToast(`段落校稿失敗：${String(err)}`, 'error');
         }
       });
@@ -1621,15 +1792,38 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
         build();
       },
       async (recordingId) => {
-        await proofreadRecordingSegment(meetingId, recordingId);
-        await switchTranscriptVersion(meetingId, 'proofread');
-        [transcript, recordings] = await Promise.all([
-          getTranscript(meetingId),
-          getRecordings(meetingId),
-        ]);
-        finishProcessing(`proofread-segment:${recordingId}`, false);
-        if (window.location.hash !== `#meeting/${meetingId}`) return;
-        build();
+        try {
+          const result = await proofreadRecordingSegment(meetingId, recordingId);
+          [transcript, recordings] = await Promise.all([
+            getTranscript(meetingId),
+            getRecordings(meetingId),
+          ]);
+          if (
+            transcript
+            && !transcript.proofread_content
+            && hasScopedTranscriptText(recordings, 'proofread')
+          ) {
+            const mergedProofread = buildGeneratedTranscriptText(recordings, 'proofread', []);
+            if (mergedProofread.trim()) {
+              transcript = await saveTranscriptProofread(meetingId, mergedProofread, 'segment-proofread');
+            }
+          }
+          if (transcript?.proofread_content) {
+            transcript = await switchTranscriptVersion(meetingId, 'proofread');
+          }
+          return { warning: result.warning ?? null };
+        } finally {
+          finishProcessing(`proofread-segment:${recordingId}`, false);
+          try {
+            [transcript, recordings] = await Promise.all([
+              getTranscript(meetingId),
+              getRecordings(meetingId),
+            ]);
+          } catch { /* ignore */ }
+          if (window.location.hash === `#meeting/${meetingId}`) {
+            build();
+          }
+        }
       },
       async () => {
         // 中場休息分隔變更後重新載入逐字稿
@@ -1647,6 +1841,7 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
       recordings,
       meetingId,
       meeting.title,
+      displayDate,
       meeting.participants,
       speakerMappings,
       async (recordingId, speakerLabel, participantName) => {
@@ -1687,7 +1882,7 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
     container.appendChild(transcriptSectionResult.el);
 
     // 摘要區塊
-    container.appendChild(buildSummarySection(summary, meetingId, meeting.title, async () => {
+    container.appendChild(buildSummarySection(summary, meetingId, meeting.title, displayDate, async () => {
       if (window.location.hash !== `#meeting/${meetingId}`) return;
       try {
         summary = await getSummary(meetingId);

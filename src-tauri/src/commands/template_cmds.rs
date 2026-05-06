@@ -2,8 +2,9 @@ use sqlx::SqlitePool;
 use tauri::State;
 
 use crate::db::{
-    meeting_template, saved_participant,
+    meeting_template,
     models::{CreateTemplateRequest, MeetingTemplate, SavedParticipant, UpdateTemplateRequest},
+    saved_participant,
 };
 
 #[tauri::command]

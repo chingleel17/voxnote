@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]  // 舊版 config.toml 缺少新欄位時，自動填入 Default 值
+#[serde(default)] // 舊版 config.toml 缺少新欄位時，自動填入 Default 值
 pub struct AppConfig {
     // ASR 供應商："assemblyai" | "local"
     pub asr_provider: String,
@@ -24,6 +24,7 @@ pub struct AppConfig {
     pub openrouter_model: String,
     pub ollama_endpoint: String,
     pub ollama_model: String,
+    pub ollama_think_level: String,
     pub custom_endpoint: String,
     pub custom_api_key: String,
     pub custom_model: String,
@@ -52,6 +53,7 @@ impl Default for AppConfig {
             openrouter_model: "openai/gpt-4o-mini".into(),
             ollama_endpoint: "http://localhost:11434".into(),
             ollama_model: String::new(),
+            ollama_think_level: "low".into(),
             custom_endpoint: String::new(),
             custom_api_key: String::new(),
             custom_model: String::new(),

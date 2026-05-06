@@ -40,6 +40,12 @@ const GEMINI_MODELS = [
   'gemini-2.0-flash',
 ];
 const LOCAL_ASR_MODELS = ['tiny', 'base', 'small', 'medium', 'large'];
+const OLLAMA_THINK_LEVELS: Array<{ value: AppConfig['ollama_think_level']; label: string }> = [
+  { value: 'off', label: '關閉思考' },
+  { value: 'low', label: '低' },
+  { value: 'medium', label: '中' },
+  { value: 'high', label: '高' },
+];
 
 // ─────────────────────────────────────────────
 // 主要渲染函式
@@ -48,6 +54,9 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
   container.innerHTML = '<div class="loading">載入設定中...</div>';
 
   let config: AppConfig;
+  let autoSaveTimer: ReturnType<typeof window.setTimeout> | null = null;
+  let latestSaveRequest = 0;
+  let latestSavedRequest = 0;
   try {
     config = await getSettings();
   } catch (err) {
@@ -71,6 +80,57 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
   form.addEventListener('submit', (e) => e.preventDefault());
   container.appendChild(form);
 
+  const saveStatus = document.createElement('small');
+  saveStatus.className = 'form-hint';
+  saveStatus.hidden = true;
+
+  const setSaveStatus = (message: string, isError = false): void => {
+    saveStatus.hidden = false;
+    saveStatus.textContent = message;
+    saveStatus.style.color = isError ? 'var(--danger-color, #d93025)' : '';
+  };
+
+  const clearSaveStatus = (): void => {
+    saveStatus.hidden = true;
+    saveStatus.textContent = '';
+    saveStatus.style.color = '';
+  };
+
+  const persistSettings = async (mode: 'auto' | 'manual'): Promise<void> => {
+    const requestId = ++latestSaveRequest;
+    const snapshot = { ...config };
+    setSaveStatus(mode === 'auto' ? '正在自動儲存設定…' : '正在儲存設定…');
+
+    try {
+      await saveSettings(snapshot);
+      if (requestId < latestSavedRequest) {
+        return;
+      }
+
+      latestSavedRequest = requestId;
+      clearSaveStatus();
+      if (mode === 'manual') {
+        showToast('設定已儲存', 'success');
+      }
+    } catch (err) {
+      const message = String(err);
+      setSaveStatus(mode === 'auto' ? '自動儲存失敗，請手動儲存。' : '儲存失敗，請再試一次。', true);
+      showToast(mode === 'auto' ? `自動儲存失敗：${message}` : `儲存失敗：${message}`, 'error');
+    }
+  };
+
+  const scheduleAutoSave = (): void => {
+    if (autoSaveTimer) {
+      window.clearTimeout(autoSaveTimer);
+    }
+
+    setSaveStatus('變更已暫存，稍後自動儲存…');
+    autoSaveTimer = window.setTimeout(() => {
+      autoSaveTimer = null;
+      void persistSettings('auto');
+    }, 500);
+  };
+
   // ── ASR 區塊 ──
   const asrSection = buildAsrSection(config, (updated) => {
     // 只合併 ASR 相關欄位，避免覆蓋 LLM section 的變更
@@ -82,6 +142,7 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
       asr_language: updated.asr_language,
       speaker_detection: updated.speaker_detection,
     };
+    scheduleAutoSave();
   });
   form.appendChild(asrSection);
 
@@ -101,10 +162,12 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
       openrouter_model: updated.openrouter_model,
       ollama_endpoint: updated.ollama_endpoint,
       ollama_model: updated.ollama_model,
+      ollama_think_level: updated.ollama_think_level,
       custom_endpoint: updated.custom_endpoint,
       custom_api_key: updated.custom_api_key,
       custom_model: updated.custom_model,
     };
+    scheduleAutoSave();
   });
   form.appendChild(llmSection);
 
@@ -115,6 +178,7 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
       proofread_prompt: updated.proofread_prompt,
       summary_prompt: updated.summary_prompt,
     };
+    scheduleAutoSave();
   });
   form.appendChild(promptSection);
 
@@ -125,18 +189,15 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
   saveBtn.className = 'btn btn-primary';
   saveBtn.textContent = '儲存設定';
   saveBtn.addEventListener('click', async () => {
-    saveBtn.disabled = true;
-    try {
-      await saveSettings(config);
-      showToast('設定已儲存', 'success');
-    } catch (err) {
-      showToast(`儲存失敗：${String(err)}`, 'error');
-    } finally {
-      saveBtn.disabled = false;
+    if (autoSaveTimer) {
+      window.clearTimeout(autoSaveTimer);
+      autoSaveTimer = null;
     }
+    await persistSettings('manual');
   });
   saveRow.appendChild(saveBtn);
   form.appendChild(saveRow);
+  form.appendChild(saveStatus);
 }
 
 // ─────────────────────────────────────────────
@@ -371,7 +432,12 @@ function buildLlmSection(
   // ── Ollama ──
   const ollamaSection = buildOllamaSection(config, (updated) => {
     // 只合併 ollama 專屬欄位，避免覆蓋 llm_provider 等其他 LLM 欄位
-    config = { ...config, ollama_endpoint: updated.ollama_endpoint, ollama_model: updated.ollama_model };
+    config = {
+      ...config,
+      ollama_endpoint: updated.ollama_endpoint,
+      ollama_model: updated.ollama_model,
+      ollama_think_level: updated.ollama_think_level,
+    };
     onChange(config);
   });
   section.appendChild(ollamaSection);
@@ -474,15 +540,19 @@ function buildOllamaSection(
       const ok = await testOllamaConnection(endpointInput.value);
       if (ok) {
         showToast('Ollama 連線成功', 'success');
-        await loadOllamaModels();
+        testBtn.disabled = false;
+        testBtn.textContent = '測試連線';
+        void loadOllamaModels();
       } else {
         showToast('Ollama 連線失敗', 'error');
       }
     } catch (err) {
       showToast(`連線錯誤：${String(err)}`, 'error');
     } finally {
-      testBtn.disabled = false;
-      testBtn.textContent = '測試連線';
+      if (testBtn.disabled) {
+        testBtn.disabled = false;
+        testBtn.textContent = '測試連線';
+      }
     }
   });
 
@@ -516,6 +586,34 @@ function buildOllamaSection(
   modelGroup.appendChild(modelSelect);
   wrapper.appendChild(modelGroup);
 
+  const thinkGroup = document.createElement('div');
+  thinkGroup.className = 'form-group';
+  const thinkLabel = document.createElement('label');
+  thinkLabel.textContent = '思考強度';
+  const thinkSelect = document.createElement('select');
+  thinkSelect.className = 'form-control';
+  for (const option of OLLAMA_THINK_LEVELS) {
+    const el = document.createElement('option');
+    el.value = option.value;
+    el.textContent = option.label;
+    el.selected = option.value === (config.ollama_think_level ?? 'low');
+    thinkSelect.appendChild(el);
+  }
+  thinkSelect.addEventListener('change', () => {
+    config = {
+      ...config,
+      ollama_think_level: thinkSelect.value as AppConfig['ollama_think_level'],
+    };
+    onChange(config);
+  });
+  const thinkHint = document.createElement('small');
+  thinkHint.className = 'form-hint';
+  thinkHint.textContent = '建議先用低，若請求過久可改成關閉思考。';
+  thinkGroup.appendChild(thinkLabel);
+  thinkGroup.appendChild(thinkSelect);
+  thinkGroup.appendChild(thinkHint);
+  wrapper.appendChild(thinkGroup);
+
   const loadOllamaModels = async (): Promise<void> => {
     try {
       const models = await getOllamaModels(endpointInput.value);
@@ -531,8 +629,8 @@ function buildOllamaSection(
         config = { ...config, ollama_model: modelSelect.value };
         onChange(config);
       }
-    } catch {
-      showToast('無法取得 Ollama 模型列表', 'error');
+    } catch (err) {
+      showToast(`無法取得 Ollama 模型列表：${String(err)}`, 'error');
     }
   };
 
@@ -557,7 +655,7 @@ function buildAiPromptSection(
   const hint = document.createElement('p');
   hint.className = 'form-hint';
   hint.style.marginBottom = '16px';
-  hint.textContent = '留空代表使用內建預設 Prompt。自訂後請點「儲存設定」使其生效。';
+  hint.textContent = '留空代表使用內建預設 Prompt。變更後會自動儲存。';
   section.appendChild(hint);
 
   // 校稿 Prompt

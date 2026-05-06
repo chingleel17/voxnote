@@ -6,7 +6,7 @@ use uuid::Uuid;
 use super::models::Recording;
 
 const SELECT_COLS: &str =
-    "id, meeting_id, file_path, duration_seconds, sort_order, segment_transcript, segment_proofread, no_break_before, created_at";
+    "id, meeting_id, file_path, original_file_name, duration_seconds, sort_order, segment_transcript, segment_proofread, no_break_before, created_at";
 
 pub async fn get_recording(pool: &SqlitePool, meeting_id: &str) -> Result<Option<Recording>> {
     let sql = format!("SELECT {SELECT_COLS} FROM recordings WHERE meeting_id = ? ORDER BY sort_order ASC, created_at ASC LIMIT 1");
@@ -31,6 +31,7 @@ pub async fn create_recording(
     pool: &SqlitePool,
     meeting_id: &str,
     file_path: Option<&str>,
+    original_file_name: Option<&str>,
     duration_seconds: Option<i64>,
 ) -> Result<Recording> {
     let now = Utc::now().to_rfc3339();
@@ -38,17 +39,18 @@ pub async fn create_recording(
 
     let next_sort_order: (Option<i64>,) =
         sqlx::query_as("SELECT MAX(sort_order) FROM recordings WHERE meeting_id = ?")
-        .bind(meeting_id)
-        .fetch_one(pool)
-        .await?;
+            .bind(meeting_id)
+            .fetch_one(pool)
+            .await?;
     let sort_order = next_sort_order.0.unwrap_or(-1) + 1;
 
     sqlx::query(
-        "INSERT INTO recordings (id, meeting_id, file_path, duration_seconds, sort_order, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO recordings (id, meeting_id, file_path, original_file_name, duration_seconds, sort_order, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(meeting_id)
     .bind(file_path)
+    .bind(original_file_name)
     .bind(duration_seconds)
     .bind(sort_order)
     .bind(&now)
@@ -75,11 +77,13 @@ pub async fn update_segment_transcript(
     recording_id: &str,
     content: &str,
 ) -> Result<()> {
-    sqlx::query("UPDATE recordings SET segment_transcript = ?, segment_proofread = NULL WHERE id = ?")
-        .bind(content)
-        .bind(recording_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE recordings SET segment_transcript = ?, segment_proofread = NULL WHERE id = ?",
+    )
+    .bind(content)
+    .bind(recording_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -107,22 +111,28 @@ pub async fn clear_segment_proofreads_for_meeting(
     Ok(())
 }
 
-/// 刪除指定錄音段落
-pub async fn delete_recording(pool: &SqlitePool, recording_id: &str) -> Result<()> {
-    let meeting_id: Option<String> = sqlx::query_scalar("SELECT meeting_id FROM recordings WHERE id = ?")
-        .bind(recording_id)
-        .fetch_optional(pool)
-        .await?;
+/// 刪除指定錄音段落，回傳所屬會議 ID（若存在）
+pub async fn delete_recording(pool: &SqlitePool, recording_id: &str) -> Result<Option<String>> {
+    let meeting_id: Option<String> =
+        sqlx::query_scalar("SELECT meeting_id FROM recordings WHERE id = ?")
+            .bind(recording_id)
+            .fetch_optional(pool)
+            .await?;
 
     sqlx::query("DELETE FROM recordings WHERE id = ?")
+        .bind(recording_id)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM recording_speaker_mappings WHERE recording_id = ?")
         .bind(recording_id)
         .execute(pool)
         .await?;
 
     if let Some(meeting_id) = meeting_id {
         normalize_sort_orders(pool, &meeting_id).await?;
+        return Ok(Some(meeting_id));
     }
-    Ok(())
+    Ok(None)
 }
 
 /// 設定段落是否不加中場休息分隔符
@@ -149,7 +159,10 @@ pub async fn get_segment_transcripts_with_break(
     Ok(rows.into_iter().map(|(t, nb)| (t, nb != 0)).collect())
 }
 
-pub async fn get_merged_proofread_text(pool: &SqlitePool, meeting_id: &str) -> Result<Option<String>> {
+pub async fn get_merged_proofread_text(
+    pool: &SqlitePool,
+    meeting_id: &str,
+) -> Result<Option<String>> {
     let rows: Vec<(String, Option<String>, i64)> = sqlx::query_as(
         "SELECT segment_transcript, segment_proofread, no_break_before
          FROM recordings
