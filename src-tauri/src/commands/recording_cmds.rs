@@ -86,7 +86,7 @@ pub async fn delete_recording(
         .await
         .map_err(|e| e.to_string())?
     {
-        transcript::sync_generated_content_from_recordings(&pool, &meeting_id)
+        transcript::sync_generated_content_from_recordings(&pool, &meeting_id, false)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -115,7 +115,7 @@ pub async fn reorder_recordings(
         .await
         .map_err(|e| e.to_string())?;
 
-    transcript::sync_generated_content_from_recordings(&pool, &meeting_id)
+    transcript::sync_generated_content_from_recordings(&pool, &meeting_id, true)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -133,7 +133,7 @@ pub async fn remerge_segments(
         .map_err(|e| e.to_string())?;
     let merged = recording::merge_segment_texts(&segments);
 
-    transcript::sync_generated_content_from_recordings(&pool, &meeting_id)
+    transcript::sync_generated_content_from_recordings(&pool, &meeting_id, true)
         .await
         .map_err(|e| e.to_string())?;
 

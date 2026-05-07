@@ -159,9 +159,13 @@ pub async fn switch_version(
         .ok_or_else(|| anyhow::anyhow!("切換版本後無法取得逐字稿"))
 }
 
+/// 重新從各錄音段落合併逐字稿（原始稿 + 校稿）。
+/// `preserve_existing_proofread`：若為 true，在無 segment-level 校稿時保留整份逐字稿的已完成校稿；
+/// 若為 false（刪除錄音情境），則一律清除整份校稿，確保校稿與原始稿保持一致。
 pub async fn sync_generated_content_from_recordings(
     pool: &SqlitePool,
     meeting_id: &str,
+    preserve_existing_proofread: bool,
 ) -> Result<Option<Transcript>> {
     let merged_original = recording::get_segment_transcripts_with_break(pool, meeting_id)
         .await
@@ -196,7 +200,8 @@ pub async fn sync_generated_content_from_recordings(
                         ),
                         Some(now.as_str()),
                     )
-                } else if existing.proofread_status == "completed"
+                } else if preserve_existing_proofread
+                    && existing.proofread_status == "completed"
                     && existing.proofread_content.is_some()
                 {
                     // 整份逐字稿校稿結果存在，重新轉譯時保留不覆蓋

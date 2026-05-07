@@ -1,3 +1,6 @@
+import { getTheme, toggleTheme } from '../utils/theme';
+import { getVersion } from '@tauri-apps/api/app';
+
 interface NavItem {
   icon: string;
   label: string;
@@ -7,10 +10,19 @@ interface NavItem {
 const NAV_ITEMS: NavItem[] = [
   { icon: '🏠', label: '首頁', route: '#home' },
   { icon: '🎙️', label: '錄音', route: '#record' },
+  { icon: '🗂️', label: '管理', route: '#manage' },
   { icon: '⚙️', label: '設定', route: '#settings' },
 ];
 
 let navContainer: HTMLElement | null = null;
+
+function getThemeIcon(theme: 'dark' | 'light'): string {
+  return theme === 'dark' ? '☀️' : '🌙';
+}
+
+function getThemeLabel(theme: 'dark' | 'light'): string {
+  return theme === 'dark' ? '切換淺色系' : '切換暗色系';
+}
 
 export function renderNav(container: HTMLElement): void {
   navContainer = container;
@@ -54,6 +66,45 @@ export function renderNav(container: HTMLElement): void {
   }
 
   container.appendChild(list);
+
+  // Sidebar footer：主題切換 + 版本
+  const footer = document.createElement('div');
+  footer.className = 'sidebar-footer';
+
+  const themeBtn = document.createElement('button');
+  themeBtn.className = 'sidebar-theme-btn';
+  themeBtn.setAttribute('aria-label', '切換主題');
+
+  const themeIcon = document.createElement('span');
+  themeIcon.className = 'sidebar-theme-icon';
+
+  const themeLabel = document.createElement('span');
+
+  const currentTheme = getTheme();
+  themeIcon.textContent = getThemeIcon(currentTheme);
+  themeLabel.textContent = getThemeLabel(currentTheme);
+
+  themeBtn.appendChild(themeIcon);
+  themeBtn.appendChild(themeLabel);
+  themeBtn.addEventListener('click', () => {
+    const next = toggleTheme();
+    themeIcon.textContent = getThemeIcon(next);
+    themeLabel.textContent = getThemeLabel(next);
+  });
+
+  const versionEl = document.createElement('div');
+  versionEl.className = 'sidebar-version';
+  versionEl.textContent = '';
+
+  getVersion().then((v) => {
+    versionEl.textContent = `v${v}`;
+  }).catch(() => {
+    versionEl.textContent = '';
+  });
+
+  footer.appendChild(themeBtn);
+  footer.appendChild(versionEl);
+  container.appendChild(footer);
 
   const currentHash = window.location.hash || '#home';
   updateNavActive(currentHash);

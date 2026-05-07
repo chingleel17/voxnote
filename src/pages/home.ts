@@ -502,11 +502,11 @@ export async function renderHomePage(container: HTMLElement): Promise<void> {
 
     container.appendChild(tabs);
 
-    // 標籤篩選列
-    if (allTags.length > 0) {
-      const tagBar = document.createElement('div');
-      tagBar.className = 'tag-filter-bar';
+    // 標籤篩選列（管理按鈕永遠顯示，篩選 chips 有標籤時才出現）
+    const tagBar = document.createElement('div');
+    tagBar.className = 'tag-filter-bar';
 
+    if (allTags.length > 0) {
       const clearTagBtn = document.createElement('button');
       clearTagBtn.className = `tag-filter-chip${activeTagId === '' ? ' active' : ''}`;
       clearTagBtn.textContent = '全部標籤';
@@ -521,18 +521,18 @@ export async function renderHomePage(container: HTMLElement): Promise<void> {
         chip.addEventListener('click', () => { activeTagId = tag.id; buildPage(); });
         tagBar.appendChild(chip);
       }
-
-      const manageTagsBtn = document.createElement('button');
-      manageTagsBtn.className = 'btn btn-ghost btn-sm tag-manage-btn';
-      manageTagsBtn.textContent = '管理標籤';
-      manageTagsBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        openTagManagerModal();
-      });
-      tagBar.appendChild(manageTagsBtn);
-
-      container.appendChild(tagBar);
     }
+
+    const manageTagsBtn = document.createElement('button');
+    manageTagsBtn.className = 'btn btn-ghost btn-sm tag-manage-btn';
+    manageTagsBtn.textContent = '管理標籤';
+    manageTagsBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openTagManagerModal();
+    });
+    tagBar.appendChild(manageTagsBtn);
+
+    container.appendChild(tagBar);
 
     // 會議列表
     let filtered = activeCategory

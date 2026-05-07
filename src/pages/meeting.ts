@@ -243,16 +243,52 @@ function formatExportDate(value: string): string {
   return `${year}${month}${day}`;
 }
 
-function buildTranscriptExportFileName(meetingTitle: string, meetingDate: string): string {
+function formatMeetingDisplayDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value.trim() || '未指定日期';
+  }
+
+  return date.toLocaleDateString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit' });
+}
+
+function buildCodeFence(text: string, language = ''): string {
+  const fenceLength = Array.from(text.matchAll(/`+/g)).reduce((max, match) => Math.max(max, match[0].length + 1), 3);
+  const fence = '`'.repeat(fenceLength);
+  return `${fence}${language}\n${text}\n${fence}`;
+}
+
+function buildTranscriptExportFileName(meetingTitle: string, meetingDate: string, extension: 'txt' | 'md'): string {
   const safeTitle = sanitizeFileNamePart(meetingTitle) || '未命名會議';
   const safeDate = formatExportDate(meetingDate);
-  return `${safeTitle}_${safeDate}_逐字稿.txt`;
+  return `${safeTitle}_${safeDate}_逐字稿.${extension}`;
 }
 
 function buildSummaryExportFileName(meetingTitle: string, meetingDate: string): string {
   const safeTitle = sanitizeFileNamePart(meetingTitle) || '未命名會議';
   const safeDate = formatExportDate(meetingDate);
   return `${safeTitle}_${safeDate}_摘要.md`;
+}
+
+function buildTranscriptMarkdownContent(
+  meetingTitle: string,
+  meetingDate: string,
+  version: TranscriptVersion,
+  text: string,
+): string {
+  const normalizedTitle = meetingTitle.trim() || '未命名會議';
+  const transcriptText = text.trim() || '（無逐字稿內容）';
+  return [
+    `# ${normalizedTitle} 逐字稿`,
+    '',
+    `- 會議日期：${formatMeetingDisplayDate(meetingDate)}`,
+    `- 版本：${getTranscriptVersionLabel(version)}`,
+    '',
+    '## 內容',
+    '',
+    buildCodeFence(transcriptText, 'text'),
+    '',
+  ].join('\n');
 }
 
 function shouldFollowManualBase(
@@ -1116,15 +1152,40 @@ function buildTranscriptSection(
     });
   });
 
-  const exportBtn = document.createElement('button');
-  exportBtn.className = 'btn btn-secondary btn-sm';
-  exportBtn.textContent = '匯出 TXT';
-  exportBtn.addEventListener('click', async () => {
+  const exportMenu = document.createElement('details');
+  exportMenu.className = 'export-menu';
+
+  const exportTrigger = document.createElement('summary');
+  exportTrigger.className = 'btn btn-secondary btn-sm export-menu-trigger';
+  exportTrigger.textContent = '匯出';
+  exportTrigger.setAttribute('role', 'button');
+  exportTrigger.setAttribute('aria-label', '選擇逐字稿匯出格式');
+
+  const exportOptions = document.createElement('div');
+  exportOptions.className = 'export-menu-list';
+
+  const createExportOptionButton = (
+    label: string,
+    action: () => Promise<void>,
+  ): HTMLButtonElement => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'export-menu-item';
+    button.textContent = label;
+    button.addEventListener('click', async (event) => {
+      event.preventDefault();
+      exportMenu.open = false;
+      await action();
+    });
+    return button;
+  };
+
+  exportOptions.appendChild(createExportOptionButton('匯出 TXT', async () => {
     const text = getTranscriptDisplayText(loadedTranscript, recordings, currentVersion, localMappings);
     try {
       const exported = await exportTextFile(
         text,
-        buildTranscriptExportFileName(meetingTitle, meetingDate),
+        buildTranscriptExportFileName(meetingTitle, meetingDate, 'txt'),
         '文字檔',
         'txt',
       );
@@ -1134,7 +1195,27 @@ function buildTranscriptSection(
     } catch (err) {
       showToast(`匯出失敗：${String(err)}`, 'error');
     }
-  });
+  }));
+
+  exportOptions.appendChild(createExportOptionButton('匯出 Markdown', async () => {
+    const text = getTranscriptDisplayText(loadedTranscript, recordings, currentVersion, localMappings);
+    try {
+      const exported = await exportTextFile(
+        buildTranscriptMarkdownContent(meetingTitle, meetingDate, currentVersion, text),
+        buildTranscriptExportFileName(meetingTitle, meetingDate, 'md'),
+        'Markdown',
+        'md',
+      );
+      if (exported) {
+        showToast('逐字稿已匯出', 'success');
+      }
+    } catch (err) {
+      showToast(`匯出失敗：${String(err)}`, 'error');
+    }
+  }));
+
+  exportMenu.appendChild(exportTrigger);
+  exportMenu.appendChild(exportOptions);
 
   const proofreadActionBtn = document.createElement('button');
   proofreadActionBtn.className = 'btn btn-primary btn-sm';
@@ -1181,7 +1262,7 @@ function buildTranscriptSection(
   actions.appendChild(manualActionBtn);
   actions.appendChild(fullscreenBtn);
   actions.appendChild(copyBtn);
-  actions.appendChild(exportBtn);
+  actions.appendChild(exportMenu);
   section.appendChild(actions);
 
   if (hasPartialProofread) {
@@ -1294,7 +1375,7 @@ function buildSummarySection(
 
   const exportBtn = document.createElement('button');
   exportBtn.className = 'btn btn-secondary btn-sm';
-  exportBtn.textContent = '匯出 MD';
+  exportBtn.textContent = '匯出 Markdown';
   exportBtn.addEventListener('click', async () => {
     try {
       const exported = await exportTextFile(
@@ -1944,7 +2025,15 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
     if (allTags.length === 0) {
       const hint = document.createElement('p');
       hint.className = 'empty-hint';
-      hint.textContent = '尚無標籤，請先在首頁管理標籤。';
+      hint.textContent = '尚無標籤，請先至 ';
+      const link = document.createElement('a');
+      link.href = '#manage';
+      link.textContent = '管理頁面';
+      link.addEventListener('click', () => {
+        window.location.hash = '#manage';
+      });
+      hint.appendChild(link);
+      hint.appendChild(document.createTextNode(' 新增標籤。'));
       tagGroup.appendChild(hint);
     } else {
       const tagCheckboxes = document.createElement('div');

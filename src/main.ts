@@ -1,9 +1,11 @@
 import { renderNav, updateNavActive } from './components/nav';
 import { renderHomePage } from './pages/home';
+import { renderManagePage } from './pages/manage';
 import { renderMeetingPage } from './pages/meeting';
 import { renderRecordPage } from './pages/record';
 import { renderSettingsPage } from './pages/settings';
 import { initStatusBar } from './components/statusBar';
+import { initTheme } from './utils/theme';
 
 interface ParsedRoute {
   page: string;
@@ -31,6 +33,9 @@ async function renderPage(container: HTMLElement, route: ParsedRoute): Promise<v
     case 'record':
       await renderRecordPage(container, route.id);
       break;
+    case 'manage':
+      await renderManagePage(container);
+      break;
     case 'settings':
       await renderSettingsPage(container);
       break;
@@ -40,6 +45,8 @@ async function renderPage(container: HTMLElement, route: ParsedRoute): Promise<v
 }
 
 window.addEventListener('DOMContentLoaded', () => {
+  initTheme();
+
   const sidebar = document.getElementById('sidebar');
   const content = document.getElementById('content');
   if (!sidebar || !content) return;

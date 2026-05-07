@@ -68,7 +68,7 @@ pub async fn start_transcription(
         .map_err(|e| e.to_string())?;
     let merged = recording::merge_segment_texts(&segments);
 
-    transcript::sync_generated_content_from_recordings(&pool, &meeting_id)
+    transcript::sync_generated_content_from_recordings(&pool, &meeting_id, true)
         .await
         .map_err(|e| e.to_string())?;
 
