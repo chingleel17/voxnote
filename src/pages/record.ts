@@ -1,10 +1,12 @@
-import type { MeetingWithDetails } from '../types';
-import { getMeetings } from '../api/meetings';
-import { saveRecording } from '../api/recordings';
+import type { Category, MeetingWithDetails, SavedParticipant, Tag } from '../types';
+import { createMeeting, getCategories, getMeetings } from '../api/meetings';
+import { writeRecordingFile } from '../api/recordings';
+import { getSavedParticipants, upsertSavedParticipant } from '../api/participants';
+import { getTags } from '../api/tags';
+import { openModal } from '../components/modal';
 import { showToast } from '../components/toast';
 import { createWaveformPlayer } from '../components/audioPlayer';
-import { writeFile, mkdir, BaseDirectory } from '@tauri-apps/plugin-fs';
-import { appDataDir, join } from '@tauri-apps/api/path';
+import { buildParticipantEditor } from '../components/participantEditor';
 
 interface RecordingState {
   mediaRecorder: MediaRecorder | null;
@@ -128,13 +130,29 @@ function formatTime(secs: number): string {
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 
+function formatMeetingDate(meeting: MeetingWithDetails): string {
+  return new Date(meeting.meeting_date ?? meeting.created_at).toLocaleDateString('zh-TW', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+}
+
 export async function renderRecordPage(container: HTMLElement, preselectedMeetingId?: string): Promise<void> {
   stopAll();
   container.innerHTML = '';
 
   let meetings: MeetingWithDetails[] = [];
+  let categories: Category[] = [];
+  let savedParticipants: SavedParticipant[] = [];
+  let allTags: Tag[] = [];
   try {
-    meetings = await getMeetings();
+    [meetings, categories, savedParticipants, allTags] = await Promise.all([
+      getMeetings(),
+      getCategories(),
+      getSavedParticipants(),
+      getTags(),
+    ]);
   } catch {
     // 允許在沒有會議時繼續使用錄音頁
   }
@@ -157,26 +175,233 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
   meetingGroup.className = 'form-group';
   const meetingLabel = document.createElement('label');
   meetingLabel.textContent = '選擇會議';
-  const meetingSelect = document.createElement('select');
-  meetingSelect.className = 'form-control';
-  const noneOpt = document.createElement('option');
-  noneOpt.value = '';
-  noneOpt.textContent = '-- 請選擇會議 --';
-  meetingSelect.appendChild(noneOpt);
-  for (const m of meetings) {
-    const opt = document.createElement('option');
-    opt.value = m.id;
-    opt.textContent = m.title;
-    meetingSelect.appendChild(opt);
-  }
+  const meetingSearchRow = document.createElement('div');
+  meetingSearchRow.className = 'record-meeting-search-row';
+  const meetingPicker = document.createElement('div');
+  meetingPicker.className = 'meeting-picker';
+  const meetingTrigger = document.createElement('button');
+  meetingTrigger.type = 'button';
+  meetingTrigger.className = 'meeting-picker-trigger';
+  const meetingTriggerText = document.createElement('span');
+  meetingTriggerText.className = 'meeting-picker-trigger-text';
+  const meetingTriggerArrow = document.createElement('span');
+  meetingTriggerArrow.className = 'meeting-picker-trigger-arrow';
+  meetingTriggerArrow.textContent = '▾';
+  meetingTrigger.appendChild(meetingTriggerText);
+  meetingTrigger.appendChild(meetingTriggerArrow);
+  const meetingDropdown = document.createElement('div');
+  meetingDropdown.className = 'meeting-picker-dropdown hidden';
+  const meetingSearchInput = document.createElement('input');
+  meetingSearchInput.className = 'form-control';
+  meetingSearchInput.placeholder = '搜尋會議名稱或日期';
+  const meetingList = document.createElement('div');
+  meetingList.className = 'meeting-picker-results';
+  meetingDropdown.appendChild(meetingSearchInput);
+  meetingDropdown.appendChild(meetingList);
+  meetingPicker.appendChild(meetingTrigger);
+  meetingPicker.appendChild(meetingDropdown);
+  const createMeetingBtn = document.createElement('button');
+  createMeetingBtn.className = 'btn btn-secondary btn-sm';
+  createMeetingBtn.textContent = '新增會議';
+  meetingSearchRow.appendChild(meetingPicker);
+  meetingSearchRow.appendChild(createMeetingBtn);
+  let selectedMeetingId = preselectedMeetingId ?? '';
+  let isMeetingDropdownOpen = false;
+
+  const syncMeetingTrigger = (): void => {
+    const selectedMeeting = meetings.find((meeting) => meeting.id === selectedMeetingId);
+    meetingTriggerText.textContent = selectedMeeting
+      ? `${selectedMeeting.title}（${formatMeetingDate(selectedMeeting)}）`
+      : '請選擇會議';
+    meetingTrigger.classList.toggle('placeholder', !selectedMeeting);
+  };
+
+  const setMeetingDropdownOpen = (open: boolean): void => {
+    isMeetingDropdownOpen = open;
+    meetingDropdown.classList.toggle('hidden', !open);
+    meetingPicker.classList.toggle('open', open);
+    meetingTriggerArrow.textContent = open ? '▴' : '▾';
+    if (open) {
+      meetingSearchInput.value = '';
+      renderMeetingList();
+      window.setTimeout(() => meetingSearchInput.focus(), 0);
+    }
+  };
+
+  const renderMeetingList = (): void => {
+    const keyword = meetingSearchInput.value.trim().toLowerCase();
+    meetingList.innerHTML = '';
+    const filteredMeetings = meetings.filter((meeting) => {
+      if (!keyword) return true;
+      const dateText = formatMeetingDate(meeting).toLowerCase();
+      return meeting.title.toLowerCase().includes(keyword) || dateText.includes(keyword);
+    });
+
+    if (filteredMeetings.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'meeting-picker-empty';
+      empty.textContent = '找不到符合的會議';
+      meetingList.appendChild(empty);
+    }
+
+    for (const meeting of filteredMeetings) {
+      const option = document.createElement('button');
+      option.type = 'button';
+      option.className = `meeting-picker-option${selectedMeetingId === meeting.id ? ' active' : ''}`;
+      const title = document.createElement('span');
+      title.className = 'meeting-picker-title';
+      title.textContent = meeting.title;
+      const badge = document.createElement('span');
+      badge.className = 'badge badge-category';
+      badge.textContent = formatMeetingDate(meeting);
+      option.appendChild(title);
+      option.appendChild(badge);
+      option.addEventListener('click', () => {
+        selectedMeetingId = meeting.id;
+        syncMeetingTrigger();
+        setMeetingDropdownOpen(false);
+      });
+      meetingList.appendChild(option);
+    }
+  };
+
+  meetingSearchInput.addEventListener('input', renderMeetingList);
+  meetingTrigger.addEventListener('click', () => {
+    setMeetingDropdownOpen(!isMeetingDropdownOpen);
+  });
+  document.addEventListener('click', (event) => {
+    if (!(event.target instanceof Node)) return;
+    if (!meetingSearchRow.contains(event.target)) {
+      setMeetingDropdownOpen(false);
+    }
+  });
   meetingGroup.appendChild(meetingLabel);
-  meetingGroup.appendChild(meetingSelect);
+  meetingGroup.appendChild(meetingSearchRow);
   wrapper.appendChild(meetingGroup);
 
   // 自動選取預設會議
   if (preselectedMeetingId) {
-    meetingSelect.value = preselectedMeetingId;
+    const selectedMeeting = meetings.find((meeting) => meeting.id === preselectedMeetingId);
+    if (selectedMeeting) {
+      selectedMeetingId = selectedMeeting.id;
+    }
   }
+  syncMeetingTrigger();
+  renderMeetingList();
+
+  createMeetingBtn.addEventListener('click', () => {
+    const form = document.createElement('div');
+    form.className = 'form-group-list';
+
+    const titleGroup = document.createElement('div');
+    titleGroup.className = 'form-group';
+    const titleLabel = document.createElement('label');
+    titleLabel.textContent = '會議標題';
+    const titleInput = document.createElement('input');
+    titleInput.type = 'text';
+    titleInput.className = 'form-control';
+    titleInput.placeholder = '請輸入會議標題';
+    titleGroup.appendChild(titleLabel);
+    titleGroup.appendChild(titleInput);
+    form.appendChild(titleGroup);
+
+    const categoryGroup = document.createElement('div');
+    categoryGroup.className = 'form-group';
+    const categoryLabel = document.createElement('label');
+    categoryLabel.textContent = '分類';
+    const categorySelect = document.createElement('select');
+    categorySelect.className = 'form-control';
+    const emptyCategoryOption = document.createElement('option');
+    emptyCategoryOption.value = '';
+    emptyCategoryOption.textContent = '-- 無分類 --';
+    categorySelect.appendChild(emptyCategoryOption);
+    for (const category of categories) {
+      const option = document.createElement('option');
+      option.value = category.id;
+      option.textContent = category.name;
+      categorySelect.appendChild(option);
+    }
+    categoryGroup.appendChild(categoryLabel);
+    categoryGroup.appendChild(categorySelect);
+    form.appendChild(categoryGroup);
+
+    let selectedTagIds: Set<string> = new Set();
+    const tagGroup = document.createElement('div');
+    tagGroup.className = 'form-group';
+    const tagLabel = document.createElement('label');
+    tagLabel.textContent = '標籤（可複選）';
+    tagGroup.appendChild(tagLabel);
+    if (allTags.length === 0) {
+      const hint = document.createElement('p');
+      hint.className = 'empty-hint';
+      hint.textContent = '尚無標籤，可先到管理頁建立。';
+      tagGroup.appendChild(hint);
+    } else {
+      const tagCheckboxes = document.createElement('div');
+      tagCheckboxes.className = 'tag-checkbox-list';
+      for (const tag of allTags) {
+        const row = document.createElement('label');
+        row.className = 'tag-checkbox-row';
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.addEventListener('change', () => {
+          if (checkbox.checked) selectedTagIds.add(tag.id);
+          else selectedTagIds.delete(tag.id);
+        });
+        const swatch = document.createElement('span');
+        swatch.className = 'tag-swatch';
+        swatch.style.backgroundColor = tag.color;
+        row.appendChild(checkbox);
+        row.appendChild(swatch);
+        row.appendChild(document.createTextNode(tag.name));
+        tagCheckboxes.appendChild(row);
+      }
+      tagGroup.appendChild(tagCheckboxes);
+    }
+    form.appendChild(tagGroup);
+
+    const participantEditor = buildParticipantEditor([], savedParticipants, {
+      allowManageSaved: true,
+      onSavedParticipantsChanged: (updated) => {
+        savedParticipants = updated;
+      },
+    });
+    form.appendChild(participantEditor.el);
+
+    openModal({
+      title: '新增會議',
+      content: form,
+      confirmText: '建立',
+      cancelText: '取消',
+      onConfirm: async () => {
+        const title = titleInput.value.trim();
+        if (!title) {
+          titleInput.focus();
+          return false;
+        }
+        try {
+          const participants = participantEditor.getParticipants();
+          const meeting = await createMeeting({
+            title,
+            category_id: categorySelect.value || null,
+            participants,
+            tag_ids: Array.from(selectedTagIds),
+          });
+          meetings.unshift(meeting);
+          await Promise.all(participants.map((name) => upsertSavedParticipant(name)));
+          savedParticipants = await getSavedParticipants();
+          selectedMeetingId = meeting.id;
+          syncMeetingTrigger();
+          setMeetingDropdownOpen(false);
+          renderMeetingList();
+          showToast('會議已建立', 'success');
+        } catch (err) {
+          showToast(`建立失敗：${String(err)}`, 'error');
+          return false;
+        }
+      },
+    });
+  });
 
   // 麥克風選擇
   const micGroup = document.createElement('div');
@@ -348,7 +573,7 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
   }
 
   saveBtn.addEventListener('click', async () => {
-    const meetingId = meetingSelect.value;
+    const meetingId = selectedMeetingId;
     if (!meetingId) {
       showToast('請先選擇會議', 'warning');
       return;
@@ -374,18 +599,12 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
         : 'webm';
       const fileName = `${meetingId}_${Date.now()}.${ext}`;
 
-      // 讀取音訊 bytes 並直接用 fs plugin 寫檔（避免大型 IPC JSON 序列化）
+      // 讀取音訊 bytes 交由後端寫入設定的錄音資料夾
       const response = await fetch(state.audioBlobUrl);
       const buffer = await response.arrayBuffer();
-      const bytes = new Uint8Array(buffer);
+      const bytes = Array.from(new Uint8Array(buffer));
 
-      await mkdir('recordings', { baseDir: BaseDirectory.AppData, recursive: true });
-      await writeFile(`recordings/${fileName}`, bytes, { baseDir: BaseDirectory.AppData });
-
-      // 取得完整磁碟路徑後更新 DB
-      const dataDir = await appDataDir();
-      const filePath = await join(dataDir, 'recordings', fileName);
-      await saveRecording(meetingId, filePath, state.uploadedFile?.name ?? null, durationSeconds);
+      await writeRecordingFile(meetingId, bytes, fileName, state.uploadedFile?.name ?? null, durationSeconds);
       showToast('錄音已儲存', 'success');
       window.location.hash = `#meeting/${meetingId}`;
     } catch (err) {

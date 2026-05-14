@@ -71,6 +71,19 @@ pub async fn get_recording_by_id(pool: &SqlitePool, id: &str) -> Result<Option<R
     Ok(row)
 }
 
+pub async fn update_recording_file_path(
+    pool: &SqlitePool,
+    recording_id: &str,
+    file_path: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE recordings SET file_path = ? WHERE id = ?")
+        .bind(file_path)
+        .bind(recording_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// 更新段落的個別轉譯結果
 pub async fn update_segment_transcript(
     pool: &SqlitePool,

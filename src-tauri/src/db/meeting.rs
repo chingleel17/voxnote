@@ -16,6 +16,8 @@ const MEETING_SELECT_SQL: &str = r#"
         CAST(EXISTS(SELECT 1 FROM transcripts t WHERE t.meeting_id = m.id) AS INTEGER) AS has_transcript,
         CAST(EXISTS(SELECT 1 FROM summaries s WHERE s.meeting_id = m.id) AS INTEGER) AS has_summary,
         m.meeting_date,
+        m.archived_at,
+        m.archived_path,
         m.created_at,
         m.updated_at
     FROM meetings m
@@ -44,13 +46,28 @@ fn row_to_meeting(row: &sqlx::sqlite::SqliteRow) -> MeetingWithDetails {
         has_summary: has_summary != 0,
         tags: vec![],
         meeting_date: row.get("meeting_date"),
+        archived_at: row.get("archived_at"),
+        archived_path: row.get("archived_path"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
 }
 
 pub async fn get_meetings(pool: &SqlitePool) -> Result<Vec<MeetingWithDetails>> {
-    let sql = format!("{} ORDER BY m.created_at DESC", MEETING_SELECT_SQL);
+    let sql = format!("{} HAVING m.archived_at IS NULL ORDER BY m.created_at DESC", MEETING_SELECT_SQL);
+    let rows = sqlx::query(&sql).fetch_all(pool).await?;
+    let mut meetings: Vec<MeetingWithDetails> = rows.iter().map(row_to_meeting).collect();
+    for m in &mut meetings {
+        m.tags = get_meeting_tags(pool, &m.id).await.unwrap_or_default();
+    }
+    Ok(meetings)
+}
+
+pub async fn get_archived_meetings(pool: &SqlitePool) -> Result<Vec<MeetingWithDetails>> {
+    let sql = format!(
+        "{} HAVING m.archived_at IS NOT NULL ORDER BY m.archived_at DESC, m.updated_at DESC",
+        MEETING_SELECT_SQL
+    );
     let rows = sqlx::query(&sql).fetch_all(pool).await?;
     let mut meetings: Vec<MeetingWithDetails> = rows.iter().map(row_to_meeting).collect();
     for m in &mut meetings {
@@ -159,6 +176,28 @@ pub async fn update_meeting(
 
 pub async fn delete_meeting(pool: &SqlitePool, id: &str) -> Result<()> {
     sqlx::query("DELETE FROM meetings WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn archive_meeting(pool: &SqlitePool, id: &str, archived_path: Option<&str>) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query("UPDATE meetings SET archived_at = ?, archived_path = ?, updated_at = ? WHERE id = ?")
+        .bind(&now)
+        .bind(archived_path)
+        .bind(&now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn unarchive_meeting(pool: &SqlitePool, id: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query("UPDATE meetings SET archived_at = NULL, archived_path = NULL, updated_at = ? WHERE id = ?")
+        .bind(&now)
         .bind(id)
         .execute(pool)
         .await?;

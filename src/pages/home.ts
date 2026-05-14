@@ -1,5 +1,5 @@
 import type { MeetingWithDetails, Category, CreateMeetingRequest, SavedParticipant, MeetingTemplate, CreateTemplateRequest, Tag } from '../types';
-import { getMeetings, getCategories, createMeeting, deleteMeeting } from '../api/meetings';
+import { getMeetings, getArchivedMeetings, getCategories, createMeeting, deleteMeeting } from '../api/meetings';
 import { getSavedParticipants, upsertSavedParticipant } from '../api/participants';
 import { getTemplates, createTemplate, deleteTemplate, updateTemplate } from '../api/templates';
 import { getTags, createTag, deleteTag } from '../api/tags';
@@ -16,6 +16,7 @@ function buildCreateMeetingForm(
   categories: Category[],
   savedParticipants: SavedParticipant[],
   templates: MeetingTemplate[],
+  tags: Tag[],
   onSavedParticipantsChanged?: (participants: SavedParticipant[]) => void,
   onTemplatesChanged?: (templates: MeetingTemplate[]) => void
 ): {
@@ -274,6 +275,42 @@ function buildCreateMeetingForm(
   catGroup.appendChild(catLabel);
   catGroup.appendChild(catSelect);
 
+  // 標籤選擇
+  let selectedTagIds: Set<string> = new Set();
+  const tagGroup = document.createElement('div');
+  tagGroup.className = 'form-group';
+  const tagLabel = document.createElement('label');
+  tagLabel.textContent = '標籤（可複選）';
+  tagGroup.appendChild(tagLabel);
+  if (tags.length === 0) {
+    const hint = document.createElement('p');
+    hint.className = 'empty-hint';
+    hint.textContent = '尚無標籤，可先到管理頁建立。';
+    tagGroup.appendChild(hint);
+  } else {
+    const tagCheckboxes = document.createElement('div');
+    tagCheckboxes.className = 'tag-checkbox-list';
+    for (const tag of tags) {
+      const row = document.createElement('label');
+      row.className = 'tag-checkbox-row';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = selectedTagIds.has(tag.id);
+      cb.addEventListener('change', () => {
+        if (cb.checked) selectedTagIds.add(tag.id);
+        else selectedTagIds.delete(tag.id);
+      });
+      const swatch = document.createElement('span');
+      swatch.className = 'tag-swatch';
+      swatch.style.backgroundColor = tag.color;
+      row.appendChild(cb);
+      row.appendChild(swatch);
+      row.appendChild(document.createTextNode(tag.name));
+      tagCheckboxes.appendChild(row);
+    }
+    tagGroup.appendChild(tagCheckboxes);
+  }
+
   // 參與者列表編輯器
   const partEditorContainer = document.createElement('div');
   const initialEditor = buildParticipantEditor([], savedParticipants, {
@@ -315,6 +352,7 @@ function buildCreateMeetingForm(
 
   form.appendChild(titleGroup);
   form.appendChild(catGroup);
+  form.appendChild(tagGroup);
   form.appendChild(partEditorContainer);
   form.appendChild(tplSaveGroup);
 
@@ -328,6 +366,7 @@ function buildCreateMeetingForm(
       title,
       category_id: catSelect.value || null,
       participants: getParticipantsRef(),
+      tag_ids: Array.from(selectedTagIds),
     };
   };
 
@@ -436,16 +475,19 @@ export async function renderHomePage(container: HTMLElement): Promise<void> {
   container.innerHTML = '<div class="loading">載入中...</div>';
 
   let meetings: MeetingWithDetails[] = [];
+  let archivedMeetings: MeetingWithDetails[] = [];
   let categories: Category[] = [];
   let savedParticipants: SavedParticipant[] = [];
   let templates: MeetingTemplate[] = [];
   let allTags: Tag[] = [];
   let activeCategory = '';
   let activeTagId = '';
+  let listMode: 'active' | 'archived' = 'active';
 
   try {
-    [meetings, categories, savedParticipants, templates, allTags] = await Promise.all([
+    [meetings, archivedMeetings, categories, savedParticipants, templates, allTags] = await Promise.all([
       getMeetings(),
+      getArchivedMeetings(),
       getCategories(),
       getSavedParticipants(),
       getTemplates(),
@@ -465,13 +507,34 @@ export async function renderHomePage(container: HTMLElement): Promise<void> {
 
     const pageTitle = document.createElement('h2');
     pageTitle.className = 'page-title';
-    pageTitle.textContent = '我的會議';
+    pageTitle.textContent = listMode === 'active' ? '我的會議' : '已封存會議';
     toolbar.appendChild(pageTitle);
+
+    const listModeGroup = document.createElement('div');
+    listModeGroup.className = 'meeting-list-mode-group';
+    const activeBtn = document.createElement('button');
+    activeBtn.className = `btn btn-sm ${listMode === 'active' ? 'btn-primary' : 'btn-secondary'}`;
+    activeBtn.textContent = '一般會議';
+    activeBtn.addEventListener('click', () => {
+      listMode = 'active';
+      buildPage();
+    });
+    const archivedBtn = document.createElement('button');
+    archivedBtn.className = `btn btn-sm ${listMode === 'archived' ? 'btn-primary' : 'btn-secondary'}`;
+    archivedBtn.textContent = '已封存';
+    archivedBtn.addEventListener('click', () => {
+      listMode = 'archived';
+      buildPage();
+    });
+    listModeGroup.appendChild(activeBtn);
+    listModeGroup.appendChild(archivedBtn);
+    toolbar.appendChild(listModeGroup);
 
     const addBtn = document.createElement('button');
     addBtn.className = 'btn btn-primary';
     addBtn.textContent = '+ 新增會議';
     addBtn.addEventListener('click', () => openAddModal());
+    addBtn.disabled = listMode === 'archived';
     toolbar.appendChild(addBtn);
 
     container.appendChild(toolbar);
@@ -535,9 +598,10 @@ export async function renderHomePage(container: HTMLElement): Promise<void> {
     container.appendChild(tagBar);
 
     // 會議列表
+    const sourceMeetings = listMode === 'active' ? meetings : archivedMeetings;
     let filtered = activeCategory
-      ? meetings.filter((m) => m.category_id === activeCategory)
-      : meetings;
+      ? sourceMeetings.filter((m) => m.category_id === activeCategory)
+      : sourceMeetings;
 
     if (activeTagId) {
       filtered = filtered.filter((m) => m.tags.some((t) => t.id === activeTagId));
@@ -546,7 +610,9 @@ export async function renderHomePage(container: HTMLElement): Promise<void> {
     if (filtered.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'empty-state';
-      empty.innerHTML = '<p>目前沒有會議記錄</p><p>點擊「+ 新增會議」開始建立</p>';
+      empty.innerHTML = listMode === 'active'
+        ? '<p>目前沒有會議記錄</p><p>點擊「+ 新增會議」開始建立</p>'
+        : '<p>目前沒有封存中的會議</p><p>你可在會議詳情頁將會議封存。</p>';
       container.appendChild(empty);
     } else {
       const list = document.createElement('div');
@@ -566,6 +632,7 @@ export async function renderHomePage(container: HTMLElement): Promise<void> {
       categories,
       savedParticipants,
       templates,
+      allTags,
       (updated) => {
         savedParticipants.splice(0, savedParticipants.length, ...updated);
       },
@@ -714,7 +781,7 @@ export async function renderHomePage(container: HTMLElement): Promise<void> {
   }
 
   function handleDelete(id: string): void {
-    const meeting = meetings.find((m) => m.id === id);
+    const meeting = meetings.find((m) => m.id === id) ?? archivedMeetings.find((m) => m.id === id);
     if (!meeting) return;
     openModal({
       title: '刪除確認',
@@ -725,6 +792,7 @@ export async function renderHomePage(container: HTMLElement): Promise<void> {
         try {
           await deleteMeeting(id);
           meetings = meetings.filter((m) => m.id !== id);
+          archivedMeetings = archivedMeetings.filter((m) => m.id !== id);
           showToast('已刪除', 'success');
           buildPage();
         } catch (err) {

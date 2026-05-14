@@ -18,6 +18,8 @@ pub struct MeetingWithDetails {
     pub has_summary: bool,
     pub tags: Vec<Tag>,
     pub meeting_date: Option<String>,
+    pub archived_at: Option<String>,
+    pub archived_path: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

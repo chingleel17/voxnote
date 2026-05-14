@@ -27,6 +27,8 @@ export interface MeetingWithDetails {
   has_summary: boolean;
   tags: Tag[];
   meeting_date: string | null;
+  archived_at: string | null;
+  archived_path: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -85,6 +87,9 @@ export interface AppConfig {
   // ASR
   asr_provider: 'assemblyai' | 'local';
   assembly_ai_key: string;
+  assembly_ai_speech_model: 'universal-2' | 'universal-3-pro';
+  recording_storage_dir: string;
+  archive_storage_dir: string;
   local_asr_model: 'tiny' | 'base' | 'small' | 'medium' | 'large';
   asr_language: string;       // "zh" | "en" | "auto"
   speaker_detection: boolean; // 說話人偵測

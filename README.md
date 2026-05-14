@@ -15,6 +15,14 @@
   <img alt="Platform" src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-lightgrey">
 </p>
 
+<p align="center">
+  中文版 | <a href="./README.en.md">English</a>
+</p>
+
+<p align="center">
+  <img alt="VoxNote 應用程式截圖" src="./screenshot.png" width="960">
+</p>
+
 ---
 
 ## 目錄
@@ -46,30 +54,36 @@ VoxNote 是一款以**本地優先**設計的桌面會議助理。所有資料�
 ## 功能特色
 
 ### 會議管理
+
 - 建立、編輯、刪除會議，支援分類與標籤
 - 參與者管理（含常用參與者快速選取）
 - 會議模板（預設標題、分類、參與者）
 
 ### 錄音功能
+
 - 瀏覽器原生 MediaRecorder 錄音（WAV）
 - 支援上傳音訊檔案（`.wav` / `.mp3` / `.m4a` / `.ogg` / `.aac` / `.flac`，最大 500MB）
 - 自訂音訊播放器（播放/暫停、進度條、靜音）
 
 ### 語音轉文字（ASR）
+
 - **AssemblyAI**（雲端）：自動語言偵測、說話者分離
 - **本地 Whisper**：偵測 PATH 中的 `whisper`、`faster-whisper`、`openai-whisper`
 
 ### AI 校對
+
 - 修正錯字、同音異字、標點錯誤
 - 保留原始時間戳記（`[MM:SS]`）
 - 自動偵測縮略品質，不符標準時提示確認
 - 保存原始版本與校對版本，可隨時切換
 
 ### AI 摘要
+
 - 生成結構化 Markdown 摘要（主題、待辦事項、重要時間點等）
 - 支援自訂 Prompt
 
 ### 匯出
+
 - 逐字稿 TXT（原始版 / 校對版）
 - 摘要 Markdown
 
@@ -77,13 +91,13 @@ VoxNote 是一款以**本地優先**設計的桌面會議助理。所有資料�
 
 ## 技術架構
 
-| 層次 | 技術 |
-|------|------|
-| 桌面框架 | [Tauri 2.0](https://tauri.app/) |
-| 後端 | Rust + [sqlx](https://github.com/launchbadge/sqlx)（SQLite） |
-| 前端 | Vanilla TypeScript + [Vite](https://vitejs.dev/) |
-| AI 呼叫 | reqwest（HTTP）— 無第三方 AI SDK |
-| 設定儲存 | TOML（`AppData` 目錄） |
+| 層次     | 技術                                                         |
+| -------- | ------------------------------------------------------------ |
+| 桌面框架 | [Tauri 2.0](https://tauri.app/)                              |
+| 後端     | Rust + [sqlx](https://github.com/launchbadge/sqlx)（SQLite） |
+| 前端     | Vanilla TypeScript + [Vite](https://vitejs.dev/)             |
+| AI 呼叫  | reqwest（HTTP）— 無第三方 AI SDK                             |
+| 設定儲存 | TOML（`AppData` 目錄）                                       |
 
 ```
 src/                    # 前端（Vanilla TypeScript）
@@ -116,6 +130,7 @@ src-tauri/src/          # Rust 後端
 - [Tauri CLI v2](https://tauri.app/start/)
 
 Windows 額外需要（C++ Build Tools）：
+
 ```
 winget install Microsoft.VisualStudio.2022.BuildTools
 ```
@@ -165,14 +180,14 @@ npm run tauri build
 
 ### 支援的 LLM 供應商
 
-| 供應商 | 需要 API Key | 說明 |
-|--------|-------------|------|
-| **OpenAI** | 是 | GPT-4o 等 |
-| **Claude** | 是 | Anthropic Claude 系列 |
-| **Gemini** | 是 | Google Gemini 系列 |
-| **OpenRouter** | 是 | 多模型代理 |
-| **Ollama** | 否 | 本地 LLM，需先[安裝 Ollama](https://ollama.com/) |
-| **自訂端點** | 可選 | 任何 OpenAI 相容 API |
+| 供應商         | 需要 API Key | 說明                                             |
+| -------------- | ------------ | ------------------------------------------------ |
+| **OpenAI**     | 是           | GPT-4o 等                                        |
+| **Claude**     | 是           | Anthropic Claude 系列                            |
+| **Gemini**     | 是           | Google Gemini 系列                               |
+| **OpenRouter** | 是           | 多模型代理                                       |
+| **Ollama**     | 否           | 本地 LLM，需先[安裝 Ollama](https://ollama.com/) |
+| **自訂端點**   | 可選         | 任何 OpenAI 相容 API                             |
 
 ### Ollama 快速設定
 

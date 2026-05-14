@@ -50,6 +50,7 @@ pub async fn transcribe_assemblyai(
     api_key: &str,
     file_path: &str,
     language: &str,
+    speech_model: &str,
     speaker_detection: bool,
     progress_cb: impl Fn(String),
 ) -> Result<String> {
@@ -83,7 +84,10 @@ pub async fn transcribe_assemblyai(
 
     // 2. 建立轉錄任務
     progress_cb("建立轉錄任務...".into());
-    let mut req_body = json!({ "audio_url": upload_url });
+    let mut req_body = json!({
+        "audio_url": upload_url,
+        "speech_models": build_speech_models(speech_model),
+    });
     if !language.is_empty() && language != "auto" {
         req_body["language_code"] = json!(language);
     }
@@ -159,6 +163,13 @@ pub async fn transcribe_assemblyai(
                 progress_cb(format!("轉錄中（{}）...", other));
             }
         }
+    }
+}
+
+fn build_speech_models(selected_model: &str) -> Vec<&'static str> {
+    match selected_model {
+        "universal-3-pro" => vec!["universal-3-pro", "universal-2"],
+        _ => vec!["universal-2", "universal-3-pro"],
     }
 }
 

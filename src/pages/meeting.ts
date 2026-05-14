@@ -1,8 +1,8 @@
-import type { MeetingWithDetails, Transcript, Summary, Recording, SavedParticipant, CreateTemplateRequest, Tag, SpeakerMapping } from '../types';
-import { getMeeting, updateMeeting } from '../api/meetings';
+import type { MeetingWithDetails, Transcript, Summary, Recording, SavedParticipant, CreateTemplateRequest, Tag, SpeakerMapping, Category } from '../types';
+import { getMeeting, getCategories, updateMeeting, archiveMeeting, unarchiveMeeting } from '../api/meetings';
 import { exportTextFileToPath, getTranscript, saveTranscriptManual, saveTranscriptProofread, switchTranscriptVersion } from '../api/transcripts';
 import { getSummary } from '../api/summaries';
-import { getRecordings, deleteRecording, setNoBreakBefore, reorderRecordings, remergeSegments } from '../api/recordings';
+import { getRecordings, deleteRecording, setNoBreakBefore, reorderRecordings, remergeSegments, readRecordingFile } from '../api/recordings';
 import { startTranscription, proofreadRecordingSegment, proofreadTranscript, generateSummary } from '../api/settings';
 import { getSavedParticipants, upsertSavedParticipant } from '../api/participants';
 import { deleteSpeakerMapping, getSpeakerMappings, upsertSpeakerMapping } from '../api/speakerMappings';
@@ -12,7 +12,6 @@ import { openModal } from '../components/modal';
 import { showToast } from '../components/toast';
 import { createWaveformPlayer } from '../components/audioPlayer';
 import { buildParticipantEditor } from '../components/participantEditor';
-import { convertFileSrc } from '@tauri-apps/api/core';
 import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 import { isProcessing, startProcessing, finishProcessing, onProcessingComplete } from '../utils/processingState';
 
@@ -21,6 +20,7 @@ type ManualBaseVersion = 'original' | 'proofread';
 
 const transcriptUtteranceRe = /^\[(\d{2}:\d{2})(?:\s+([^\]]+))?\]\s+(.*)$/;
 const MERGED_BREAK_SEPARATOR = '\n\n--- ☕ 中場休息 ---\n\n';
+const recordingObjectUrls = new Map<string, string>();
 
 function parseTimeToSeconds(timeStr: string): number {
   const [minutesPart, secondsPart] = timeStr.split(':');
@@ -159,6 +159,79 @@ function buildGeneratedTranscriptText(
   }).join('');
 }
 
+function buildSpeakerReferenceLines(recordings: Recording[], speakerMappings: SpeakerMapping[]): string[] {
+  const segmentIndexByRecordingId = new Map(recordings.map((recording, index) => [recording.id, index + 1]));
+  const grouped = new Map<string, Array<{ segmentIndex: number | null; participantName: string }>>();
+
+  for (const mapping of speakerMappings) {
+    const recordingId = mapping.recording_id;
+    const speakerLabel = mapping.speaker_label.trim();
+    const participantName = mapping.participant_name.trim();
+    if (!recordingId || !speakerLabel || !participantName) continue;
+
+    const entries = grouped.get(speakerLabel) ?? [];
+    entries.push({
+      segmentIndex: segmentIndexByRecordingId.get(recordingId) ?? null,
+      participantName,
+    });
+    grouped.set(speakerLabel, entries);
+  }
+
+  return Array.from(grouped.entries())
+    .sort(([left], [right]) => left.localeCompare(right))
+    .flatMap(([speakerLabel, entries]) => {
+      const participantNames = Array.from(new Set(entries.map((entry) => entry.participantName)));
+      if (participantNames.length === 1) {
+        return [`${speakerLabel}代表 ${participantNames[0]}`];
+      }
+
+      const seen = new Set<string>();
+      return [...entries]
+        .sort((left, right) => {
+          const leftIndex = left.segmentIndex ?? Number.MAX_SAFE_INTEGER;
+          const rightIndex = right.segmentIndex ?? Number.MAX_SAFE_INTEGER;
+          if (leftIndex !== rightIndex) return leftIndex - rightIndex;
+          return left.participantName.localeCompare(right.participantName);
+        })
+        .flatMap((entry) => {
+          const key = `${entry.segmentIndex ?? 'unknown'}::${entry.participantName}`;
+          if (seen.has(key)) return [];
+          seen.add(key);
+          const segmentPrefix = entry.segmentIndex ? `第${entry.segmentIndex}段 ` : '';
+          return [`${segmentPrefix}${speakerLabel}代表 ${entry.participantName}`];
+        });
+    });
+}
+
+function buildTranscriptSpeakerReference(recordings: Recording[], speakerMappings: SpeakerMapping[]): string {
+  const lines = buildSpeakerReferenceLines(recordings, speakerMappings);
+  if (lines.length === 0) {
+    return '';
+  }
+
+  return [
+    '【這裡是講者對應的人員】',
+    '',
+    ...lines,
+    '',
+    '【以下是會議逐字稿】',
+    '',
+  ].join('\n');
+}
+
+function prependTranscriptSpeakerReference(
+  text: string,
+  recordings: Recording[],
+  speakerMappings: SpeakerMapping[],
+): string {
+  const reference = buildTranscriptSpeakerReference(recordings, speakerMappings);
+  if (!reference) {
+    return text;
+  }
+
+  return `${reference}${text.trim()}`;
+}
+
 function buildGlobalSpeakerLabelMapper(
   recordings: Recording[],
   speakerMappings: SpeakerMapping[],
@@ -252,6 +325,30 @@ function formatMeetingDisplayDate(value: string): string {
   return date.toLocaleDateString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit' });
 }
 
+async function resolveRecordingSource(filePath: string): Promise<string> {
+  if (filePath.startsWith('blob:')) {
+    return filePath;
+  }
+
+  const cached = recordingObjectUrls.get(filePath);
+  if (cached) {
+    return cached;
+  }
+
+  const bytes = await readRecordingFile(filePath);
+  const blob = new Blob([new Uint8Array(bytes)]);
+  const objectUrl = URL.createObjectURL(blob);
+  recordingObjectUrls.set(filePath, objectUrl);
+  return objectUrl;
+}
+
+function revokeRecordingSources(): void {
+  for (const objectUrl of recordingObjectUrls.values()) {
+    URL.revokeObjectURL(objectUrl);
+  }
+  recordingObjectUrls.clear();
+}
+
 function buildCodeFence(text: string, language = ''): string {
   const fenceLength = Array.from(text.matchAll(/`+/g)).reduce((max, match) => Math.max(max, match[0].length + 1), 3);
   const fence = '`'.repeat(fenceLength);
@@ -275,17 +372,19 @@ function buildTranscriptMarkdownContent(
   meetingDate: string,
   version: TranscriptVersion,
   text: string,
+  recordings: Recording[],
+  speakerMappings: SpeakerMapping[],
 ): string {
   const normalizedTitle = meetingTitle.trim() || '未命名會議';
   const transcriptText = text.trim() || '（無逐字稿內容）';
+  const speakerReference = buildTranscriptSpeakerReference(recordings, speakerMappings);
   return [
     `# ${normalizedTitle} 逐字稿`,
     '',
     `- 會議日期：${formatMeetingDisplayDate(meetingDate)}`,
     `- 版本：${getTranscriptVersionLabel(version)}`,
     '',
-    '## 內容',
-    '',
+    ...(speakerReference ? [speakerReference] : ['## 內容', '']),
     buildCodeFence(transcriptText, 'text'),
     '',
   ].join('\n');
@@ -1184,7 +1283,7 @@ function buildTranscriptSection(
     const text = getTranscriptDisplayText(loadedTranscript, recordings, currentVersion, localMappings);
     try {
       const exported = await exportTextFile(
-        text,
+        prependTranscriptSpeakerReference(text, recordings, localMappings),
         buildTranscriptExportFileName(meetingTitle, meetingDate, 'txt'),
         '文字檔',
         'txt',
@@ -1201,7 +1300,7 @@ function buildTranscriptSection(
     const text = getTranscriptDisplayText(loadedTranscript, recordings, currentVersion, localMappings);
     try {
       const exported = await exportTextFile(
-        buildTranscriptMarkdownContent(meetingTitle, meetingDate, currentVersion, text),
+        buildTranscriptMarkdownContent(meetingTitle, meetingDate, currentVersion, text, recordings, localMappings),
         buildTranscriptExportFileName(meetingTitle, meetingDate, 'md'),
         'Markdown',
         'md',
@@ -1509,9 +1608,13 @@ function buildRecordingSection(
     audioEl.preload = 'metadata';
     audioEl.style.display = 'none';
     audioEl.dataset.recordingId = rec.id;
-    audioEl.src = rec.file_path!.startsWith('blob:')
-      ? rec.file_path!
-      : convertFileSrc(rec.file_path!);
+    void resolveRecordingSource(rec.file_path!).then((src) => {
+      if (audioEl.dataset.recordingId === rec.id) {
+        audioEl.src = src;
+      }
+    }).catch((err) => {
+      showToast(`載入錄音失敗：${String(err)}`, 'error');
+    });
     const playerEl = createWaveformPlayer(audioEl);
     segWrap.appendChild(audioEl);
     segWrap.appendChild(playerEl);
@@ -1685,8 +1788,11 @@ function buildRecordingSection(
 
 export async function renderMeetingPage(container: HTMLElement, meetingId: string): Promise<void> {
   container.innerHTML = '<div class="loading">載入中...</div>';
+  revokeRecordingSources();
+  window.addEventListener('hashchange', revokeRecordingSources, { once: true });
 
   let meeting: MeetingWithDetails | null = null;
+  let categories: Category[] = [];
   let transcript: Transcript | null = null;
   let summary: Summary | null = null;
   let recordings: Recording[] = [];
@@ -1697,8 +1803,9 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
   let currentTranscriptSection: { el: HTMLElement; refreshMappings: (m: SpeakerMapping[]) => void } | null = null;
 
   try {
-    [meeting, transcript, summary, recordings, savedParticipants, allTags, speakerMappings] = await Promise.all([
+    [meeting, categories, transcript, summary, recordings, savedParticipants, allTags, speakerMappings] = await Promise.all([
       getMeeting(meetingId),
+      getCategories(),
       getTranscript(meetingId),
       getSummary(meetingId),
       getRecordings(meetingId),
@@ -1723,6 +1830,7 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
     if (recordings.filter((recording) => recording.file_path).length < 2) {
       isRecordingListCollapsed = false;
     }
+    revokeRecordingSources();
     container.innerHTML = '';
 
     // 頂部導覽
@@ -1759,10 +1867,27 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
     saveAsTplBtn.textContent = '儲存為範本';
     saveAsTplBtn.addEventListener('click', () => openSaveTemplateModal());
 
+    const archiveBtn = document.createElement('button');
+    archiveBtn.className = 'btn btn-secondary btn-sm';
+    archiveBtn.textContent = meeting.archived_at ? '取消封存' : '封存';
+    archiveBtn.addEventListener('click', async () => {
+      if (!meeting) return;
+      try {
+        meeting = meeting.archived_at
+          ? await unarchiveMeeting(meeting.id)
+          : await archiveMeeting(meeting.id);
+        showToast(meeting.archived_at ? '會議已封存' : '已取消封存', 'success');
+        build();
+      } catch (err) {
+        showToast(`操作失敗：${String(err)}`, 'error');
+      }
+    });
+
     topBar.appendChild(backBtn);
     topBar.appendChild(titleArea);
     topBar.appendChild(editBtn);
     topBar.appendChild(saveAsTplBtn);
+    topBar.appendChild(archiveBtn);
     topBar.appendChild(printBtn);
     container.appendChild(topBar);
 
@@ -1778,6 +1903,12 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
     dateChip.textContent = new Date(displayDate).toLocaleDateString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit' });
     dateBar.appendChild(dateBarLabel);
     dateBar.appendChild(dateChip);
+    if (meeting.archived_at) {
+      const archivedChip = document.createElement('span');
+      archivedChip.className = 'participant-chip';
+      archivedChip.textContent = `已封存於 ${formatMeetingDisplayDate(meeting.archived_at)}`;
+      dateBar.appendChild(archivedChip);
+    }
     container.appendChild(dateBar);
 
     // 參與者
@@ -2002,6 +2133,26 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
     dateGroup.appendChild(dateLabel);
     dateGroup.appendChild(dateInput);
 
+    const categoryGroup = document.createElement('div');
+    categoryGroup.className = 'form-group';
+    const categoryLabel = document.createElement('label');
+    categoryLabel.textContent = '分類';
+    const categorySelect = document.createElement('select');
+    categorySelect.className = 'form-control';
+    const emptyCategoryOption = document.createElement('option');
+    emptyCategoryOption.value = '';
+    emptyCategoryOption.textContent = '-- 無分類 --';
+    categorySelect.appendChild(emptyCategoryOption);
+    for (const category of categories) {
+      const option = document.createElement('option');
+      option.value = category.id;
+      option.textContent = category.name;
+      option.selected = category.id === (meeting.category_id ?? '');
+      categorySelect.appendChild(option);
+    }
+    categoryGroup.appendChild(categoryLabel);
+    categoryGroup.appendChild(categorySelect);
+
     // 參與者列表編輯器
     const { el: partEditorEl, getParticipants } = buildParticipantEditor(
       meeting.participants,
@@ -2061,6 +2212,7 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
 
     form.appendChild(titleGroup);
     form.appendChild(dateGroup);
+    form.appendChild(categoryGroup);
     form.appendChild(partEditorEl);
     form.appendChild(tagGroup);
 
@@ -2076,7 +2228,7 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
         try {
           const updated = await updateMeeting(meeting.id, {
             title,
-            category_id: meeting.category_id,
+            category_id: categorySelect.value || null,
             participants,
             tag_ids: Array.from(selectedTagIds),
             meeting_date: dateInput.value || null,

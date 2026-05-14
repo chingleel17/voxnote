@@ -1,6 +1,6 @@
 [package]
 name = "voxnote"
-version = "0.1.0"
+version = "0.1.2"
 description = "VoxNote - 錄音、逐字稿、AI 校稿、會議摘要一站式桌面應用"
 authors = ["ching"]
 edition = "2021"
@@ -27,4 +27,3 @@ anyhow = "1"
 thiserror = "2"
 toml = "0.8"
 reqwest = { version = "0.12", features = ["json", "multipart"] }
-

@@ -8,6 +8,9 @@ pub struct AppConfig {
     // ASR 供應商："assemblyai" | "local"
     pub asr_provider: String,
     pub assembly_ai_key: String,
+    pub assembly_ai_speech_model: String, // "universal-2" | "universal-3-pro"
+    pub recording_storage_dir: String,
+    pub archive_storage_dir: String,
     pub local_asr_model: String, // "tiny" | "base" | "small" | "medium" | "large"
     pub asr_language: String,    // "zh" | "en" | "auto"
     pub speaker_detection: bool, // 是否啟用說話人偵測
@@ -39,6 +42,9 @@ impl Default for AppConfig {
         Self {
             asr_provider: "assemblyai".into(),
             assembly_ai_key: String::new(),
+            assembly_ai_speech_model: "universal-2".into(),
+            recording_storage_dir: String::new(),
+            archive_storage_dir: String::new(),
             local_asr_model: "base".into(),
             asr_language: "zh".into(),
             speaker_detection: true,

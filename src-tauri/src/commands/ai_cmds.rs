@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
 use serde::Serialize;
 use sqlx::SqlitePool;
 use tauri::{AppHandle, State};
@@ -5,7 +7,10 @@ use tauri::{AppHandle, State};
 use crate::{
     ai::call_llm,
     config::load_config,
-    db::{recording, summary, transcript},
+    db::{
+        models::{Recording, SpeakerMapping},
+        recording, speaker_mapping, summary, transcript,
+    },
 };
 
 const PROOFREAD_SYSTEM: &str = "\
@@ -46,6 +51,96 @@ const FINAL_SUMMARY_SYSTEM: &str = "\
 ## 待辦事項（TODO）\n\
 ## 重要時間點（含 [MM:SS] 時間標記）\n\
 ## 專有名詞說明";
+
+fn build_speaker_reference_lines(
+    recordings: &[Recording],
+    speaker_mappings: &[SpeakerMapping],
+) -> Vec<String> {
+    let recording_order: HashMap<&str, usize> = recordings
+        .iter()
+        .enumerate()
+        .map(|(index, recording)| (recording.id.as_str(), index + 1))
+        .collect();
+
+    let mut grouped: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
+    for mapping in speaker_mappings {
+        let Some(recording_id) = mapping.recording_id.as_deref() else {
+            continue;
+        };
+
+        let speaker_label = mapping.speaker_label.trim();
+        let participant_name = mapping.participant_name.trim();
+        if speaker_label.is_empty() || participant_name.is_empty() {
+            continue;
+        }
+
+        grouped
+            .entry(speaker_label.to_string())
+            .or_default()
+            .push((
+                *recording_order.get(recording_id).unwrap_or(&usize::MAX),
+                participant_name.to_string(),
+            ));
+    }
+
+    let mut lines = Vec::new();
+    for (speaker_label, mut entries) in grouped {
+        let unique_participants: BTreeSet<String> =
+            entries.iter().map(|(_, name)| name.clone()).collect();
+        if unique_participants.len() == 1 {
+            if let Some(participant_name) = unique_participants.iter().next() {
+                lines.push(format!("{}代表 {}", speaker_label, participant_name));
+            }
+            continue;
+        }
+
+        entries.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        let mut seen = BTreeSet::new();
+        for (segment_index, participant_name) in entries {
+            if !seen.insert((segment_index, participant_name.clone())) {
+                continue;
+            }
+
+            let segment_prefix = if segment_index == usize::MAX {
+                String::new()
+            } else {
+                format!("第{}段 ", segment_index)
+            };
+            lines.push(format!(
+                "{}{}代表 {}",
+                segment_prefix, speaker_label, participant_name
+            ));
+        }
+    }
+
+    lines
+}
+
+fn build_speaker_reference_block(
+    recordings: &[Recording],
+    speaker_mappings: &[SpeakerMapping],
+) -> Option<String> {
+    let lines = build_speaker_reference_lines(recordings, speaker_mappings);
+    if lines.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "【這裡是講者對應的人員】\n\n{}\n\n",
+        lines.join("\n")
+    ))
+}
+
+fn prepend_reference_block(
+    reference_block: Option<&str>,
+    content_label: &str,
+    content: &str,
+) -> String {
+    match reference_block {
+        Some(reference) => format!("{reference}{content_label}\n\n{content}"),
+        None => content.to_string(),
+    }
+}
 
 /// 將逐字稿依行分塊，每塊不超過 max_chars 字元（完整行不截斷）
 fn chunk_transcript(text: &str, max_chars: usize) -> Vec<String> {
@@ -451,6 +546,14 @@ pub async fn generate_summary(
         return Err("逐字稿內容為空".into());
     }
 
+    let recordings = recording::get_recordings(&pool, &meeting_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let speaker_mappings = speaker_mapping::get_speaker_mappings(&pool, &meeting_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let speaker_reference = build_speaker_reference_block(&recordings, &speaker_mappings);
+
     // 使用自訂 prompt（若設定為空則用內建預設）
     let summary_system: &str = if config.summary_prompt.is_empty() {
         SUMMARY_SYSTEM
@@ -461,7 +564,12 @@ pub async fn generate_summary(
     // 分塊總結：超過 20,000 字元時分段處理，避免模型靜默截斷
     const SUMMARY_CHUNK_SIZE: usize = 20_000;
     let summary_text = if content.len() <= SUMMARY_CHUNK_SIZE {
-        call_llm(&config, summary_system, &content)
+        let summary_input = prepend_reference_block(
+            speaker_reference.as_deref(),
+            "【以下是會議逐字稿】",
+            &content,
+        );
+        call_llm(&config, summary_system, &summary_input)
             .await
             .map_err(|e| e.to_string())?
     } else {
@@ -470,7 +578,12 @@ pub async fn generate_summary(
         let total_chunks = chunks.len();
         let mut chunk_summaries: Vec<String> = Vec::new();
         for (i, chunk) in chunks.iter().enumerate() {
-            let partial = call_llm(&config, CHUNK_SUMMARY_SYSTEM, chunk)
+            let chunk_input = prepend_reference_block(
+                speaker_reference.as_deref(),
+                "【以下是會議逐字稿】",
+                chunk,
+            );
+            let partial = call_llm(&config, CHUNK_SUMMARY_SYSTEM, &chunk_input)
                 .await
                 .map_err(|e| format!("會議總結失敗（第{}/{}段）：{}", i + 1, total_chunks, e))?;
             chunk_summaries.push(partial);
@@ -487,7 +600,12 @@ pub async fn generate_summary(
         } else {
             &config.summary_prompt
         };
-        call_llm(&config, final_system, &combined)
+        let combined_input = prepend_reference_block(
+            speaker_reference.as_deref(),
+            "【以下是各段重點】",
+            &combined,
+        );
+        call_llm(&config, final_system, &combined_input)
             .await
             .map_err(|e| e.to_string())?
     };

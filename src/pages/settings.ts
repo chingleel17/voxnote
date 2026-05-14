@@ -5,6 +5,7 @@ import {
   detectLocalAsrTools,
   type LocalAsrInfo,
 } from '../api/settings';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { showToast } from '../components/toast';
 
 // ─────────────────────────────────────────────
@@ -38,6 +39,13 @@ const GEMINI_MODELS = [
   'gemini-2.5-flash',
   'gemini-2.5-flash-lite',
   'gemini-2.0-flash',
+];
+const ASSEMBLYAI_SPEECH_MODELS: Array<{
+  value: AppConfig['assembly_ai_speech_model'];
+  label: string;
+}> = [
+  { value: 'universal-2', label: 'Universal-2' },
+  { value: 'universal-3-pro', label: 'Universal-3 Pro' },
 ];
 const LOCAL_ASR_MODELS = ['tiny', 'base', 'small', 'medium', 'large'];
 const OLLAMA_THINK_LEVELS: Array<{ value: AppConfig['ollama_think_level']; label: string }> = [
@@ -79,6 +87,10 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
   form.className = 'settings-form';
   form.addEventListener('submit', (e) => e.preventDefault());
   container.appendChild(form);
+
+  const settingsGrid = document.createElement('div');
+  settingsGrid.className = 'settings-grid';
+  form.appendChild(settingsGrid);
 
   const saveStatus = document.createElement('small');
   saveStatus.className = 'form-hint';
@@ -138,13 +150,14 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
       ...config,
       asr_provider: updated.asr_provider,
       assembly_ai_key: updated.assembly_ai_key,
+      assembly_ai_speech_model: updated.assembly_ai_speech_model,
       local_asr_model: updated.local_asr_model,
       asr_language: updated.asr_language,
       speaker_detection: updated.speaker_detection,
     };
     scheduleAutoSave();
   });
-  form.appendChild(asrSection);
+  settingsGrid.appendChild(asrSection);
 
   // ── LLM 區塊 ──
   const llmSection = buildLlmSection(config, (updated) => {
@@ -169,7 +182,7 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
     };
     scheduleAutoSave();
   });
-  form.appendChild(llmSection);
+  settingsGrid.appendChild(llmSection);
 
   // ── AI Prompt 自訂區塊 ──
   const promptSection = buildAiPromptSection(config, (updated) => {
@@ -180,11 +193,25 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
     };
     scheduleAutoSave();
   });
-  form.appendChild(promptSection);
+
+  const storageSection = buildStorageSection(config, (updated) => {
+    config = {
+      ...config,
+      recording_storage_dir: updated.recording_storage_dir,
+      archive_storage_dir: updated.archive_storage_dir,
+    };
+    scheduleAutoSave();
+  });
+
+  const advancedSection = buildAdvancedSection([promptSection, storageSection]);
+  form.appendChild(advancedSection);
 
   // ── 儲存按鈕 ──
   const saveRow = document.createElement('div');
   saveRow.className = 'settings-save-row';
+  const saveMeta = document.createElement('div');
+  saveMeta.className = 'settings-save-meta';
+  saveMeta.appendChild(saveStatus);
   const saveBtn = document.createElement('button');
   saveBtn.className = 'btn btn-primary';
   saveBtn.textContent = '儲存設定';
@@ -195,9 +222,9 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
     }
     await persistSettings('manual');
   });
+  saveRow.appendChild(saveMeta);
   saveRow.appendChild(saveBtn);
   form.appendChild(saveRow);
-  form.appendChild(saveStatus);
 }
 
 // ─────────────────────────────────────────────
@@ -238,6 +265,17 @@ function buildAsrSection(
       config = { ...config, assembly_ai_key: v };
       onChange(config);
     })
+  );
+  assemblySection.appendChild(
+    buildSelectGroup(
+      'AssemblyAI 模型',
+      ASSEMBLYAI_SPEECH_MODELS,
+      config.assembly_ai_speech_model || 'universal-2',
+      (v) => {
+        config = { ...config, assembly_ai_speech_model: v as AppConfig['assembly_ai_speech_model'] };
+        onChange(config);
+      }
+    )
   );
   section.appendChild(assemblySection);
 
@@ -346,6 +384,70 @@ function buildAsrSection(
   updateAsrVisibility(config.asr_provider);
 
   return section;
+}
+
+// ─────────────────────────────────────────────
+// 錄音儲存區塊
+// ─────────────────────────────────────────────
+function buildStorageSection(
+  config: AppConfig,
+  onChange: (c: AppConfig) => void
+): HTMLElement {
+  const section = document.createElement('section');
+  section.className = 'settings-section';
+
+  const heading = document.createElement('h3');
+  heading.className = 'settings-section-title';
+  heading.textContent = '錄音與封存';
+  section.appendChild(heading);
+
+  const hint = document.createElement('p');
+  hint.className = 'form-hint';
+  hint.style.marginBottom = '16px';
+  hint.textContent = '可指定新錄音的儲存資料夾與整個會議封存資料夾。留空時仍使用預設 AppData 路徑。';
+  section.appendChild(hint);
+
+  section.appendChild(buildDirectoryPickerGroup(
+    '錄音儲存資料夾',
+    config.recording_storage_dir,
+    async (value) => {
+      config = { ...config, recording_storage_dir: value };
+      onChange(config);
+    }
+  ));
+
+  section.appendChild(buildDirectoryPickerGroup(
+    '封存資料夾',
+    config.archive_storage_dir,
+    async (value) => {
+      config = { ...config, archive_storage_dir: value };
+      onChange(config);
+    }
+  ));
+
+  return section;
+}
+
+// ─────────────────────────────────────────────
+// 進階設定
+// ─────────────────────────────────────────────
+function buildAdvancedSection(children: HTMLElement[]): HTMLElement {
+  const details = document.createElement('details');
+  details.className = 'settings-advanced';
+
+  const summary = document.createElement('summary');
+  summary.className = 'settings-advanced-summary';
+  summary.textContent = '進階設定';
+  details.appendChild(summary);
+
+  const body = document.createElement('div');
+  body.className = 'settings-advanced-body';
+  for (const child of children) {
+    body.appendChild(child);
+  }
+  details.appendChild(body);
+
+  return details;
 }
 
 // ─────────────────────────────────────────────
@@ -766,5 +868,59 @@ function buildSelectGroup(
   select.addEventListener('change', () => onChange(select.value));
   group.appendChild(label);
   group.appendChild(select);
+  return group;
+}
+
+function buildDirectoryPickerGroup(
+  labelText: string,
+  value: string,
+  onChange: (v: string) => void | Promise<void>
+): HTMLElement {
+  const group = document.createElement('div');
+  group.className = 'form-group';
+
+  const label = document.createElement('label');
+  label.textContent = labelText;
+
+  const row = document.createElement('div');
+  row.className = 'directory-picker-row';
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'form-control';
+  input.readOnly = true;
+  input.value = value;
+  input.placeholder = '未指定，將使用預設路徑';
+
+  const pickBtn = document.createElement('button');
+  pickBtn.type = 'button';
+  pickBtn.className = 'btn btn-secondary btn-sm';
+  pickBtn.textContent = '選擇資料夾';
+  pickBtn.addEventListener('click', async () => {
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+      title: labelText,
+    });
+    if (typeof selected === 'string') {
+      input.value = selected;
+      await onChange(selected);
+    }
+  });
+
+  const clearBtn = document.createElement('button');
+  clearBtn.type = 'button';
+  clearBtn.className = 'btn btn-ghost btn-sm';
+  clearBtn.textContent = '清除';
+  clearBtn.addEventListener('click', async () => {
+    input.value = '';
+    await onChange('');
+  });
+
+  row.appendChild(input);
+  row.appendChild(pickBtn);
+  row.appendChild(clearBtn);
+  group.appendChild(label);
+  group.appendChild(row);
   return group;
 }

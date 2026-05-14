@@ -1,7 +1,10 @@
+use std::path::PathBuf;
+
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Manager, State};
 
 use crate::db::{models::Recording, recording, transcript};
+use crate::config::load_config;
 
 #[tauri::command]
 pub async fn get_recording(
@@ -53,12 +56,7 @@ pub async fn write_recording_file(
     app_handle: AppHandle,
     pool: State<'_, SqlitePool>,
 ) -> Result<Recording, String> {
-    let app_data_dir = app_handle
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?;
-
-    let recordings_dir = app_data_dir.join("recordings");
+    let recordings_dir = resolve_recordings_dir(&app_handle).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&recordings_dir).map_err(|e| e.to_string())?;
 
     let file_path = recordings_dir.join(&file_name);
@@ -75,6 +73,11 @@ pub async fn write_recording_file(
     )
     .await
     .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn read_recording_file(file_path: String) -> Result<Vec<u8>, String> {
+    std::fs::read(file_path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -138,4 +141,18 @@ pub async fn remerge_segments(
         .map_err(|e| e.to_string())?;
 
     Ok(merged)
+}
+
+fn resolve_recordings_dir(app_handle: &AppHandle) -> Result<PathBuf, anyhow::Error> {
+    let config = load_config(app_handle)?;
+    let custom_dir = config.recording_storage_dir.trim();
+    if !custom_dir.is_empty() {
+        return Ok(PathBuf::from(custom_dir));
+    }
+
+    let app_data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    Ok(app_data_dir.join("recordings"))
 }

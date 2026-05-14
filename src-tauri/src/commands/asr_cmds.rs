@@ -38,6 +38,7 @@ pub async fn start_transcription(
             &config.assembly_ai_key,
             &file_path,
             &config.asr_language,
+            &config.assembly_ai_speech_model,
             config.speaker_detection,
             emit_progress,
         )

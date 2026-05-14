@@ -25,3 +25,4 @@ export const writeRecordingFile = (
   originalFileName: string | null,
   durationSeconds: number | null,
 ) => invoke<Recording>('write_recording_file', { meetingId, fileData, fileName, originalFileName, durationSeconds });
+export const readRecordingFile = (filePath: string) => invoke<number[]>('read_recording_file', { filePath });

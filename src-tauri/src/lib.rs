@@ -28,10 +28,13 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             // meeting
             get_meetings,
+            get_archived_meetings,
             get_meeting,
             create_meeting,
             update_meeting,
             delete_meeting,
+            archive_meeting,
+            unarchive_meeting,
             get_categories,
             create_category,
             delete_category,
@@ -54,6 +57,7 @@ pub fn run() {
             get_recordings,
             save_recording,
             write_recording_file,
+            read_recording_file,
             delete_recording,
             set_no_break_before,
             reorder_recordings,

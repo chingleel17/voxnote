@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS meetings (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     category_id TEXT,
+    archived_at TEXT,
+    archived_path TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL
@@ -203,6 +205,12 @@ pub async fn init_db(app: &AppHandle) -> Result<SqlitePool> {
         .await;
 
     let _ = sqlx::query("ALTER TABLE meetings ADD COLUMN meeting_date TEXT")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE meetings ADD COLUMN archived_at TEXT")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE meetings ADD COLUMN archived_path TEXT")
         .execute(&pool)
         .await;
 
