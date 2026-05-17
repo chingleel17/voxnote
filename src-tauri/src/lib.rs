@@ -17,6 +17,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let app_handle = app.handle().clone();
             tauri::async_runtime::block_on(async move {
@@ -37,6 +38,7 @@ pub fn run() {
             unarchive_meeting,
             get_categories,
             create_category,
+            update_category,
             delete_category,
             // transcript
             get_transcript,
@@ -87,6 +89,7 @@ pub fn run() {
             // tags
             get_tags,
             create_tag,
+            update_tag,
             delete_tag,
             set_meeting_tags,
         ])

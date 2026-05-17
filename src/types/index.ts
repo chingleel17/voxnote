@@ -93,6 +93,7 @@ export interface AppConfig {
   local_asr_model: 'tiny' | 'base' | 'small' | 'medium' | 'large';
   asr_language: string;       // "zh" | "en" | "auto"
   speaker_detection: boolean; // 說話人偵測
+  auto_proofread_after_transcription: boolean; // 逐段轉譯完成後自動 AI 校稿
 
   // LLM
   llm_provider: 'openai' | 'claude' | 'gemini' | 'openrouter' | 'ollama' | 'custom';
@@ -114,6 +115,9 @@ export interface AppConfig {
   // AI Prompt 自訂（空字串代表使用內建預設 Prompt）
   proofread_prompt: string;
   summary_prompt: string;
+
+  // 完成通知
+  completion_notification_enabled: boolean;
 }
 
 export interface SavedParticipant {

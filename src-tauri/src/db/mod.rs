@@ -1,5 +1,10 @@
+use std::time::Duration;
+
 use anyhow::Result;
-use sqlx::SqlitePool;
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+    SqlitePool,
+};
 use tauri::AppHandle;
 
 pub mod category;
@@ -135,6 +140,21 @@ CREATE TABLE IF NOT EXISTS meeting_tags (
     FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE,
     FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
 );
+
+CREATE INDEX IF NOT EXISTS idx_meetings_archived_created
+    ON meetings(archived_at, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_participants_meeting_id
+    ON participants(meeting_id);
+
+CREATE INDEX IF NOT EXISTS idx_recordings_meeting_sort
+    ON recordings(meeting_id, sort_order, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_summaries_meeting_id
+    ON summaries(meeting_id);
+
+CREATE INDEX IF NOT EXISTS idx_meeting_tags_tag_meeting
+    ON meeting_tags(tag_id, meeting_id);
 "#;
 
 pub async fn init_db(app: &AppHandle) -> Result<SqlitePool> {
@@ -148,12 +168,19 @@ pub async fn init_db(app: &AppHandle) -> Result<SqlitePool> {
     std::fs::create_dir_all(&data_dir)?;
 
     let db_path = data_dir.join("voxnote.db");
-    let db_url = format!(
-        "sqlite:///{}?mode=rwc",
-        db_path.to_string_lossy().replace('\\', "/")
-    );
+    let options = SqliteConnectOptions::new()
+        .filename(&db_path)
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(Duration::from_secs(5));
 
-    let pool = SqlitePool::connect(&db_url).await?;
+    let pool = SqlitePoolOptions::new()
+        .min_connections(1)
+        .max_connections(5)
+        .connect_with(options)
+        .await?;
 
     // 逐條執行 migration，忽略空白語句
     for statement in MIGRATION_SQL.split(';') {

@@ -408,14 +408,11 @@ async fn proofread_text(
     ))
 }
 
-#[tauri::command]
-pub async fn proofread_transcript(
-    meeting_id: String,
-    app: AppHandle,
-    pool: State<'_, SqlitePool>,
+async fn proofread_transcript_with_config(
+    config: &crate::config::AppConfig,
+    pool: &SqlitePool,
+    meeting_id: &str,
 ) -> Result<ProofreadResult, String> {
-    let config = load_config(&app).map_err(|e| e.to_string())?;
-
     let t = transcript::get_transcript(&pool, &meeting_id)
         .await
         .map_err(|e| e.to_string())?
@@ -459,14 +456,12 @@ pub async fn proofread_transcript(
     Ok(proofread)
 }
 
-#[tauri::command]
-pub async fn proofread_recording_segment(
-    meeting_id: String,
-    recording_id: String,
-    app: AppHandle,
-    pool: State<'_, SqlitePool>,
+pub(crate) async fn proofread_recording_segment_with_config(
+    config: &crate::config::AppConfig,
+    pool: &SqlitePool,
+    meeting_id: &str,
+    recording_id: &str,
 ) -> Result<ProofreadResult, String> {
-    let config = load_config(&app).map_err(|e| e.to_string())?;
     let recording_item = recording::get_recording_by_id(&pool, &recording_id)
         .await
         .map_err(|e| e.to_string())?
@@ -519,6 +514,27 @@ pub async fn proofread_recording_segment(
     .map_err(|e| e.to_string())?;
 
     Ok(proofread_segment)
+}
+
+#[tauri::command]
+pub async fn proofread_transcript(
+    meeting_id: String,
+    app: AppHandle,
+    pool: State<'_, SqlitePool>,
+) -> Result<ProofreadResult, String> {
+    let config = load_config(&app).map_err(|e| e.to_string())?;
+    proofread_transcript_with_config(&config, &pool, &meeting_id).await
+}
+
+#[tauri::command]
+pub async fn proofread_recording_segment(
+    meeting_id: String,
+    recording_id: String,
+    app: AppHandle,
+    pool: State<'_, SqlitePool>,
+) -> Result<ProofreadResult, String> {
+    let config = load_config(&app).map_err(|e| e.to_string())?;
+    proofread_recording_segment_with_config(&config, &pool, &meeting_id, &recording_id).await
 }
 
 #[tauri::command]

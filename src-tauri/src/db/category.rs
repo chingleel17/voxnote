@@ -32,6 +32,20 @@ pub async fn create_category(pool: &SqlitePool, name: &str) -> Result<Category> 
     })
 }
 
+pub async fn update_category(pool: &SqlitePool, id: &str, name: &str) -> Result<Category> {
+    sqlx::query("UPDATE categories SET name = ? WHERE id = ?")
+        .bind(name)
+        .bind(id)
+        .execute(pool)
+        .await?;
+
+    sqlx::query_as::<_, Category>("SELECT id, name, created_at FROM categories WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .map_err(Into::into)
+}
+
 pub async fn delete_category(pool: &SqlitePool, id: &str) -> Result<()> {
     let mut tx = pool.begin().await?;
 

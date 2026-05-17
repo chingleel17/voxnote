@@ -27,3 +27,4 @@ anyhow = "1"
 thiserror = "2"
 toml = "0.8"
 reqwest = { version = "0.12", features = ["json", "multipart"] }
+tauri-plugin-notification = "2.3.3"

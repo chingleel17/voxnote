@@ -4,7 +4,7 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use super::models::{CreateMeetingRequest, MeetingWithDetails, UpdateMeetingRequest};
-use super::tag::{get_meeting_tags, set_meeting_tags};
+use super::tag::{get_tags_for_meeting_ids, set_meeting_tags};
 
 const MEETING_SELECT_SQL: &str = r#"
     SELECT
@@ -57,8 +57,13 @@ pub async fn get_meetings(pool: &SqlitePool) -> Result<Vec<MeetingWithDetails>> 
     let sql = format!("{} HAVING m.archived_at IS NULL ORDER BY m.created_at DESC", MEETING_SELECT_SQL);
     let rows = sqlx::query(&sql).fetch_all(pool).await?;
     let mut meetings: Vec<MeetingWithDetails> = rows.iter().map(row_to_meeting).collect();
-    for m in &mut meetings {
-        m.tags = get_meeting_tags(pool, &m.id).await.unwrap_or_default();
+    let meeting_ids: Vec<String> = meetings.iter().map(|meeting| meeting.id.clone()).collect();
+    let tags_by_meeting = get_tags_for_meeting_ids(pool, &meeting_ids).await?;
+    for meeting in &mut meetings {
+        meeting.tags = tags_by_meeting
+            .get(&meeting.id)
+            .cloned()
+            .unwrap_or_default();
     }
     Ok(meetings)
 }
@@ -70,8 +75,13 @@ pub async fn get_archived_meetings(pool: &SqlitePool) -> Result<Vec<MeetingWithD
     );
     let rows = sqlx::query(&sql).fetch_all(pool).await?;
     let mut meetings: Vec<MeetingWithDetails> = rows.iter().map(row_to_meeting).collect();
-    for m in &mut meetings {
-        m.tags = get_meeting_tags(pool, &m.id).await.unwrap_or_default();
+    let meeting_ids: Vec<String> = meetings.iter().map(|meeting| meeting.id.clone()).collect();
+    let tags_by_meeting = get_tags_for_meeting_ids(pool, &meeting_ids).await?;
+    for meeting in &mut meetings {
+        meeting.tags = tags_by_meeting
+            .get(&meeting.id)
+            .cloned()
+            .unwrap_or_default();
     }
     Ok(meetings)
 }
@@ -83,9 +93,8 @@ pub async fn get_meeting(pool: &SqlitePool, id: &str) -> Result<Option<MeetingWi
         Some(m) => m,
         None => return Ok(None),
     };
-    meeting.tags = get_meeting_tags(pool, &meeting.id)
-        .await
-        .unwrap_or_default();
+    let mut tags_by_meeting = get_tags_for_meeting_ids(pool, &[meeting.id.clone()]).await?;
+    meeting.tags = tags_by_meeting.remove(&meeting.id).unwrap_or_default();
     Ok(Some(meeting))
 }
 

@@ -1,8 +1,8 @@
 import type { SavedParticipant, MeetingTemplate, Tag, Category } from '../types';
 import { getSavedParticipants, deleteSavedParticipant, updateSavedParticipant, upsertSavedParticipant } from '../api/participants';
 import { getTemplates, deleteTemplate, updateTemplate } from '../api/templates';
-import { getTags, createTag, deleteTag } from '../api/tags';
-import { getCategories, createCategory, deleteCategory } from '../api/meetings';
+import { getTags, createTag, updateTag, deleteTag } from '../api/tags';
+import { getCategories, createCategory, updateCategory, deleteCategory } from '../api/meetings';
 import { openModal } from '../components/modal';
 import { showToast } from '../components/toast';
 
@@ -16,6 +16,44 @@ const TAB_LABELS: Record<TabKey, string> = {
 };
 
 const TAG_COLORS = ['#6366f1', '#10b981', '#f59e0b', '#ef4444', '#3b82f6', '#8b5cf6', '#ec4899', '#14b8a6'];
+
+function sortTags(items: Tag[]): Tag[] {
+  return [...items].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function sortCategories(items: Category[]): Category[] {
+  return [...items].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function buildTagColorPicker(
+  selectedColor: string,
+  onSelect: (color: string) => void,
+): HTMLDivElement {
+  const colorPicker = document.createElement('div');
+  colorPicker.className = 'tag-color-picker';
+
+  const setSelected = (color: string): void => {
+    colorPicker.querySelectorAll<HTMLButtonElement>('.color-dot').forEach((dot) => {
+      dot.classList.toggle('selected', dot.dataset.color === color);
+    });
+  };
+
+  for (const color of TAG_COLORS) {
+    const dot = document.createElement('button');
+    dot.type = 'button';
+    dot.dataset.color = color;
+    dot.className = `color-dot${color === selectedColor ? ' selected' : ''}`;
+    dot.style.backgroundColor = color;
+    dot.title = color;
+    dot.addEventListener('click', () => {
+      onSelect(color);
+      setSelected(color);
+    });
+    colorPicker.appendChild(dot);
+  }
+
+  return colorPicker;
+}
 
 export async function renderManagePage(container: HTMLElement): Promise<void> {
   container.innerHTML = '<div class="loading">載入中...</div>';
@@ -32,28 +70,33 @@ export async function renderManagePage(container: HTMLElement): Promise<void> {
       getTags(),
       getCategories(),
     ]);
+    tags = sortTags(tags);
+    categories = sortCategories(categories);
   } catch (err) {
     container.innerHTML = `<div class="error-state">載入失敗：${String(err)}</div>`;
     return;
   }
-
   let activeTab: TabKey = 'participants';
+  const header = document.createElement('div');
+  header.className = 'page-toolbar';
+  const title = document.createElement('h2');
+  title.className = 'page-title';
+  title.textContent = '管理';
+  header.appendChild(title);
+
+  const tabs = document.createElement('div');
+  tabs.className = 'manage-tabs';
+
+  const content = document.createElement('div');
+  content.className = 'manage-content';
+
+  container.innerHTML = '';
+  container.appendChild(header);
+  container.appendChild(tabs);
+  container.appendChild(content);
 
   function build(): void {
-    container.innerHTML = '';
-
-    // 標題
-    const header = document.createElement('div');
-    header.className = 'page-toolbar';
-    const title = document.createElement('h2');
-    title.className = 'page-title';
-    title.textContent = '管理';
-    header.appendChild(title);
-    container.appendChild(header);
-
-    // Tab 列
-    const tabs = document.createElement('div');
-    tabs.className = 'manage-tabs';
+    tabs.replaceChildren();
     for (const key of Object.keys(TAB_LABELS) as TabKey[]) {
       const btn = document.createElement('button');
       btn.className = `manage-tab-btn${activeTab === key ? ' active' : ''}`;
@@ -61,28 +104,23 @@ export async function renderManagePage(container: HTMLElement): Promise<void> {
       btn.addEventListener('click', () => { activeTab = key; build(); });
       tabs.appendChild(btn);
     }
-    container.appendChild(tabs);
 
-    // 內容區
-    const content = document.createElement('div');
-    content.className = 'manage-content';
-
+    let nextContent = buildParticipantsTab();
     switch (activeTab) {
       case 'participants':
-        content.appendChild(buildParticipantsTab());
+        nextContent = buildParticipantsTab();
         break;
       case 'templates':
-        content.appendChild(buildTemplatesTab());
+        nextContent = buildTemplatesTab();
         break;
       case 'tags':
-        content.appendChild(buildTagsTab());
+        nextContent = buildTagsTab();
         break;
       case 'categories':
-        content.appendChild(buildCategoriesTab());
+        nextContent = buildCategoriesTab();
         break;
     }
-
-    container.appendChild(content);
+    content.replaceChildren(nextContent);
   }
 
   // ─────────────── 常用參與者 ───────────────
@@ -372,22 +410,6 @@ export async function renderManagePage(container: HTMLElement): Promise<void> {
     nameInput.placeholder = '標籤名稱';
 
     let selectedColor = TAG_COLORS[0];
-    const colorPicker = document.createElement('div');
-    colorPicker.className = 'tag-color-picker';
-    for (const c of TAG_COLORS) {
-      const dot = document.createElement('button');
-      dot.type = 'button';
-      dot.className = `color-dot${c === selectedColor ? ' selected' : ''}`;
-      dot.style.backgroundColor = c;
-      dot.title = c;
-      dot.addEventListener('click', () => {
-        selectedColor = c;
-        colorPicker.querySelectorAll<HTMLElement>('.color-dot').forEach((d) => d.classList.remove('selected'));
-        dot.classList.add('selected');
-      });
-      colorPicker.appendChild(dot);
-    }
-
     const addBtn = document.createElement('button');
     addBtn.className = 'btn btn-primary btn-sm';
     addBtn.textContent = '新增';
@@ -396,14 +418,18 @@ export async function renderManagePage(container: HTMLElement): Promise<void> {
       if (!name) return;
       try {
         const newTag = await createTag(name, selectedColor);
-        tags.push(newTag);
+        tags = sortTags([...tags, newTag]);
         nameInput.value = '';
+        selectedColor = TAG_COLORS[0];
         build();
       } catch (err) {
         showToast(`新增失敗：${String(err)}`, 'error');
       }
     });
-
+    const updateCreatePickerColor = (color: string): void => {
+      selectedColor = color;
+    };
+    const colorPicker = buildTagColorPicker(selectedColor, updateCreatePickerColor);
     addRow.appendChild(nameInput);
     addRow.appendChild(addBtn);
     addSection.appendChild(addRow);
@@ -446,6 +472,61 @@ export async function renderManagePage(container: HTMLElement): Promise<void> {
       info.appendChild(nameEl);
       info.appendChild(meta);
 
+      const editBtn = document.createElement('button');
+      editBtn.className = 'btn btn-secondary btn-sm';
+      editBtn.textContent = '編輯';
+      editBtn.addEventListener('click', () => {
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'form-control manage-rename-input';
+        input.value = tag.name;
+        let editingColor = tag.color;
+
+        const editGroup = document.createElement('div');
+        editGroup.className = 'manage-row-info';
+        const picker = buildTagColorPicker(editingColor, (color) => {
+          editingColor = color;
+        });
+        editGroup.appendChild(input);
+        editGroup.appendChild(picker);
+        info.replaceWith(editGroup);
+        editBtn.style.display = 'none';
+        input.focus();
+        input.select();
+
+        const submitEdit = async () => {
+          const nextName = input.value.trim();
+          if (!nextName) {
+            build();
+            return;
+          }
+          if (nextName === tag.name && editingColor === tag.color) {
+            build();
+            return;
+          }
+          try {
+            const updated = await updateTag(tag.id, nextName, editingColor);
+            tags = sortTags(tags.map((item) => (item.id === tag.id ? updated : item)));
+            build();
+          } catch (err) {
+            showToast(`更新失敗：${String(err)}`, 'error');
+            build();
+          }
+        };
+
+        input.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') void submitEdit();
+          if (e.key === 'Escape') build();
+        });
+        input.addEventListener('blur', () => {
+          const nextFocused = document.activeElement;
+          if (nextFocused instanceof HTMLElement && picker.contains(nextFocused)) {
+            return;
+          }
+          void submitEdit();
+        });
+      });
+
       const delBtn = document.createElement('button');
       delBtn.className = 'btn btn-danger btn-sm';
       delBtn.textContent = '刪除';
@@ -462,6 +543,7 @@ export async function renderManagePage(container: HTMLElement): Promise<void> {
 
       row.appendChild(swatch);
       row.appendChild(info);
+      row.appendChild(editBtn);
       row.appendChild(delBtn);
       list.appendChild(row);
     }
@@ -489,7 +571,7 @@ export async function renderManagePage(container: HTMLElement): Promise<void> {
       if (!name) return;
       try {
         const cat = await createCategory(name);
-        categories.unshift(cat);
+        categories = sortCategories([...categories, cat]);
         nameInput.value = '';
         build();
       } catch (err) {
@@ -527,6 +609,42 @@ export async function renderManagePage(container: HTMLElement): Promise<void> {
       nameEl.textContent = cat.name;
       info.appendChild(nameEl);
 
+      const editBtn = document.createElement('button');
+      editBtn.className = 'btn btn-secondary btn-sm';
+      editBtn.textContent = '重新命名';
+      editBtn.addEventListener('click', () => {
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'form-control manage-rename-input';
+        input.value = cat.name;
+        nameEl.replaceWith(input);
+        editBtn.style.display = 'none';
+        input.focus();
+        input.select();
+
+        const submitRename = async () => {
+          const nextName = input.value.trim();
+          if (!nextName || nextName === cat.name) {
+            build();
+            return;
+          }
+          try {
+            const updated = await updateCategory(cat.id, nextName);
+            categories = sortCategories(categories.map((item) => (item.id === cat.id ? updated : item)));
+            build();
+          } catch (err) {
+            showToast(`重新命名失敗：${String(err)}`, 'error');
+            build();
+          }
+        };
+
+        input.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') void submitRename();
+          if (e.key === 'Escape') build();
+        });
+        input.addEventListener('blur', () => void submitRename());
+      });
+
       const delBtn = document.createElement('button');
       delBtn.className = 'btn btn-danger btn-sm';
       delBtn.textContent = '刪除';
@@ -543,6 +661,7 @@ export async function renderManagePage(container: HTMLElement): Promise<void> {
 
       row.appendChild(icon);
       row.appendChild(info);
+      row.appendChild(editBtn);
       row.appendChild(delBtn);
       list.appendChild(row);
     }

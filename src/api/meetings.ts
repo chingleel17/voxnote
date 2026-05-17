@@ -11,4 +11,5 @@ export const archiveMeeting = (id: string) => invoke<MeetingWithDetails>('archiv
 export const unarchiveMeeting = (id: string) => invoke<MeetingWithDetails>('unarchive_meeting', { id });
 export const getCategories = () => invoke<Category[]>('get_categories');
 export const createCategory = (name: string) => invoke<Category>('create_category', { name });
+export const updateCategory = (id: string, name: string) => invoke<Category>('update_category', { id, name });
 export const deleteCategory = (id: string) => invoke<void>('delete_category', { id });

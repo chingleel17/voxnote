@@ -34,3 +34,6 @@ src/api/generated/
 .env
 .env.local
 .env.*.local
+
+# Local release notes
+.local/

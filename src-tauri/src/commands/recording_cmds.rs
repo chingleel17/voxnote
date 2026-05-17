@@ -57,10 +57,14 @@ pub async fn write_recording_file(
     pool: State<'_, SqlitePool>,
 ) -> Result<Recording, String> {
     let recordings_dir = resolve_recordings_dir(&app_handle).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&recordings_dir).map_err(|e| e.to_string())?;
-
     let file_path = recordings_dir.join(&file_name);
-    std::fs::write(&file_path, &file_data).map_err(|e| e.to_string())?;
+    let file_path = tauri::async_runtime::spawn_blocking(move || -> Result<PathBuf, String> {
+        std::fs::create_dir_all(&recordings_dir).map_err(|e| e.to_string())?;
+        std::fs::write(&file_path, &file_data).map_err(|e| e.to_string())?;
+        Ok(file_path)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
 
     let file_path_str = file_path.to_string_lossy().to_string();
 
@@ -77,7 +81,9 @@ pub async fn write_recording_file(
 
 #[tauri::command]
 pub async fn read_recording_file(file_path: String) -> Result<Vec<u8>, String> {
-    std::fs::read(file_path).map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || std::fs::read(file_path).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]

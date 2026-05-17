@@ -3,9 +3,17 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::{
     asr::{detect_local_asr, transcribe_assemblyai, transcribe_local_whisper, LocalAsrInfo},
+    commands::ai_cmds::proofread_recording_segment_with_config,
     config::load_config,
     db::{recording, transcript},
 };
+
+fn emit_asr_progress(app: &AppHandle, meeting_id: &str, message: &str) {
+    let _ = app.emit(
+        "asr_progress",
+        serde_json::json!({ "meetingId": meeting_id, "message": message }),
+    );
+}
 
 #[tauri::command]
 pub async fn detect_local_asr_tools() -> Result<Vec<LocalAsrInfo>, String> {
@@ -23,16 +31,6 @@ pub async fn start_transcription(
 ) -> Result<String, String> {
     let config = load_config(&app).map_err(|e| e.to_string())?;
 
-    let app_clone = app.clone();
-    let meeting_id_clone = meeting_id.clone();
-
-    let emit_progress = move |msg: String| {
-        let _ = app_clone.emit(
-            "asr_progress",
-            serde_json::json!({ "meetingId": meeting_id_clone, "message": msg }),
-        );
-    };
-
     let text = match config.asr_provider.as_str() {
         "assemblyai" => transcribe_assemblyai(
             &config.assembly_ai_key,
@@ -40,12 +38,12 @@ pub async fn start_transcription(
             &config.asr_language,
             &config.assembly_ai_speech_model,
             config.speaker_detection,
-            emit_progress,
+            |msg| emit_asr_progress(&app, &meeting_id, &msg),
         )
         .await
         .map_err(|e| e.to_string())?,
         "local" => {
-            emit_progress("啟動本地 Whisper...".into());
+            emit_asr_progress(&app, &meeting_id, "啟動本地 Whisper...");
             transcribe_local_whisper(
                 "whisper",
                 &config.local_asr_model,
@@ -72,6 +70,25 @@ pub async fn start_transcription(
     transcript::sync_generated_content_from_recordings(&pool, &meeting_id, true)
         .await
         .map_err(|e| e.to_string())?;
+
+    if config.auto_proofread_after_transcription {
+        emit_asr_progress(&app, &meeting_id, "逐字稿已產生，正在進行 AI 校稿...");
+        match proofread_recording_segment_with_config(&config, &pool, &meeting_id, &recording_id)
+            .await
+        {
+            Ok(result) => {
+                let message = match result.warning {
+                    Some(warning) => format!("AI 校稿已完成，但結果可能不完整：{}", warning),
+                    None => "AI 校稿已完成".to_string(),
+                };
+                emit_asr_progress(&app, &meeting_id, &message);
+            }
+            Err(err) => {
+                let message = format!("AI 校稿失敗，已保留原始逐字稿：{}", err);
+                emit_asr_progress(&app, &meeting_id, &message);
+            }
+        }
+    }
 
     Ok(merged)
 }

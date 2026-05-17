@@ -1,12 +1,13 @@
 import type { AppConfig } from '../types';
 import {
-  getSettings, saveSettings,
+  saveSettings,
   testLlmConnection, testOllamaConnection, getOllamaModels,
   detectLocalAsrTools,
   type LocalAsrInfo,
 } from '../api/settings';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { showToast } from '../components/toast';
+import { initConfigStore, setCurrentConfig } from '../utils/configStore';
 
 // ─────────────────────────────────────────────
 // 預設模型選項（來源：各供應商官方文件，2026-04-29）
@@ -66,7 +67,7 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
   let latestSaveRequest = 0;
   let latestSavedRequest = 0;
   try {
-    config = await getSettings();
+    config = await initConfigStore();
   } catch (err) {
     container.innerHTML = `<div class="error-state">載入設定失敗：${String(err)}</div>`;
     return;
@@ -154,7 +155,9 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
       local_asr_model: updated.local_asr_model,
       asr_language: updated.asr_language,
       speaker_detection: updated.speaker_detection,
+      auto_proofread_after_transcription: updated.auto_proofread_after_transcription,
     };
+    setCurrentConfig(config);
     scheduleAutoSave();
   });
   settingsGrid.appendChild(asrSection);
@@ -180,9 +183,20 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
       custom_api_key: updated.custom_api_key,
       custom_model: updated.custom_model,
     };
+    setCurrentConfig(config);
     scheduleAutoSave();
   });
   settingsGrid.appendChild(llmSection);
+
+  const notificationSection = buildNotificationSection(config, (updated) => {
+    config = {
+      ...config,
+      completion_notification_enabled: updated.completion_notification_enabled,
+    };
+    setCurrentConfig(config);
+    scheduleAutoSave();
+  });
+  settingsGrid.appendChild(notificationSection);
 
   // ── AI Prompt 自訂區塊 ──
   const promptSection = buildAiPromptSection(config, (updated) => {
@@ -191,6 +205,7 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
       proofread_prompt: updated.proofread_prompt,
       summary_prompt: updated.summary_prompt,
     };
+    setCurrentConfig(config);
     scheduleAutoSave();
   });
 
@@ -200,6 +215,7 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
       recording_storage_dir: updated.recording_storage_dir,
       archive_storage_dir: updated.archive_storage_dir,
     };
+    setCurrentConfig(config);
     scheduleAutoSave();
   });
 
@@ -376,6 +392,31 @@ function buildAsrSection(
   speakerGroup.appendChild(speakerHint);
   section.appendChild(speakerGroup);
 
+  const autoProofreadGroup = document.createElement('div');
+  autoProofreadGroup.className = 'form-group';
+  const autoProofreadLabel = document.createElement('label');
+  autoProofreadLabel.textContent = '逐段轉譯後自動 AI 校稿';
+  const autoProofreadToggle = document.createElement('label');
+  autoProofreadToggle.className = 'toggle-switch';
+  const autoProofreadInput = document.createElement('input');
+  autoProofreadInput.type = 'checkbox';
+  autoProofreadInput.checked = config.auto_proofread_after_transcription === true;
+  autoProofreadInput.addEventListener('change', () => {
+    config = { ...config, auto_proofread_after_transcription: autoProofreadInput.checked };
+    onChange(config);
+  });
+  const autoProofreadSlider = document.createElement('span');
+  autoProofreadSlider.className = 'toggle-slider';
+  autoProofreadToggle.appendChild(autoProofreadInput);
+  autoProofreadToggle.appendChild(autoProofreadSlider);
+  const autoProofreadHint = document.createElement('small');
+  autoProofreadHint.className = 'form-hint';
+  autoProofreadHint.textContent = '啟用後，每段錄音完成轉譯時會立即校稿該段，並同步更新整份校稿版逐字稿。';
+  autoProofreadGroup.appendChild(autoProofreadLabel);
+  autoProofreadGroup.appendChild(autoProofreadToggle);
+  autoProofreadGroup.appendChild(autoProofreadHint);
+  section.appendChild(autoProofreadGroup);
+
   // 可見性控制
   const updateAsrVisibility = (provider: string): void => {
     assemblySection.style.display = provider === 'assemblyai' ? '' : 'none';
@@ -404,7 +445,7 @@ function buildStorageSection(
   const hint = document.createElement('p');
   hint.className = 'form-hint';
   hint.style.marginBottom = '16px';
-  hint.textContent = '可指定新錄音的儲存資料夾與整個會議封存資料夾。留空時仍使用預設 AppData 路徑。';
+  hint.textContent = '可指定新錄音的儲存資料夾與整個會議封存資料夾。留空時會使用預設 AppData 路徑（recordings / archives）。';
   section.appendChild(hint);
 
   section.appendChild(buildDirectoryPickerGroup(
@@ -424,6 +465,49 @@ function buildStorageSection(
       onChange(config);
     }
   ));
+
+  return section;
+}
+
+function buildNotificationSection(
+  config: AppConfig,
+  onChange: (c: AppConfig) => void,
+): HTMLElement {
+  const section = document.createElement('section');
+  section.className = 'settings-section';
+
+  const heading = document.createElement('h3');
+  heading.className = 'settings-section-title';
+  heading.textContent = '完成通知';
+  section.appendChild(heading);
+
+  const notifyGroup = document.createElement('div');
+  notifyGroup.className = 'form-group';
+  const notifyLabel = document.createElement('label');
+  notifyLabel.textContent = 'Windows 原生完成通知';
+  const notifyToggle = document.createElement('label');
+  notifyToggle.className = 'toggle-switch';
+  const notifyInput = document.createElement('input');
+  notifyInput.type = 'checkbox';
+  notifyInput.checked = config.completion_notification_enabled !== false;
+  notifyInput.addEventListener('change', () => {
+    config = {
+      ...config,
+      completion_notification_enabled: notifyInput.checked,
+    };
+    onChange(config);
+  });
+  const notifySlider = document.createElement('span');
+  notifySlider.className = 'toggle-slider';
+  notifyToggle.appendChild(notifyInput);
+  notifyToggle.appendChild(notifySlider);
+  const notifyHint = document.createElement('small');
+  notifyHint.className = 'form-hint';
+  notifyHint.textContent = '當逐段轉譯、AI 校稿或摘要生成完成時，若 VoxNote 不在前景視窗，就顯示 Windows 通知。';
+  notifyGroup.appendChild(notifyLabel);
+  notifyGroup.appendChild(notifyToggle);
+  notifyGroup.appendChild(notifyHint);
+  section.appendChild(notifyGroup);
 
   return section;
 }

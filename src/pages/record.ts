@@ -269,12 +269,16 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
   meetingTrigger.addEventListener('click', () => {
     setMeetingDropdownOpen(!isMeetingDropdownOpen);
   });
-  document.addEventListener('click', (event) => {
+  const handleDocumentClick = (event: MouseEvent): void => {
     if (!(event.target instanceof Node)) return;
     if (!meetingSearchRow.contains(event.target)) {
       setMeetingDropdownOpen(false);
     }
-  });
+  };
+  document.addEventListener('click', handleDocumentClick);
+  window.addEventListener('hashchange', () => {
+    document.removeEventListener('click', handleDocumentClick);
+  }, { once: true });
   meetingGroup.appendChild(meetingLabel);
   meetingGroup.appendChild(meetingSearchRow);
   wrapper.appendChild(meetingGroup);

@@ -9,6 +9,10 @@ export async function createTag(name: string, color: string): Promise<Tag> {
   return invoke<Tag>('create_tag', { name, color });
 }
 
+export async function updateTag(id: string, name: string, color: string): Promise<Tag> {
+  return invoke<Tag>('update_tag', { id, name, color });
+}
+
 export async function deleteTag(id: string): Promise<void> {
   return invoke<void>('delete_tag', { id });
 }

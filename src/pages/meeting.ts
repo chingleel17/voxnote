@@ -14,6 +14,7 @@ import { createWaveformPlayer } from '../components/audioPlayer';
 import { buildParticipantEditor } from '../components/participantEditor';
 import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 import { isProcessing, startProcessing, finishProcessing, onProcessingComplete } from '../utils/processingState';
+import { notifyCompletion } from '../utils/notifications';
 
 type TranscriptVersion = 'original' | 'proofread' | 'manual';
 type ManualBaseVersion = 'original' | 'proofread';
@@ -471,6 +472,43 @@ function buildProcessingLabel(meetingTitle: string, actionLabel: string, segment
   }
   parts.push(actionLabel);
   return parts.join('-');
+}
+
+function getNotificationMeetingTitle(meetingTitle: string): string {
+  return meetingTitle.trim() || '未命名會議';
+}
+
+function notifyTranscriptionCompleted(meetingTitle: string, segmentIndex: number, hasMultipleSegments: boolean): void {
+  const title = 'VoxNote 轉譯完成';
+  const body = hasMultipleSegments
+    ? `${getNotificationMeetingTitle(meetingTitle)} 的段落 ${segmentIndex} 已完成轉譯`
+    : `${getNotificationMeetingTitle(meetingTitle)} 已完成轉譯`;
+  void notifyCompletion({ title, body });
+}
+
+function notifyFullProofreadCompleted(meetingTitle: string, warning: string | null): void {
+  void notifyCompletion({
+    title: 'VoxNote AI 校稿完成',
+    body: warning
+      ? `${getNotificationMeetingTitle(meetingTitle)} 的 AI 校稿已完成，但結果可能不完整`
+      : `${getNotificationMeetingTitle(meetingTitle)} 的 AI 校稿已完成`,
+  });
+}
+
+function notifySegmentProofreadCompleted(meetingTitle: string, segmentIndex: number, warning: string | null): void {
+  void notifyCompletion({
+    title: 'VoxNote 段落校稿完成',
+    body: warning
+      ? `${getNotificationMeetingTitle(meetingTitle)} 的段落 ${segmentIndex} 已完成校稿，但結果可能不完整`
+      : `${getNotificationMeetingTitle(meetingTitle)} 的段落 ${segmentIndex} 已完成校稿`,
+  });
+}
+
+function notifySummaryCompleted(meetingTitle: string): void {
+  void notifyCompletion({
+    title: 'VoxNote 摘要完成',
+    body: `${getNotificationMeetingTitle(meetingTitle)} 的會議摘要已生成`,
+  });
 }
 
 function normalizeWarningMessage(warning: string): string {
@@ -1348,6 +1386,7 @@ function buildTranscriptSection(
           : 'AI 校稿完成，已切換至校稿版',
         result.warning ? 'warning' : 'success',
       );
+      notifyFullProofreadCompleted(meetingTitle, result.warning ?? null);
       finishProcessing(proofreadKey);
     } catch (err) {
       showToast(`AI 校稿失敗：${String(err)}`, 'error');
@@ -1454,6 +1493,7 @@ function buildSummarySection(
       if (!copyBtn.isConnected) actions.appendChild(copyBtn);
       if (!exportBtn.isConnected) actions.appendChild(exportBtn);
       showToast('會議摘要已生成', 'success');
+      notifySummaryCompleted(meetingTitle);
       finishProcessing(summaryKey);
     } catch (err) {
       showToast(`摘要生成失敗：${String(err)}`, 'error');
@@ -1678,6 +1718,7 @@ function buildRecordingSection(
             : '逐字稿已生成',
           'success'
         );
+        notifyTranscriptionCompleted(meetingTitle, segIndex, validRecordings.length > 1);
         finishProcessing(key);
         onTranscribed(rec.id);
       } catch (err) {
@@ -1713,6 +1754,7 @@ function buildRecordingSection(
               : `段落 ${segIndex} 校稿完成，已更新校稿版逐字稿`,
             result.warning ? 'warning' : 'success',
           );
+          notifySegmentProofreadCompleted(meetingTitle, segIndex, result.warning);
         } catch (err) {
           showToast(`段落校稿失敗：${String(err)}`, 'error');
         }
@@ -1876,6 +1918,7 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
         meeting = meeting.archived_at
           ? await unarchiveMeeting(meeting.id)
           : await archiveMeeting(meeting.id);
+        recordings = await getRecordings(meetingId);
         showToast(meeting.archived_at ? '會議已封存' : '已取消封存', 'success');
         build();
       } catch (err) {

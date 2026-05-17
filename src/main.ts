@@ -5,6 +5,7 @@ import { renderMeetingPage } from './pages/meeting';
 import { renderRecordPage } from './pages/record';
 import { renderSettingsPage } from './pages/settings';
 import { initStatusBar } from './components/statusBar';
+import { initConfigStore } from './utils/configStore';
 import { initTheme } from './utils/theme';
 
 interface ParsedRoute {
@@ -46,6 +47,7 @@ async function renderPage(container: HTMLElement, route: ParsedRoute): Promise<v
 
 window.addEventListener('DOMContentLoaded', () => {
   initTheme();
+  void initConfigStore();
 
   const sidebar = document.getElementById('sidebar');
   const content = document.getElementById('content');

@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+
 use crate::db::models::Tag;
 use chrono::Utc;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 pub async fn get_tags(pool: &SqlitePool) -> Result<Vec<Tag>, sqlx::Error> {
@@ -27,6 +29,25 @@ pub async fn create_tag(pool: &SqlitePool, name: &str, color: &str) -> Result<Ta
         color: color.to_string(),
         created_at: now,
     })
+}
+
+pub async fn update_tag(
+    pool: &SqlitePool,
+    id: &str,
+    name: &str,
+    color: &str,
+) -> Result<Tag, sqlx::Error> {
+    sqlx::query("UPDATE tags SET name = ?, color = ? WHERE id = ?")
+        .bind(name)
+        .bind(color)
+        .bind(id)
+        .execute(pool)
+        .await?;
+
+    sqlx::query_as::<_, Tag>("SELECT id, name, color, created_at FROM tags WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await
 }
 
 pub async fn delete_tag(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
@@ -56,19 +77,41 @@ pub async fn set_meeting_tags(
     Ok(())
 }
 
-pub async fn get_meeting_tags(
+pub async fn get_tags_for_meeting_ids(
     pool: &SqlitePool,
-    meeting_id: &str,
-) -> Result<Vec<Tag>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, Tag>(
-        "SELECT t.id, t.name, t.color, t.created_at
-         FROM tags t
-         INNER JOIN meeting_tags mt ON mt.tag_id = t.id
-         WHERE mt.meeting_id = ?
-         ORDER BY t.name ASC",
-    )
-    .bind(meeting_id)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
+    meeting_ids: &[String],
+) -> Result<HashMap<String, Vec<Tag>>, sqlx::Error> {
+    if meeting_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let placeholders = vec!["?"; meeting_ids.len()].join(", ");
+    let sql = format!(
+        "SELECT mt.meeting_id, t.id, t.name, t.color, t.created_at
+         FROM meeting_tags mt
+         INNER JOIN tags t ON t.id = mt.tag_id
+         WHERE mt.meeting_id IN ({placeholders})
+         ORDER BY t.name ASC"
+    );
+
+    let mut query = sqlx::query(&sql);
+    for meeting_id in meeting_ids {
+        query = query.bind(meeting_id);
+    }
+
+    let rows = query.fetch_all(pool).await?;
+    let mut tags_by_meeting: HashMap<String, Vec<Tag>> = HashMap::new();
+
+    for row in rows {
+        let meeting_id: String = row.get("meeting_id");
+        let tag = Tag {
+            id: row.get("id"),
+            name: row.get("name"),
+            color: row.get("color"),
+            created_at: row.get("created_at"),
+        };
+        tags_by_meeting.entry(meeting_id).or_default().push(tag);
+    }
+
+    Ok(tags_by_meeting)
 }

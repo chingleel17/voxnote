@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use sqlx::SqlitePool;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::db::{
     category, meeting,
@@ -71,10 +71,8 @@ pub async fn archive_meeting(
     pool: State<'_, SqlitePool>,
 ) -> Result<MeetingWithDetails, String> {
     let config = load_config(&app).map_err(|e| e.to_string())?;
-    let archive_root = config.archive_storage_dir.trim();
-    if archive_root.is_empty() {
-        return Err("請先在設定中指定封存資料夾".into());
-    }
+    let archive_root = resolve_archive_root(&app, config.archive_storage_dir.trim())
+        .map_err(|e| e.to_string())?;
 
     let meeting_detail = meeting::get_meeting(&pool, &id)
         .await
@@ -85,7 +83,7 @@ pub async fn archive_meeting(
     }
 
     let archive_dir =
-        build_archive_directory(Path::new(archive_root), &meeting_detail).map_err(|e| e.to_string())?;
+        build_archive_directory(&archive_root, &meeting_detail).map_err(|e| e.to_string())?;
     let recordings_dir = archive_dir.join("recordings");
     std::fs::create_dir_all(&recordings_dir).map_err(|e| e.to_string())?;
 
@@ -214,6 +212,17 @@ pub async fn create_category(
 }
 
 #[tauri::command]
+pub async fn update_category(
+    id: String,
+    name: String,
+    pool: State<'_, SqlitePool>,
+) -> Result<Category, String> {
+    category::update_category(&pool, &id, &name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn delete_category(id: String, pool: State<'_, SqlitePool>) -> Result<(), String> {
     category::delete_category(&pool, &id)
         .await
@@ -231,6 +240,18 @@ fn build_archive_directory(root: &Path, meeting: &MeetingWithDetails) -> Result<
         .unwrap_or_else(|| "undated".to_string());
     let suffix = meeting.id.chars().take(8).collect::<String>();
     Ok(root.join(format!("{date}_{title}_{suffix}")))
+}
+
+fn resolve_archive_root(app: &AppHandle, configured_path: &str) -> Result<PathBuf, anyhow::Error> {
+    if !configured_path.is_empty() {
+        return Ok(PathBuf::from(configured_path));
+    }
+
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| anyhow::anyhow!("無法取得 AppData 目錄：{}", e))?;
+    Ok(app_data_dir.join("archives"))
 }
 
 fn sanitize_path_segment(value: &str) -> String {

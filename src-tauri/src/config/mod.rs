@@ -14,6 +14,7 @@ pub struct AppConfig {
     pub local_asr_model: String, // "tiny" | "base" | "small" | "medium" | "large"
     pub asr_language: String,    // "zh" | "en" | "auto"
     pub speaker_detection: bool, // 是否啟用說話人偵測
+    pub auto_proofread_after_transcription: bool, // 逐段轉譯完成後自動 AI 校稿
 
     // LLM 供應商："openai" | "claude" | "gemini" | "openrouter" | "ollama" | "custom"
     pub llm_provider: String,
@@ -35,6 +36,9 @@ pub struct AppConfig {
     // AI Prompt 自訂（空字串代表使用內建預設 Prompt）
     pub proofread_prompt: String,
     pub summary_prompt: String,
+
+    // Windows 完成通知
+    pub completion_notification_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -48,6 +52,7 @@ impl Default for AppConfig {
             local_asr_model: "base".into(),
             asr_language: "zh".into(),
             speaker_detection: true,
+            auto_proofread_after_transcription: false,
             llm_provider: "openai".into(),
             openai_key: String::new(),
             openai_model: "gpt-4.1-mini".into(),
@@ -65,6 +70,7 @@ impl Default for AppConfig {
             custom_model: String::new(),
             proofread_prompt: String::new(),
             summary_prompt: String::new(),
+            completion_notification_enabled: true,
         }
     }
 }

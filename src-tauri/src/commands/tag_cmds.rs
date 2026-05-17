@@ -20,6 +20,18 @@ pub async fn create_tag(
 }
 
 #[tauri::command]
+pub async fn update_tag(
+    id: String,
+    name: String,
+    color: String,
+    pool: State<'_, SqlitePool>,
+) -> Result<Tag, String> {
+    tag::update_tag(&pool, &id, &name, &color)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn delete_tag(id: String, pool: State<'_, SqlitePool>) -> Result<(), String> {
     tag::delete_tag(&pool, &id).await.map_err(|e| e.to_string())
 }
