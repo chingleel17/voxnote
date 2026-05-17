@@ -8,6 +8,7 @@ import {
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { showToast } from '../components/toast';
 import { initConfigStore, setCurrentConfig } from '../utils/configStore';
+import { sendTestNotification } from '../utils/notifications';
 
 // ─────────────────────────────────────────────
 // 預設模型選項（來源：各供應商官方文件，2026-04-29）
@@ -45,9 +46,9 @@ const ASSEMBLYAI_SPEECH_MODELS: Array<{
   value: AppConfig['assembly_ai_speech_model'];
   label: string;
 }> = [
-  { value: 'universal-2', label: 'Universal-2' },
-  { value: 'universal-3-pro', label: 'Universal-3 Pro' },
-];
+    { value: 'universal-2', label: 'Universal-2' },
+    { value: 'universal-3-pro', label: 'Universal-3 Pro' },
+  ];
 const LOCAL_ASR_MODELS = ['tiny', 'base', 'small', 'medium', 'large'];
 const OLLAMA_THINK_LEVELS: Array<{ value: AppConfig['ollama_think_level']; label: string }> = [
   { value: 'off', label: '關閉思考' },
@@ -508,6 +509,45 @@ function buildNotificationSection(
   notifyGroup.appendChild(notifyToggle);
   notifyGroup.appendChild(notifyHint);
   section.appendChild(notifyGroup);
+
+  const testRow = document.createElement('div');
+  testRow.className = 'section-actions';
+
+  const testBtn = document.createElement('button');
+  testBtn.type = 'button';
+  testBtn.className = 'btn btn-secondary btn-sm';
+  testBtn.textContent = '發送測試通知';
+  testBtn.addEventListener('click', async () => {
+    testBtn.disabled = true;
+    try {
+      const result = await sendTestNotification();
+      if (!result.enabled) {
+        showToast('測試通知未發送：完成通知目前已停用。', 'warning');
+      } else if (!result.permissionGranted) {
+        showToast('測試通知未發送：Windows 通知權限未允許。', 'warning', 5000);
+      } else {
+        showToast(
+          result.focused
+            ? '測試通知已送出。此按鈕會忽略前景限制，用來確認通知鏈路是否正常。'
+            : '測試通知已送出。',
+          'success',
+          5000,
+        );
+      }
+    } catch (err) {
+      showToast(`測試通知失敗：${String(err)}`, 'error', 5000);
+    } finally {
+      testBtn.disabled = false;
+    }
+  });
+
+  const testHint = document.createElement('small');
+  testHint.className = 'form-hint';
+  testHint.textContent = '此按鈕會直接送出一則測試通知，並忽略「前景視窗不通知」限制，方便排查是焦點判斷還是通知鏈路有問題。';
+
+  testRow.appendChild(testBtn);
+  section.appendChild(testRow);
+  section.appendChild(testHint);
 
   return section;
 }

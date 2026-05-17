@@ -1,4 +1,3 @@
-import { getCurrentWindow } from '@tauri-apps/api/window';
 import {
   isPermissionGranted,
   requestPermission,
@@ -12,8 +11,60 @@ interface CompletionNotification {
   body: string;
 }
 
+interface NotificationDispatchOptions {
+  ignoreFocus?: boolean;
+}
+
+export interface NotificationDebugInfo {
+  enabled: boolean;
+  focused: boolean;
+  permissionGranted: boolean;
+  skippedBecauseFocused: boolean;
+}
+
 let permissionGranted: boolean | null = null;
 let permissionRequest: Promise<boolean> | null = null;
+let focusTrackingInitialized = false;
+let windowFocused = true;
+let documentVisible = true;
+
+function updateForegroundState(): void {
+  windowFocused = window.document.hasFocus();
+  documentVisible = window.document.visibilityState !== 'hidden';
+}
+
+export function initNotificationFocusTracking(): void {
+  if (focusTrackingInitialized) {
+    return;
+  }
+
+  focusTrackingInitialized = true;
+  updateForegroundState();
+
+  window.addEventListener('focus', () => {
+    windowFocused = true;
+    documentVisible = window.document.visibilityState !== 'hidden';
+  });
+
+  window.addEventListener('blur', () => {
+    windowFocused = false;
+  });
+
+  window.document.addEventListener('visibilitychange', () => {
+    documentVisible = window.document.visibilityState !== 'hidden';
+    if (documentVisible) {
+      windowFocused = window.document.hasFocus();
+    }
+  });
+}
+
+function isAppForeground(): boolean {
+  if (!focusTrackingInitialized) {
+    updateForegroundState();
+  }
+
+  return windowFocused && documentVisible;
+}
 
 async function ensureNotificationPermission(): Promise<boolean> {
   if (permissionGranted !== null) {
@@ -35,28 +86,60 @@ async function ensureNotificationPermission(): Promise<boolean> {
   return permissionRequest;
 }
 
-async function shouldNotify(): Promise<boolean> {
+async function getNotificationDebugInfo(options?: NotificationDispatchOptions): Promise<NotificationDebugInfo> {
   const config = getCurrentConfig() ?? await initConfigStore();
-  if (!config.completion_notification_enabled) {
-    return false;
+  const focused = isAppForeground();
+  const permissionGranted = await ensureNotificationPermission();
+
+  return {
+    enabled: config.completion_notification_enabled,
+    focused,
+    permissionGranted,
+    skippedBecauseFocused: !options?.ignoreFocus && focused,
+  };
+}
+
+async function dispatchNotification(
+  notification: CompletionNotification,
+  options?: NotificationDispatchOptions,
+): Promise<NotificationDebugInfo> {
+  const debug = await getNotificationDebugInfo(options);
+
+  if (!debug.enabled) {
+    return debug;
   }
 
-  const isFocused = await getCurrentWindow().isFocused();
-  return !isFocused;
+  if (debug.skippedBecauseFocused) {
+    return debug;
+  }
+
+  if (!debug.permissionGranted) {
+    return debug;
+  }
+
+  await sendNotification(notification);
+  return debug;
 }
 
 export async function notifyCompletion(notification: CompletionNotification): Promise<void> {
-  if (!await shouldNotify()) {
-    return;
-  }
-
-  if (!await ensureNotificationPermission()) {
-    return;
-  }
-
   try {
-    await sendNotification(notification);
+    await dispatchNotification(notification);
   } catch (err) {
     showToast(`Windows 通知失敗：${String(err)}`, 'warning', 5000);
+  }
+}
+
+export async function sendTestNotification(): Promise<NotificationDebugInfo> {
+  try {
+    return await dispatchNotification(
+      {
+        title: 'VoxNote 測試通知',
+        body: '這是一則測試通知，用來確認 Windows 通知是否正常。',
+      },
+      { ignoreFocus: true },
+    );
+  } catch (err) {
+    showToast(`Windows 通知失敗：${String(err)}`, 'warning', 5000);
+    throw err;
   }
 }
