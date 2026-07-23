@@ -19,7 +19,7 @@ import { notifyCompletion } from '../utils/notifications';
 type TranscriptVersion = 'original' | 'proofread' | 'manual';
 type ManualBaseVersion = 'original' | 'proofread';
 
-const transcriptUtteranceRe = /^\[(\d{2}:\d{2})(?:\s+([^\]]+))?\]\s+(.*)$/;
+const transcriptUtteranceRe = /^\[(\d+:\d{2})(?:\s+([^\]]+))?\]\s+(.*)$/;
 const MERGED_BREAK_SEPARATOR = '\n\n--- ☕ 中場休息 ---\n\n';
 const recordingObjectUrls = new Map<string, string>();
 
@@ -435,6 +435,22 @@ function getTranscriptDisplayText(
       transcript.manual_content,
       buildGlobalSpeakerLabelMapper(recordings, speakerMappings),
     );
+  }
+
+  return getTranscriptVersionText(transcript, version);
+}
+
+function getTranscriptRenderText(
+  transcript: Transcript,
+  recordings: Recording[],
+  version: TranscriptVersion,
+): string {
+  if (version === 'manual') {
+    if (!transcript.manual_content) return '';
+    if (shouldFollowManualBase(transcript, recordings)) {
+      return getTranscriptVersionText(transcript, transcript.manual_base_version);
+    }
+    return transcript.manual_content;
   }
 
   return getTranscriptVersionText(transcript, version);
@@ -971,7 +987,7 @@ function buildTranscriptSection(
     } else {
       renderTranscriptTextInto(
         content,
-        getTranscriptDisplayText(loadedTranscript, recordings, version, localMappings),
+        getTranscriptRenderText(loadedTranscript, recordings, version),
         mapTranscriptSpeakerLabel(),
         getFallbackTimeClickHandler(),
       );
@@ -1158,7 +1174,7 @@ function buildTranscriptSection(
       } else {
         renderTranscriptTextInto(
           viewer,
-          getTranscriptDisplayText(loadedTranscript, recordings, overlayVersion, localMappings),
+          getTranscriptRenderText(loadedTranscript, recordings, overlayVersion),
           mapTranscriptSpeakerLabel(),
           getFallbackTimeClickHandler(),
         );

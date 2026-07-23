@@ -1,7 +1,7 @@
 use sqlx::SqlitePool;
 use tauri::State;
 
-use crate::db::{models::SpeakerMapping, speaker_mapping};
+use crate::{backup::DataOperationLock, db::{models::SpeakerMapping, speaker_mapping}};
 
 #[tauri::command]
 pub async fn get_speaker_mappings(
@@ -20,7 +20,9 @@ pub async fn upsert_speaker_mapping(
     speaker_label: String,
     participant_name: String,
     pool: State<'_, SqlitePool>,
+    data_lock: State<'_, DataOperationLock>,
 ) -> Result<SpeakerMapping, String> {
+    let _guard = data_lock.try_begin_write()?;
     speaker_mapping::upsert_speaker_mapping(
         &pool,
         &meeting_id,
@@ -38,7 +40,9 @@ pub async fn delete_speaker_mapping(
     recording_id: String,
     speaker_label: String,
     pool: State<'_, SqlitePool>,
+    data_lock: State<'_, DataOperationLock>,
 ) -> Result<(), String> {
+    let _guard = data_lock.try_begin_write()?;
     speaker_mapping::delete_speaker_mapping(&pool, &meeting_id, &recording_id, &speaker_label)
         .await
         .map_err(|e| e.to_string())

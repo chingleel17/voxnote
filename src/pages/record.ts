@@ -1,98 +1,69 @@
-import type { Category, MeetingWithDetails, SavedParticipant, Tag } from '../types';
+import { convertFileSrc } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import type {
+  Category,
+  MeetingWithDetails,
+  RecordingDeviceList,
+  RecordingSourceMode,
+  SavedParticipant,
+  Tag,
+} from '../types';
 import { createMeeting, getCategories, getMeetings } from '../api/meetings';
-import { writeRecordingFile } from '../api/recordings';
+import {
+  cancelDesktopRecording,
+  commitTemporaryRecording,
+  discardTempRecordingFile,
+  listRecordingDevices,
+  startDesktopRecording,
+  stopDesktopRecording,
+  writeRecordingFile,
+} from '../api/recordings';
+import { saveSettings } from '../api/settings';
 import { getSavedParticipants, upsertSavedParticipant } from '../api/participants';
 import { getTags } from '../api/tags';
 import { openModal } from '../components/modal';
 import { showToast } from '../components/toast';
 import { createWaveformPlayer } from '../components/audioPlayer';
 import { buildParticipantEditor } from '../components/participantEditor';
+import { initConfigStore, setCurrentConfig } from '../utils/configStore';
 
 interface RecordingState {
-  mediaRecorder: MediaRecorder | null;
-  audioChunks: Blob[];
-  stream: MediaStream | null;
+  isRecording: boolean;
   startTime: number;
   timerInterval: number | null;
-  audioBlob: Blob | null;
-  audioBlobUrl: string | null;
   uploadedFile: File | null;
-  analyser: AnalyserNode | null;
+  previewObjectUrl: string | null;
+  previewTempFilePath: string | null;
+  previewDurationSeconds: number | null;
+  previewSourceMode: RecordingSourceMode | null;
+  previewNeedsCleanup: boolean;
   animationId: number | null;
+  liveLevel: number;
+  unlistenLevel: UnlistenFn | null;
 }
 
 const state: RecordingState = {
-  mediaRecorder: null,
-  audioChunks: [],
-  stream: null,
+  isRecording: false,
   startTime: 0,
   timerInterval: null,
-  audioBlob: null,
-  audioBlobUrl: null,
   uploadedFile: null,
-  analyser: null,
+  previewObjectUrl: null,
+  previewTempFilePath: null,
+  previewDurationSeconds: null,
+  previewSourceMode: null,
+  previewNeedsCleanup: false,
   animationId: null,
+  liveLevel: 0,
+  unlistenLevel: null,
 };
 
-function stopAll(): void {
-  if (state.timerInterval !== null) {
-    clearInterval(state.timerInterval);
-    state.timerInterval = null;
-  }
-  if (state.animationId !== null) {
-    cancelAnimationFrame(state.animationId);
-    state.animationId = null;
-  }
-  if (state.stream) {
-    state.stream.getTracks().forEach((t) => t.stop());
-    state.stream = null;
-  }
-  if (state.audioBlobUrl) {
-    URL.revokeObjectURL(state.audioBlobUrl);
-    state.audioBlobUrl = null;
-  }
-  state.audioBlob = null;
-  state.uploadedFile = null;
+function resetCanvas(canvas: HTMLCanvasElement): void {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.fillStyle = '#0f1117';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
 }
 
-function drawWaveform(canvas: HTMLCanvasElement, analyser: AnalyserNode): void {
-  const ctxOrNull = canvas.getContext('2d');
-  if (!ctxOrNull) return;
-  const ctx: CanvasRenderingContext2D = ctxOrNull;
-
-  const bufferLength = analyser.frequencyBinCount;
-  const dataArray = new Uint8Array(bufferLength);
-
-  function draw(): void {
-    state.animationId = requestAnimationFrame(draw);
-    analyser.getByteTimeDomainData(dataArray);
-
-    ctx.fillStyle = '#0f1117';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = '#6366f1';
-    ctx.beginPath();
-
-    const sliceWidth = canvas.width / bufferLength;
-    let x = 0;
-    for (let i = 0; i < bufferLength; i++) {
-      const v = (dataArray[i] ?? 128) / 128.0;
-      const y = (v * canvas.height) / 2;
-      if (i === 0) {
-        ctx.moveTo(x, y);
-      } else {
-        ctx.lineTo(x, y);
-      }
-      x += sliceWidth;
-    }
-    ctx.lineTo(canvas.width, canvas.height / 2);
-    ctx.stroke();
-  }
-
-  draw();
-}
-
-/** 從 AudioBuffer 降採樣後繪製靜態波形 */
 function drawStaticWaveform(canvas: HTMLCanvasElement, audioBuffer: AudioBuffer): void {
   const ctxOrNull = canvas.getContext('2d');
   if (!ctxOrNull) return;
@@ -101,8 +72,7 @@ function drawStaticWaveform(canvas: HTMLCanvasElement, audioBuffer: AudioBuffer)
   const channelData = audioBuffer.getChannelData(0);
   const step = Math.ceil(channelData.length / canvas.width);
 
-  ctx.fillStyle = '#0f1117';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  resetCanvas(canvas);
   ctx.lineWidth = 1.5;
   ctx.strokeStyle = '#6366f1';
   ctx.beginPath();
@@ -120,11 +90,37 @@ function drawStaticWaveform(canvas: HTMLCanvasElement, audioBuffer: AudioBuffer)
       ctx.lineTo(i, y);
     }
   }
+
+  ctx.stroke();
+}
+
+function drawLiveLevel(canvas: HTMLCanvasElement, level: number, phase: number): void {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+
+  resetCanvas(canvas);
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = '#6366f1';
+  ctx.beginPath();
+
+  const amplitude = Math.max(0.08, Math.min(level, 1)) * (canvas.height * 0.38);
+  const centerY = canvas.height / 2;
+  const step = Math.max(4, Math.floor(canvas.width / 90));
+
+  for (let x = 0; x <= canvas.width; x += step) {
+    const wave = Math.sin((x / canvas.width) * Math.PI * 8 + phase) * amplitude;
+    const y = centerY + wave;
+    if (x === 0) {
+      ctx.moveTo(x, y);
+    } else {
+      ctx.lineTo(x, y);
+    }
+  }
   ctx.stroke();
 }
 
 function formatTime(secs: number): string {
-  if (!isFinite(secs) || isNaN(secs)) return '0:00';
+  if (!isFinite(secs) || Number.isNaN(secs)) return '0:00';
   const m = Math.floor(secs / 60);
   const s = Math.floor(secs % 60);
   return `${m}:${String(s).padStart(2, '0')}`;
@@ -138,26 +134,103 @@ function formatMeetingDate(meeting: MeetingWithDetails): string {
   });
 }
 
+async function releasePreviewResources(): Promise<void> {
+  if (state.previewNeedsCleanup && state.previewTempFilePath) {
+    try {
+      await discardTempRecordingFile(state.previewTempFilePath);
+    } catch {
+      // 失敗時由啟動時清理暫存檔補救
+    }
+  }
+
+  if (state.previewObjectUrl) {
+    URL.revokeObjectURL(state.previewObjectUrl);
+  }
+
+  state.previewObjectUrl = null;
+  state.previewTempFilePath = null;
+  state.previewDurationSeconds = null;
+  state.previewSourceMode = null;
+  state.previewNeedsCleanup = false;
+  state.uploadedFile = null;
+}
+
+async function stopAllRecordingState(): Promise<void> {
+  if (state.timerInterval !== null) {
+    clearInterval(state.timerInterval);
+    state.timerInterval = null;
+  }
+  if (state.animationId !== null) {
+    cancelAnimationFrame(state.animationId);
+    state.animationId = null;
+  }
+  if (state.unlistenLevel) {
+    state.unlistenLevel();
+    state.unlistenLevel = null;
+  }
+  if (state.isRecording) {
+    try {
+      await cancelDesktopRecording();
+    } catch {
+      // 離開頁面時不中斷使用者流程
+    }
+  }
+  state.isRecording = false;
+  state.startTime = 0;
+  state.liveLevel = 0;
+  await releasePreviewResources();
+}
+
 export async function renderRecordPage(container: HTMLElement, preselectedMeetingId?: string): Promise<void> {
-  stopAll();
+  await stopAllRecordingState();
   container.innerHTML = '';
 
   let meetings: MeetingWithDetails[] = [];
   let categories: Category[] = [];
   let savedParticipants: SavedParticipant[] = [];
   let allTags: Tag[] = [];
+  let recordingDevices: RecordingDeviceList = {
+    microphones: [],
+    system_outputs: [],
+    system_audio_supported: false,
+  };
+  let appConfig = await initConfigStore();
+
   try {
-    [meetings, categories, savedParticipants, allTags] = await Promise.all([
+    [meetings, categories, savedParticipants, allTags, recordingDevices] = await Promise.all([
       getMeetings(),
       getCategories(),
       getSavedParticipants(),
       getTags(),
+      listRecordingDevices(),
     ]);
   } catch {
-    // 允許在沒有會議時繼續使用錄音頁
+    try {
+      recordingDevices = await listRecordingDevices();
+    } catch {
+      recordingDevices = {
+        microphones: [],
+        system_outputs: [],
+        system_audio_supported: false,
+      };
+    }
   }
 
-  // 頁面標題
+  const persistRecordingPreferences = async (
+    mode: RecordingSourceMode,
+    microphoneDeviceId: string,
+    systemDeviceId: string,
+  ): Promise<void> => {
+    appConfig = {
+      ...appConfig,
+      recording_source_mode: mode,
+      recording_microphone_device_id: microphoneDeviceId,
+      recording_system_device_id: systemDeviceId,
+    };
+    setCurrentConfig(appConfig);
+    await saveSettings(appConfig);
+  };
+
   const toolbar = document.createElement('div');
   toolbar.className = 'page-toolbar';
   const pageTitle = document.createElement('h2');
@@ -170,7 +243,6 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
   wrapper.className = 'record-wrapper';
   container.appendChild(wrapper);
 
-  // 會議選擇
   const meetingGroup = document.createElement('div');
   meetingGroup.className = 'form-group';
   const meetingLabel = document.createElement('label');
@@ -276,14 +348,18 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
     }
   };
   document.addEventListener('click', handleDocumentClick);
-  window.addEventListener('hashchange', () => {
-    document.removeEventListener('click', handleDocumentClick);
-  }, { once: true });
+  window.addEventListener(
+    'hashchange',
+    () => {
+      document.removeEventListener('click', handleDocumentClick);
+      void stopAllRecordingState();
+    },
+    { once: true },
+  );
   meetingGroup.appendChild(meetingLabel);
   meetingGroup.appendChild(meetingSearchRow);
   wrapper.appendChild(meetingGroup);
 
-  // 自動選取預設會議
   if (preselectedMeetingId) {
     const selectedMeeting = meetings.find((meeting) => meeting.id === preselectedMeetingId);
     if (selectedMeeting) {
@@ -407,52 +483,100 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
     });
   });
 
-  // 麥克風選擇
+  const modeGroup = document.createElement('div');
+  modeGroup.className = 'form-group';
+  const modeLabel = document.createElement('label');
+  modeLabel.textContent = '錄音來源';
+  const modeSelect = document.createElement('select');
+  modeSelect.className = 'form-control';
+  const modeOptions: Array<{ value: RecordingSourceMode; label: string }> = [
+    { value: 'microphone', label: '僅麥克風' },
+    { value: 'system', label: '僅電腦音訊' },
+    { value: 'mix', label: '麥克風 + 電腦音訊混音' },
+  ];
+  for (const option of modeOptions) {
+    const el = document.createElement('option');
+    el.value = option.value;
+    el.textContent = option.label;
+    modeSelect.appendChild(el);
+  }
+  modeSelect.value = appConfig.recording_source_mode ?? 'microphone';
+  modeGroup.appendChild(modeLabel);
+  modeGroup.appendChild(modeSelect);
+  wrapper.appendChild(modeGroup);
+
   const micGroup = document.createElement('div');
   micGroup.className = 'form-group';
   const micLabel = document.createElement('label');
   micLabel.textContent = '麥克風';
   const micSelect = document.createElement('select');
   micSelect.className = 'form-control';
-
-  try {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    const audioInputs = devices.filter((d) => d.kind === 'audioinput');
-    for (const device of audioInputs) {
-      const opt = document.createElement('option');
-      opt.value = device.deviceId;
-      opt.textContent = device.label || `麥克風 ${device.deviceId.slice(0, 8)}`;
-      micSelect.appendChild(opt);
+  if (recordingDevices.microphones.length === 0) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = '找不到可用麥克風';
+    micSelect.appendChild(option);
+  } else {
+    for (const device of recordingDevices.microphones) {
+      const option = document.createElement('option');
+      option.value = device.id;
+      option.textContent = device.is_default ? `${device.name}（預設）` : device.name;
+      micSelect.appendChild(option);
     }
-  } catch {
-    const opt = document.createElement('option');
-    opt.value = '';
-    opt.textContent = '預設麥克風';
-    micSelect.appendChild(opt);
   }
+  micSelect.value =
+    appConfig.recording_microphone_device_id ||
+    recordingDevices.microphones.find((device) => device.is_default)?.id ||
+    recordingDevices.microphones[0]?.id ||
+    '';
   micGroup.appendChild(micLabel);
   micGroup.appendChild(micSelect);
   wrapper.appendChild(micGroup);
 
-  // 波形視覺化
+  const systemGroup = document.createElement('div');
+  systemGroup.className = 'form-group';
+  const systemLabel = document.createElement('label');
+  systemLabel.textContent = '電腦音訊來源';
+  const systemSelect = document.createElement('select');
+  systemSelect.className = 'form-control';
+  if (recordingDevices.system_outputs.length === 0) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = recordingDevices.system_audio_supported ? '目前找不到輸出裝置' : '此平台尚未支援';
+    systemSelect.appendChild(option);
+  } else {
+    for (const device of recordingDevices.system_outputs) {
+      const option = document.createElement('option');
+      option.value = device.id;
+      option.textContent = device.is_default ? `${device.name}（預設）` : device.name;
+      systemSelect.appendChild(option);
+    }
+  }
+  systemSelect.value =
+    appConfig.recording_system_device_id ||
+    recordingDevices.system_outputs.find((device) => device.is_default)?.id ||
+    recordingDevices.system_outputs[0]?.id ||
+    '';
+  systemGroup.appendChild(systemLabel);
+  systemGroup.appendChild(systemSelect);
+  wrapper.appendChild(systemGroup);
+
+  const supportHint = document.createElement('small');
+  supportHint.className = 'form-hint';
+  wrapper.appendChild(supportHint);
+
   const canvas = document.createElement('canvas');
   canvas.className = 'waveform-canvas';
   canvas.width = 600;
   canvas.height = 100;
-  const ctx = canvas.getContext('2d');
-  if (ctx) {
-    ctx.fillStyle = '#0f1117';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-  }
+  resetCanvas(canvas);
   wrapper.appendChild(canvas);
 
-  // 計時器
   const timer = document.createElement('div');
   timer.className = 'record-timer';
   timer.textContent = '00:00';
   wrapper.appendChild(timer);
 
-  // 錄音控制按鈕
   const controlRow = document.createElement('div');
   controlRow.className = 'record-controls';
 
@@ -479,7 +603,6 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
   controlRow.appendChild(fileInput);
   wrapper.appendChild(controlRow);
 
-  // 播放器區塊（錄音完成後顯示）
   const playerSection = document.createElement('div');
   playerSection.className = 'record-player hidden';
   const playerTitle = document.createElement('p');
@@ -489,7 +612,7 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
   const audioEl = document.createElement('audio');
   audioEl.preload = 'metadata';
   audioEl.style.display = 'none';
-  let customPlayerEl = createWaveformPlayer(audioEl);
+  const customPlayerEl = createWaveformPlayer(audioEl);
 
   const saveBtn = document.createElement('button');
   saveBtn.className = 'btn btn-primary';
@@ -501,80 +624,160 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
   playerSection.appendChild(saveBtn);
   wrapper.appendChild(playerSection);
 
-  // 錄音邏輯
-  let isRecording = false;
+  const syncSourceUi = (): void => {
+    const mode = modeSelect.value as RecordingSourceMode;
+    const needsMic = mode === 'microphone' || mode === 'mix';
+    const needsSystem = mode === 'system' || mode === 'mix';
+    micGroup.classList.toggle('hidden', !needsMic || state.uploadedFile !== null);
+    systemGroup.classList.toggle('hidden', !needsSystem || state.uploadedFile !== null);
 
-  recordBtn.addEventListener('click', async () => {
-    if (!isRecording) {
-      await startRecording();
+    if (needsSystem && !recordingDevices.system_audio_supported) {
+      supportHint.textContent = '目前僅 Windows 支援電腦本地音訊錄音。請改用僅麥克風或上傳音訊檔案。';
+      supportHint.style.color = 'var(--color-warning)';
+    } else if (needsSystem) {
+      supportHint.textContent = '電腦音訊會擷取目前系統預設播放裝置的聲音；戴耳機開會時也能收進錄音。';
+      supportHint.style.color = '';
     } else {
-      stopRecording();
+      supportHint.textContent = '僅麥克風模式會透過桌面錄音引擎寫出 WAV，停止後可先預覽再儲存。';
+      supportHint.style.color = '';
     }
-  });
+  };
 
-  async function startRecording(): Promise<void> {
-    const deviceId = micSelect.value;
-    const constraints: MediaStreamConstraints = {
-      audio: deviceId ? { deviceId: { exact: deviceId } } : true,
-    };
-
-    try {
-      state.stream = await navigator.mediaDevices.getUserMedia(constraints);
-    } catch (err) {
-      showToast(`無法存取麥克風：${String(err)}`, 'error');
-      return;
-    }
-
-    // 波形分析
-    const audioCtx = new AudioContext();
-    const source = audioCtx.createMediaStreamSource(state.stream);
-    state.analyser = audioCtx.createAnalyser();
-    state.analyser.fftSize = 2048;
-    source.connect(state.analyser);
-    drawWaveform(canvas, state.analyser);
-
-    state.mediaRecorder = new MediaRecorder(state.stream);
-    state.audioChunks = [];
-
-    state.mediaRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) state.audioChunks.push(e.data);
-    };
-
-    state.mediaRecorder.onstop = () => {
-      state.audioBlob = new Blob(state.audioChunks, { type: 'audio/webm' });
-      state.audioBlobUrl = URL.createObjectURL(state.audioBlob);
-      audioEl.src = state.audioBlobUrl;
-      playerSection.classList.remove('hidden');
-    };
-
-    state.mediaRecorder.start();
-    isRecording = true;
-    state.startTime = Date.now();
-    recordBtn.textContent = '停止錄音';
-    recordBtn.classList.add('recording');
-
-    state.timerInterval = window.setInterval(() => {
-      const elapsed = Math.floor((Date.now() - state.startTime) / 1000);
-      const m = Math.floor(elapsed / 60);
-      const s = elapsed % 60;
-      timer.textContent = `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-    }, 1000);
-  }
-
-  function stopRecording(): void {
-    state.mediaRecorder?.stop();
-    isRecording = false;
-    recordBtn.textContent = '開始錄音';
-    recordBtn.classList.remove('recording');
-    if (state.timerInterval !== null) {
-      clearInterval(state.timerInterval);
-      state.timerInterval = null;
-    }
+  const startVisualizer = (): void => {
     if (state.animationId !== null) {
       cancelAnimationFrame(state.animationId);
-      state.animationId = null;
     }
-  }
+    let phase = 0;
+    const draw = (): void => {
+      phase += 0.22;
+      drawLiveLevel(canvas, state.liveLevel, phase);
+      state.liveLevel *= 0.92;
+      state.animationId = requestAnimationFrame(draw);
+    };
+    draw();
+  };
+
+  const showPreview = async (
+    src: string,
+    title: string,
+    durationSeconds: number | null,
+    tempFilePath: string | null,
+    sourceMode: RecordingSourceMode | null,
+    needsCleanup: boolean,
+  ): Promise<void> => {
+    state.previewDurationSeconds = durationSeconds;
+    state.previewTempFilePath = tempFilePath;
+    state.previewSourceMode = sourceMode;
+    state.previewNeedsCleanup = needsCleanup;
+    audioEl.src = src;
+    playerTitle.textContent = title;
+    playerSection.classList.remove('hidden');
+    timer.textContent = durationSeconds ? formatTime(durationSeconds) : '00:00';
+  };
+
+  const resetToRecordingMode = async (): Promise<void> => {
+    await releasePreviewResources();
+    playerSection.classList.add('hidden');
+    fileInput.value = '';
+    audioEl.src = '';
+    timer.textContent = '00:00';
+    recordBtn.classList.remove('hidden');
+    uploadBtn.classList.remove('hidden');
+    modeGroup.classList.remove('hidden');
+    reselectBtn.classList.add('hidden');
+    state.uploadedFile = null;
+    resetCanvas(canvas);
+    syncSourceUi();
+  };
+
+  const ensureLevelListener = async (): Promise<void> => {
+    if (state.unlistenLevel) {
+      return;
+    }
+    state.unlistenLevel = await listen<{ level: number; mode: RecordingSourceMode }>('recording-level', (event) => {
+      state.liveLevel = Math.max(state.liveLevel, event.payload.level);
+    });
+  };
+
+  recordBtn.addEventListener('click', async () => {
+    if (!state.isRecording) {
+      const mode = modeSelect.value as RecordingSourceMode;
+      const microphoneDeviceId = micSelect.value;
+      const systemDeviceId = systemSelect.value;
+
+      if ((mode === 'system' || mode === 'mix') && !recordingDevices.system_audio_supported) {
+        showToast('目前只有 Windows 支援電腦本地音訊錄音', 'warning');
+        return;
+      }
+      if ((mode === 'microphone' || mode === 'mix') && !microphoneDeviceId) {
+        showToast('請先選擇可用的麥克風', 'warning');
+        return;
+      }
+      if ((mode === 'system' || mode === 'mix') && !systemDeviceId) {
+        showToast('找不到可用的電腦音訊來源', 'warning');
+        return;
+      }
+
+      recordBtn.disabled = true;
+      try {
+        await ensureLevelListener();
+        await releasePreviewResources();
+        await startDesktopRecording({
+          mode,
+          microphone_device_id: microphoneDeviceId || null,
+          system_device_id: systemDeviceId || null,
+        });
+        await persistRecordingPreferences(mode, microphoneDeviceId, systemDeviceId);
+        state.isRecording = true;
+        state.startTime = Date.now();
+        state.liveLevel = 0;
+        recordBtn.textContent = '停止錄音';
+        recordBtn.classList.add('recording');
+        playerSection.classList.add('hidden');
+        startVisualizer();
+        state.timerInterval = window.setInterval(() => {
+          const elapsed = Math.floor((Date.now() - state.startTime) / 1000);
+          timer.textContent = `${String(Math.floor(elapsed / 60)).padStart(2, '0')}:${String(elapsed % 60).padStart(2, '0')}`;
+        }, 1000);
+      } catch (err) {
+        showToast(`開始錄音失敗：${String(err)}`, 'error');
+      } finally {
+        recordBtn.disabled = false;
+      }
+    } else {
+      recordBtn.disabled = true;
+      try {
+        const preview = await stopDesktopRecording();
+        state.isRecording = false;
+        recordBtn.textContent = '開始錄音';
+        recordBtn.classList.remove('recording');
+        if (state.timerInterval !== null) {
+          clearInterval(state.timerInterval);
+          state.timerInterval = null;
+        }
+        if (state.animationId !== null) {
+          cancelAnimationFrame(state.animationId);
+          state.animationId = null;
+        }
+        timer.textContent = formatTime(preview.duration_seconds);
+        await showPreview(
+          convertFileSrc(preview.temp_file_path),
+          '錄音完成，請確認後儲存：',
+          preview.duration_seconds,
+          preview.temp_file_path,
+          preview.mode,
+          true,
+        );
+        if (preview.warning) {
+          showToast(`錄音已停止：${preview.warning}`, 'warning');
+        }
+      } catch (err) {
+        showToast(`停止錄音失敗：${String(err)}`, 'error');
+      } finally {
+        recordBtn.disabled = false;
+      }
+    }
+  });
 
   saveBtn.addEventListener('click', async () => {
     const meetingId = selectedMeetingId;
@@ -582,7 +785,7 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
       showToast('請先選擇會議', 'warning');
       return;
     }
-    if (!state.audioBlobUrl) {
+    if (!audioEl.src) {
       showToast('尚無錄音檔案', 'warning');
       return;
     }
@@ -591,114 +794,117 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
     saveBtn.textContent = '儲存中…';
 
     try {
-      // 計算時長：錄音模式有 startTime，上傳模式取 null
-      const durationSeconds =
-        state.audioBlob && state.startTime > 0
-          ? Math.floor((Date.now() - state.startTime) / 1000)
-          : null;
+      if (state.uploadedFile) {
+        const ext = state.uploadedFile.name.split('.').pop() ?? 'wav';
+        const fileName = `${meetingId}_${Date.now()}.${ext}`;
+        const response = await fetch(audioEl.src);
+        const buffer = await response.arrayBuffer();
+        const bytes = Array.from(new Uint8Array(buffer));
+        await writeRecordingFile(meetingId, bytes, fileName, state.uploadedFile.name, null);
+      } else if (state.previewTempFilePath) {
+        await commitTemporaryRecording(
+          meetingId,
+          state.previewTempFilePath,
+          null,
+          state.previewDurationSeconds,
+          state.previewSourceMode,
+        );
+        state.previewNeedsCleanup = false;
+      } else {
+        throw new Error('找不到可儲存的錄音檔');
+      }
 
-      // 取得副檔名
-      const ext = state.uploadedFile
-        ? (state.uploadedFile.name.split('.').pop() ?? 'webm')
-        : 'webm';
-      const fileName = `${meetingId}_${Date.now()}.${ext}`;
-
-      // 讀取音訊 bytes 交由後端寫入設定的錄音資料夾
-      const response = await fetch(state.audioBlobUrl);
-      const buffer = await response.arrayBuffer();
-      const bytes = Array.from(new Uint8Array(buffer));
-
-      await writeRecordingFile(meetingId, bytes, fileName, state.uploadedFile?.name ?? null, durationSeconds);
       showToast('錄音已儲存', 'success');
       window.location.hash = `#meeting/${meetingId}`;
     } catch (err) {
       showToast(`儲存失敗：${String(err)}`, 'error');
       saveBtn.disabled = false;
       saveBtn.textContent = '儲存錄音';
+      return;
     }
   });
 
-  // 上傳音訊
   uploadBtn.addEventListener('click', () => fileInput.click());
 
   fileInput.addEventListener('change', async () => {
     const file = fileInput.files?.[0];
     if (!file) return;
 
-    if (state.audioBlobUrl) URL.revokeObjectURL(state.audioBlobUrl);
-    state.audioBlobUrl = URL.createObjectURL(file);
+    await releasePreviewResources();
+    const objectUrl = URL.createObjectURL(file);
+    state.previewObjectUrl = objectUrl;
     state.uploadedFile = file;
-    state.audioBlob = null;
-    state.startTime = 0;
+    state.previewDurationSeconds = null;
+    state.previewSourceMode = null;
+    state.previewNeedsCleanup = false;
+    state.previewTempFilePath = null;
 
-    // 切換控制區：隱藏錄音按鈕，顯示重新選擇
     recordBtn.classList.add('hidden');
+    uploadBtn.classList.add('hidden');
     micGroup.classList.add('hidden');
+    systemGroup.classList.add('hidden');
+    modeGroup.classList.add('hidden');
     reselectBtn.classList.remove('hidden');
 
-    // 設定音訊來源並顯示播放器
-    audioEl.src = state.audioBlobUrl;
-    playerSection.classList.remove('hidden');
-    playerTitle.textContent = `已載入音訊（${file.name}），請確認後儲存：`;
+    await showPreview(objectUrl, `已載入音訊（${file.name}），請確認後儲存：`, null, null, null, false);
 
-    // Timer 顯示音訊時長
-    audioEl.addEventListener('loadedmetadata', () => {
-      timer.textContent = formatTime(audioEl.duration);
-    }, { once: true });
-
-    // 停止錄音動態波形
-    if (state.animationId !== null) {
-      cancelAnimationFrame(state.animationId);
-      state.animationId = null;
-    }
-
-    // 波形分析中提示
     const waveCtx = canvas.getContext('2d');
     if (waveCtx) {
-      waveCtx.fillStyle = '#0f1117';
-      waveCtx.fillRect(0, 0, canvas.width, canvas.height);
+      resetCanvas(canvas);
       waveCtx.fillStyle = '#6366f1';
       waveCtx.font = '14px sans-serif';
       waveCtx.textAlign = 'center';
       waveCtx.fillText('波形分析中…', canvas.width / 2, canvas.height / 2 + 5);
     }
 
-    // 繪製靜態波形（非同步，不阻塞 UI）
     try {
       const arrayBuffer = await file.arrayBuffer();
       const audioCtx = new AudioContext();
       const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
       drawStaticWaveform(canvas, audioBuffer);
+      timer.textContent = formatTime(audioBuffer.duration);
       await audioCtx.close();
     } catch {
-      const c = canvas.getContext('2d');
-      if (c) {
-        c.fillStyle = '#0f1117';
-        c.fillRect(0, 0, canvas.width, canvas.height);
-      }
+      resetCanvas(canvas);
     }
 
     showToast('音訊已載入', 'success');
   });
 
-  // 重新選擇：恢復錄音控制
   reselectBtn.addEventListener('click', () => {
-    reselectBtn.classList.add('hidden');
-    recordBtn.classList.remove('hidden');
-    micGroup.classList.remove('hidden');
-    playerSection.classList.add('hidden');
-    timer.textContent = '00:00';
-    if (state.audioBlobUrl) {
-      URL.revokeObjectURL(state.audioBlobUrl);
-      state.audioBlobUrl = null;
-    }
-    state.uploadedFile = null;
-    audioEl.src = '';
-    const c = canvas.getContext('2d');
-    if (c) {
-      c.fillStyle = '#0f1117';
-      c.fillRect(0, 0, canvas.width, canvas.height);
-    }
-    fileInput.value = '';
+    void resetToRecordingMode();
   });
+
+  modeSelect.addEventListener('change', () => {
+    syncSourceUi();
+    void persistRecordingPreferences(
+      modeSelect.value as RecordingSourceMode,
+      micSelect.value,
+      systemSelect.value,
+    );
+  });
+
+  micSelect.addEventListener('change', () => {
+    void persistRecordingPreferences(
+      modeSelect.value as RecordingSourceMode,
+      micSelect.value,
+      systemSelect.value,
+    );
+  });
+
+  systemSelect.addEventListener('change', () => {
+    void persistRecordingPreferences(
+      modeSelect.value as RecordingSourceMode,
+      micSelect.value,
+      systemSelect.value,
+    );
+  });
+
+  audioEl.addEventListener('loadedmetadata', () => {
+    if (!state.isRecording) {
+      timer.textContent = formatTime(audioEl.duration || state.previewDurationSeconds || 0);
+    }
+  });
+
+  syncSourceUi();
 }

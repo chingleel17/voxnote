@@ -5,7 +5,8 @@ import {
   detectLocalAsrTools,
   type LocalAsrInfo,
 } from '../api/settings';
-import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
+import { exportFullBackup, importFullBackup, preflightFullBackup } from '../api/backup';
 import { showToast } from '../components/toast';
 import { initConfigStore, setCurrentConfig } from '../utils/configStore';
 import { sendTestNotification } from '../utils/notifications';
@@ -220,7 +221,8 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
     scheduleAutoSave();
   });
 
-  const advancedSection = buildAdvancedSection([promptSection, storageSection]);
+  const backupSection = buildBackupSection();
+  const advancedSection = buildAdvancedSection([promptSection, storageSection, backupSection]);
   form.appendChild(advancedSection);
 
   // ── 儲存按鈕 ──
@@ -466,6 +468,88 @@ function buildStorageSection(
       onChange(config);
     }
   ));
+
+  return section;
+}
+
+function buildBackupSection(): HTMLElement {
+  const section = document.createElement('section');
+  section.className = 'settings-section';
+
+  const heading = document.createElement('h3');
+  heading.className = 'settings-section-title';
+  heading.textContent = '資料備份與還原';
+  section.appendChild(heading);
+
+  const hint = document.createElement('p');
+  hint.className = 'form-hint';
+  hint.textContent = '備份包含會議、逐字稿、摘要、範本、錄音與封存檔案，不包含 API 金鑰與設定。';
+  section.appendChild(hint);
+
+  const actions = document.createElement('div');
+  actions.className = 'section-actions';
+  const exportButton = document.createElement('button');
+  exportButton.type = 'button';
+  exportButton.className = 'btn btn-secondary btn-sm';
+  exportButton.textContent = '建立完整備份';
+  const importButton = document.createElement('button');
+  importButton.type = 'button';
+  importButton.className = 'btn btn-secondary btn-sm';
+  importButton.textContent = '從備份還原';
+  actions.append(exportButton, importButton);
+  section.appendChild(actions);
+
+  const setBusy = (busy: boolean): void => {
+    exportButton.disabled = busy;
+    importButton.disabled = busy;
+  };
+
+  exportButton.addEventListener('click', async () => {
+    const destination = await saveDialog({
+      defaultPath: `voxnote-backup-${new Date().toISOString().slice(0, 10)}.zip`,
+      filters: [{ name: 'VoxNote 備份', extensions: ['zip'] }],
+    });
+    if (!destination) return;
+
+    setBusy(true);
+    try {
+      const result = await exportFullBackup(destination);
+      const warning = result.warnings.length ? `，${result.warnings.length} 個警告` : '';
+      showToast(`備份完成：已收錄 ${result.added} 個檔案${warning}`, result.warnings.length ? 'warning' : 'success', 5000);
+    } catch (err) {
+      showToast(`建立備份失敗：${String(err)}`, 'error', 5000);
+    } finally {
+      setBusy(false);
+    }
+  });
+
+  importButton.addEventListener('click', async () => {
+    const selected = await openDialog({
+      multiple: false,
+      filters: [{ name: 'VoxNote 備份', extensions: ['zip'] }],
+    });
+    if (!selected || Array.isArray(selected)) return;
+
+    setBusy(true);
+    try {
+      const preflight = await preflightFullBackup(selected);
+      const { meetings, recordings, assets } = preflight.summary;
+      const summary = `備份建立於 ${new Date(preflight.summary.createdAt).toLocaleString()}，包含 ${meetings} 場會議、${recordings} 段錄音與 ${assets} 個檔案。`;
+      const overwrite = window.confirm(`${summary}\n\n按「確定」覆蓋目前所有 VoxNote 資料；按「取消」改用合併匯入。`);
+      const mode = overwrite ? 'overwrite' : 'merge';
+      const modeLabel = overwrite ? '覆蓋' : '合併';
+      if (!window.confirm(`確定要以「${modeLabel}」模式還原嗎？此操作期間無法修改會議資料。`)) return;
+
+      const result = await importFullBackup(selected, mode);
+      const warning = result.warnings.length ? `，${result.warnings.length} 個警告` : '';
+      showToast(`還原完成：新增 ${result.added}、略過 ${result.skipped}、重用 ${result.reused}${warning}`, result.warnings.length ? 'warning' : 'success', 7000);
+      window.location.reload();
+    } catch (err) {
+      showToast(`還原失敗：${String(err)}`, 'error', 6000);
+    } finally {
+      setBusy(false);
+    }
+  });
 
   return section;
 }

@@ -11,6 +11,9 @@ pub struct AppConfig {
     pub assembly_ai_speech_model: String, // "universal-2" | "universal-3-pro"
     pub recording_storage_dir: String,
     pub archive_storage_dir: String,
+    pub recording_source_mode: String,
+    pub recording_microphone_device_id: String,
+    pub recording_system_device_id: String,
     pub local_asr_model: String, // "tiny" | "base" | "small" | "medium" | "large"
     pub asr_language: String,    // "zh" | "en" | "auto"
     pub speaker_detection: bool, // 是否啟用說話人偵測
@@ -49,6 +52,9 @@ impl Default for AppConfig {
             assembly_ai_speech_model: "universal-2".into(),
             recording_storage_dir: String::new(),
             archive_storage_dir: String::new(),
+            recording_source_mode: "microphone".into(),
+            recording_microphone_device_id: String::new(),
+            recording_system_device_id: String::new(),
             local_asr_model: "base".into(),
             asr_language: "zh".into(),
             speaker_detection: true,

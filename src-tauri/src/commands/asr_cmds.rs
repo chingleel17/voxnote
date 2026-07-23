@@ -3,6 +3,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::{
     asr::{detect_local_asr, transcribe_assemblyai, transcribe_local_whisper, LocalAsrInfo},
+    backup::DataOperationLock,
     commands::ai_cmds::proofread_recording_segment_with_config,
     config::load_config,
     db::{recording, transcript},
@@ -28,7 +29,9 @@ pub async fn start_transcription(
     file_path: String,
     app: AppHandle,
     pool: State<'_, SqlitePool>,
+    data_lock: State<'_, DataOperationLock>,
 ) -> Result<String, String> {
+    let _guard = data_lock.try_begin_write()?;
     let config = load_config(&app).map_err(|e| e.to_string())?;
 
     let text = match config.asr_provider.as_str() {

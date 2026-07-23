@@ -76,11 +76,33 @@ export interface Recording {
   file_path: string | null;
   original_file_name: string | null;
   duration_seconds: number | null;
+  source_mode: RecordingSourceMode | null;
   sort_order: number;
   segment_transcript: string | null;
   segment_proofread: string | null;
   no_break_before: number;
   created_at: string;
+}
+
+export type RecordingSourceMode = 'microphone' | 'system' | 'mix';
+
+export interface RecordingDevice {
+  id: string;
+  name: string;
+  is_default: boolean;
+}
+
+export interface RecordingDeviceList {
+  microphones: RecordingDevice[];
+  system_outputs: RecordingDevice[];
+  system_audio_supported: boolean;
+}
+
+export interface RecordingPreview {
+  temp_file_path: string;
+  duration_seconds: number;
+  mode: RecordingSourceMode;
+  warning: string | null;
 }
 
 export interface AppConfig {
@@ -90,6 +112,9 @@ export interface AppConfig {
   assembly_ai_speech_model: 'universal-2' | 'universal-3-pro';
   recording_storage_dir: string;
   archive_storage_dir: string;
+  recording_source_mode: RecordingSourceMode;
+  recording_microphone_device_id: string;
+  recording_system_device_id: string;
   local_asr_model: 'tiny' | 'base' | 'small' | 'medium' | 'large';
   asr_language: string;       // "zh" | "en" | "auto"
   speaker_detection: boolean; // 說話人偵測
@@ -169,4 +194,24 @@ export interface Tag {
   name: string;
   color: string;
   created_at: string;
+}
+
+export type BackupImportMode = 'merge' | 'overwrite';
+
+export interface BackupResult {
+  outputPath: string | null;
+  added: number;
+  skipped: number;
+  reused: number;
+  warnings: string[];
+}
+
+export interface BackupPreflightResult {
+  summary: {
+    createdAt: string;
+    meetings: number;
+    recordings: number;
+    assets: number;
+  };
+  warnings: string[];
 }

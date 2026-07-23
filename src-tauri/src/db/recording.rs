@@ -6,7 +6,7 @@ use uuid::Uuid;
 use super::models::Recording;
 
 const SELECT_COLS: &str =
-    "id, meeting_id, file_path, original_file_name, duration_seconds, sort_order, segment_transcript, segment_proofread, no_break_before, created_at";
+    "id, meeting_id, file_path, original_file_name, duration_seconds, source_mode, sort_order, segment_transcript, segment_proofread, no_break_before, created_at";
 
 pub async fn get_recording(pool: &SqlitePool, meeting_id: &str) -> Result<Option<Recording>> {
     let sql = format!("SELECT {SELECT_COLS} FROM recordings WHERE meeting_id = ? ORDER BY sort_order ASC, created_at ASC LIMIT 1");
@@ -33,6 +33,7 @@ pub async fn create_recording(
     file_path: Option<&str>,
     original_file_name: Option<&str>,
     duration_seconds: Option<i64>,
+    source_mode: Option<&str>,
 ) -> Result<Recording> {
     let now = Utc::now().to_rfc3339();
     let id = Uuid::new_v4().to_string();
@@ -45,13 +46,14 @@ pub async fn create_recording(
     let sort_order = next_sort_order.0.unwrap_or(-1) + 1;
 
     sqlx::query(
-        "INSERT INTO recordings (id, meeting_id, file_path, original_file_name, duration_seconds, sort_order, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO recordings (id, meeting_id, file_path, original_file_name, duration_seconds, source_mode, sort_order, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(meeting_id)
     .bind(file_path)
     .bind(original_file_name)
     .bind(duration_seconds)
+    .bind(source_mode)
     .bind(sort_order)
     .bind(&now)
     .execute(pool)

@@ -28,3 +28,8 @@ thiserror = "2"
 toml = "0.8"
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 tauri-plugin-notification = "2.3.3"
+cpal = "0.17.3"
+hound = "3.5.1"
+wasapi = "0.23.0"
+zip = { version = "2", features = ["deflate"] }
+fs4 = "1.1.0"

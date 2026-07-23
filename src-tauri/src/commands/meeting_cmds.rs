@@ -9,6 +9,7 @@ use crate::db::{
     recording, summary, transcript,
 };
 use crate::config::load_config;
+use crate::backup::DataOperationLock;
 
 #[tauri::command]
 pub async fn get_meetings(pool: State<'_, SqlitePool>) -> Result<Vec<MeetingWithDetails>, String> {
@@ -40,7 +41,9 @@ pub async fn get_meeting(
 pub async fn create_meeting(
     request: CreateMeetingRequest,
     pool: State<'_, SqlitePool>,
+    data_lock: State<'_, DataOperationLock>,
 ) -> Result<MeetingWithDetails, String> {
+    let _guard = data_lock.try_begin_write()?;
     meeting::create_meeting(&pool, request)
         .await
         .map_err(|e| e.to_string())
@@ -51,14 +54,21 @@ pub async fn update_meeting(
     id: String,
     request: UpdateMeetingRequest,
     pool: State<'_, SqlitePool>,
+    data_lock: State<'_, DataOperationLock>,
 ) -> Result<MeetingWithDetails, String> {
+    let _guard = data_lock.try_begin_write()?;
     meeting::update_meeting(&pool, &id, request)
         .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn delete_meeting(id: String, pool: State<'_, SqlitePool>) -> Result<(), String> {
+pub async fn delete_meeting(
+    id: String,
+    pool: State<'_, SqlitePool>,
+    data_lock: State<'_, DataOperationLock>,
+) -> Result<(), String> {
+    let _guard = data_lock.try_begin_write()?;
     meeting::delete_meeting(&pool, &id)
         .await
         .map_err(|e| e.to_string())
@@ -69,7 +79,9 @@ pub async fn archive_meeting(
     id: String,
     app: AppHandle,
     pool: State<'_, SqlitePool>,
+    data_lock: State<'_, DataOperationLock>,
 ) -> Result<MeetingWithDetails, String> {
+    let _guard = data_lock.try_begin_write()?;
     let config = load_config(&app).map_err(|e| e.to_string())?;
     let archive_root = resolve_archive_root(&app, config.archive_storage_dir.trim())
         .map_err(|e| e.to_string())?;
@@ -184,7 +196,9 @@ pub async fn archive_meeting(
 pub async fn unarchive_meeting(
     id: String,
     pool: State<'_, SqlitePool>,
+    data_lock: State<'_, DataOperationLock>,
 ) -> Result<MeetingWithDetails, String> {
+    let _guard = data_lock.try_begin_write()?;
     meeting::unarchive_meeting(&pool, &id)
         .await
         .map_err(|e| e.to_string())?;
@@ -205,7 +219,9 @@ pub async fn get_categories(pool: State<'_, SqlitePool>) -> Result<Vec<Category>
 pub async fn create_category(
     name: String,
     pool: State<'_, SqlitePool>,
+    data_lock: State<'_, DataOperationLock>,
 ) -> Result<Category, String> {
+    let _guard = data_lock.try_begin_write()?;
     category::create_category(&pool, &name)
         .await
         .map_err(|e| e.to_string())
@@ -216,14 +232,21 @@ pub async fn update_category(
     id: String,
     name: String,
     pool: State<'_, SqlitePool>,
+    data_lock: State<'_, DataOperationLock>,
 ) -> Result<Category, String> {
+    let _guard = data_lock.try_begin_write()?;
     category::update_category(&pool, &id, &name)
         .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn delete_category(id: String, pool: State<'_, SqlitePool>) -> Result<(), String> {
+pub async fn delete_category(
+    id: String,
+    pool: State<'_, SqlitePool>,
+    data_lock: State<'_, DataOperationLock>,
+) -> Result<(), String> {
+    let _guard = data_lock.try_begin_write()?;
     category::delete_category(&pool, &id)
         .await
         .map_err(|e| e.to_string())

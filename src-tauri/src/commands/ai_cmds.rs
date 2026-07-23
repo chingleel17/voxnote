@@ -6,6 +6,7 @@ use tauri::{AppHandle, State};
 
 use crate::{
     ai::call_llm,
+    backup::DataOperationLock,
     config::load_config,
     db::{
         models::{Recording, SpeakerMapping},
@@ -521,7 +522,9 @@ pub async fn proofread_transcript(
     meeting_id: String,
     app: AppHandle,
     pool: State<'_, SqlitePool>,
+    data_lock: State<'_, DataOperationLock>,
 ) -> Result<ProofreadResult, String> {
+    let _guard = data_lock.try_begin_write()?;
     let config = load_config(&app).map_err(|e| e.to_string())?;
     proofread_transcript_with_config(&config, &pool, &meeting_id).await
 }
@@ -532,7 +535,9 @@ pub async fn proofread_recording_segment(
     recording_id: String,
     app: AppHandle,
     pool: State<'_, SqlitePool>,
+    data_lock: State<'_, DataOperationLock>,
 ) -> Result<ProofreadResult, String> {
+    let _guard = data_lock.try_begin_write()?;
     let config = load_config(&app).map_err(|e| e.to_string())?;
     proofread_recording_segment_with_config(&config, &pool, &meeting_id, &recording_id).await
 }
@@ -542,7 +547,9 @@ pub async fn generate_summary(
     meeting_id: String,
     app: AppHandle,
     pool: State<'_, SqlitePool>,
+    data_lock: State<'_, DataOperationLock>,
 ) -> Result<String, String> {
+    let _guard = data_lock.try_begin_write()?;
     let config = load_config(&app).map_err(|e| e.to_string())?;
 
     let t = transcript::get_transcript(&pool, &meeting_id)

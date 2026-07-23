@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS recordings (
     file_path TEXT,
     original_file_name TEXT,
     duration_seconds INTEGER,
+    source_mode TEXT,
     sort_order INTEGER NOT NULL DEFAULT 0,
     segment_transcript TEXT,
     segment_proofread TEXT,
@@ -195,6 +196,9 @@ pub async fn init_db(app: &AppHandle) -> Result<SqlitePool> {
         .execute(&pool)
         .await;
     let _ = sqlx::query("ALTER TABLE recordings ADD COLUMN original_file_name TEXT")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE recordings ADD COLUMN source_mode TEXT")
         .execute(&pool)
         .await;
     let _ = sqlx::query("ALTER TABLE recordings ADD COLUMN segment_transcript TEXT")

@@ -71,6 +71,7 @@ pub struct Recording {
     pub file_path: Option<String>,
     pub original_file_name: Option<String>,
     pub duration_seconds: Option<i64>,
+    pub source_mode: Option<String>,
     pub sort_order: i64,
     pub segment_transcript: Option<String>,
     pub segment_proofread: Option<String>,

@@ -1,13 +1,15 @@
 use tauri::Manager;
 
+mod audio_recording;
 mod ai;
 mod asr;
+mod backup;
 mod commands;
 mod config;
 mod db;
 
 use commands::{
-    ai_cmds::*, asr_cmds::*, meeting_cmds::*, recording_cmds::*, settings_cmds::*,
+    ai_cmds::*, asr_cmds::*, backup_cmds::*, meeting_cmds::*, recording_cmds::*, settings_cmds::*,
     speaker_mapping_cmds::*, summary_cmds::*, tag_cmds::*, template_cmds::*, transcript_cmds::*,
 };
 
@@ -23,6 +25,10 @@ pub fn run() {
             tauri::async_runtime::block_on(async move {
                 let pool = db::init_db(&app_handle).await.expect("資料庫初始化失敗");
                 app_handle.manage(pool);
+                app_handle.manage(backup::DataOperationLock::default());
+                app_handle.manage(audio_recording::DesktopRecordingManager::default());
+                audio_recording::cleanup_stale_temp_files(&app_handle)
+                    .expect("暫存錄音清理失敗");
             });
             Ok(())
         })
@@ -59,6 +65,12 @@ pub fn run() {
             get_recordings,
             save_recording,
             write_recording_file,
+            list_recording_devices,
+            start_desktop_recording,
+            stop_desktop_recording,
+            cancel_desktop_recording,
+            discard_temp_recording_file,
+            commit_temporary_recording,
             read_recording_file,
             delete_recording,
             set_no_break_before,
@@ -92,6 +104,10 @@ pub fn run() {
             update_tag,
             delete_tag,
             set_meeting_tags,
+            // full data backup
+            export_full_backup,
+            preflight_full_backup,
+            import_full_backup,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
