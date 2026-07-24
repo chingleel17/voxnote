@@ -25,8 +25,8 @@ API、Docker 與部署契約已完成；`app.py` 的 Breeze-ASR-26 載入、Whis
   ```
   此檔含機密，已由 `.gitignore` 排除，切勿提交版控。若暫不啟用語者分離，可略過此步。
 
-- [ ] **3. 準備 Breeze-ASR-26 權重**
-  下載或轉換 Breeze-ASR-26 權重，放到 `server/models/breeze-asr-26`（此目錄已由 `.gitignore` 排除）。或改以環境變數 `BREEZE_MODEL_DIR` 指定其他路徑 / Hugging Face repo 名稱。
+- [ ] **3. 準備 ASR 模型**
+  預設使用 Breeze-ASR-26（台灣用語最佳）：下載或轉換其 CTranslate2 權重，放到 `server/models/asr-model`（此目錄已由 `.gitignore` 排除）。若想改用其他模型，設定 `ASR_MODEL` 環境變數即可（詳見下方「選擇 ASR 模型」）；使用 WhisperX 內建代號（如 `large-v3`）時可略過本步驟，模型會自動下載。
 
 - [ ] **4. 啟動服務**
   ```bash
@@ -57,11 +57,21 @@ uv run uvicorn app:app --host 0.0.0.0 --port 8000
 
 torch 的 CUDA 版本請依 NVIDIA 官方索引安裝（對應主機 CUDA 版本），必要時以 `uv pip install torch --index-url https://download.pytorch.org/whl/cu124` 覆蓋。
 
+## 選擇 ASR 模型
+
+本服務基於 WhisperX 框架，ASR 模型可插拔，透過 `ASR_MODEL` 環境變數指定。可填入的值：
+
+- **WhisperX 內建模型代號**（免轉檔、即裝即用）：如 `large-v3`、`medium`、`small`。適合需要多語言通用辨識、或使用者環境資源有限時降尺寸使用。
+- **本地 CTranslate2 模型目錄**：如 `/models/asr-model`。用於自備權重（含 Breeze-ASR-26）。
+- **Hugging Face repo 名稱**：如 `MediaTek-Research/Breeze-ASR-26`（預設值，台灣用語最佳）。
+
+注意：WhisperX 走 faster-whisper (CTranslate2) 後端，任何自訂 fine-tune 模型（如 Breeze）須先轉為 CTranslate2 格式才能載入；原版 Whisper 系列則由 WhisperX 自動處理。語者分離（pyannote）與所選 ASR 模型無關，兩者皆可搭配。
+
 ## 環境變數
 
 | 變數 | 說明 | 預設 |
 | --- | --- | --- |
-| `BREEZE_MODEL_DIR` | Breeze 權重目錄或 Hugging Face repo 名稱 | `MediaTek-Research/Breeze-ASR-26` |
+| `ASR_MODEL` | ASR 模型：CTranslate2 目錄、HF repo 名稱，或 WhisperX 內建代號（如 `large-v3`）。相容別名 `BREEZE_MODEL_DIR` | `MediaTek-Research/Breeze-ASR-26` |
 | `ASR_DEVICE` | 推論裝置 | `cuda` |
 | `ASR_COMPUTE_TYPE` | 運算精度；VRAM 較小建議 `int8`，較充裕可用 `float16` | `int8` |
 | `ASR_BATCH_SIZE` | 批次大小；VRAM 較小時調降 | `8` |

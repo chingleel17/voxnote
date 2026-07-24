@@ -36,29 +36,36 @@ def _speaker_code(index: int) -> str:
 
 
 class WhisperXTranscriber:
-    """封裝 Breeze-ASR-26 與 WhisperX 流程。
+    """封裝 WhisperX 轉錄流程，ASR 模型可透過環境變數指定。
 
     採惰性載入：首次呼叫 transcribe 時才載入模型，避免服務啟動即佔用 VRAM。
+    ASR 模型可為任何 CTranslate2 格式的 Whisper 系模型（原版 Whisper、Breeze
+    或其他 fine-tune），預設為台灣用語最佳的 Breeze-ASR-26。
     模型與執行參數皆可透過環境變數調整，以因應不同 VRAM 的 GPU。
     """
 
     def __init__(self) -> None:
-        # 轉錄模型（faster-whisper 後端，載入 Breeze-ASR-26 的 CTranslate2 權重）
+        # 轉錄模型（faster-whisper / CTranslate2 後端）
         self._asr_model: Any | None = None
         # 詞級對齊模型與其 metadata（依語言載入，故以字典快取）
         self._align_cache: dict[str, tuple[Any, Any]] = {}
         # pyannote 語者分離 pipeline（啟用 diarize 時才載入）
         self._diarize_pipeline: Any | None = None
 
-        # Breeze-ASR-26 的 CTranslate2 模型目錄或 HF repo 名稱（需先轉檔或指向已轉好的權重）
-        self._model_dir = os.getenv("BREEZE_MODEL_DIR", "MediaTek-Research/Breeze-ASR-26")
+        # ASR 模型：CTranslate2 模型目錄、HF repo 名稱，或 WhisperX 內建模型代號
+        # （如 large-v3）。ASR_MODEL 為主，BREEZE_MODEL_DIR 為向後相容別名。
+        self._model_dir = (
+            os.getenv("ASR_MODEL")
+            or os.getenv("BREEZE_MODEL_DIR")
+            or "MediaTek-Research/Breeze-ASR-26"
+        )
         self._device = os.getenv("ASR_DEVICE", "cuda")
-        # 8GB VRAM 建議 int8 或 int8_float16；24GB 可用 float16
+        # VRAM 較小建議 int8 或 int8_float16；較充裕可用 float16
         self._compute_type = os.getenv("ASR_COMPUTE_TYPE", "int8")
         self._batch_size = int(os.getenv("ASR_BATCH_SIZE", "8"))
 
     def _ensure_asr_model(self) -> Any:
-        """惰性載入 Breeze 轉錄模型。"""
+        """惰性載入 ASR 轉錄模型（依 ASR_MODEL 設定）。"""
         if self._asr_model is None:
             import whisperx
 
@@ -114,8 +121,8 @@ class WhisperXTranscriber:
         except Exception as error:
             # 對應 design 的 fallback 策略：CTranslate2 載入失敗時的明確提示
             raise RuntimeError(
-                f"Breeze-ASR-26 模型載入失敗（請確認 BREEZE_MODEL_DIR 指向已轉為 "
-                f"CTranslate2 的權重，或改用 HF pipeline 後端）：{error}"
+                f"ASR 模型載入失敗（請確認 ASR_MODEL 指向有效的 CTranslate2 權重 "
+                f"或 WhisperX 內建模型代號；自訂 fine-tune 需先轉為 CTranslate2）：{error}"
             ) from error
 
         audio = whisperx.load_audio(str(audio_path))
