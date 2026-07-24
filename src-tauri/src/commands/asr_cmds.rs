@@ -2,7 +2,10 @@ use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::{
-    asr::{detect_local_asr, transcribe_assemblyai, transcribe_local_whisper, LocalAsrInfo},
+    asr::{
+        detect_local_asr, transcribe_assemblyai, transcribe_local_whisper, transcribe_voxnote_asr,
+        LocalAsrInfo,
+    },
     backup::DataOperationLock,
     commands::ai_cmds::proofread_recording_segment_with_config,
     config::load_config,
@@ -41,6 +44,16 @@ pub async fn start_transcription(
             &config.asr_language,
             &config.assembly_ai_speech_model,
             config.speaker_detection,
+            |msg| emit_asr_progress(&app, &meeting_id, &msg),
+        )
+        .await
+        .map_err(|e| e.to_string())?,
+        "voxnote_asr" => transcribe_voxnote_asr(
+            &config.local_asr_base_url,
+            &file_path,
+            &config.asr_language,
+            config.speaker_detection,
+            config.local_asr_speaker_hint,
             |msg| emit_asr_progress(&app, &meeting_id, &msg),
         )
         .await

@@ -1,0 +1,15 @@
+services:
+  local-asr:
+    build: .
+    ports:
+      - "${ASR_PORT:-8000}:8000"
+    environment:
+      BREEZE_MODEL_DIR: /models/breeze-asr-26
+      HF_HOME: /root/.cache/huggingface
+      HF_TOKEN_FILE: /run/secrets/hf_token
+    volumes:
+      - ${BREEZE_MODEL_PATH:-./models/breeze-asr-26}:/models/breeze-asr-26:ro
+      - ${HF_CACHE_DIR:-./cache/huggingface}:/root/.cache/huggingface
+      - ${HF_TOKEN_FILE:-./secrets/hf_token}:/run/secrets/hf_token:ro
+    gpus: all
+    restart: unless-stopped

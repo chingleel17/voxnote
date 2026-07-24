@@ -107,7 +107,7 @@ export interface RecordingPreview {
 
 export interface AppConfig {
   // ASR
-  asr_provider: 'assemblyai' | 'local';
+  asr_provider: 'assemblyai' | 'local' | 'voxnote_asr';
   assembly_ai_key: string;
   assembly_ai_speech_model: 'universal-2' | 'universal-3-pro';
   recording_storage_dir: string;
@@ -116,6 +116,8 @@ export interface AppConfig {
   recording_microphone_device_id: string;
   recording_system_device_id: string;
   local_asr_model: 'tiny' | 'base' | 'small' | 'medium' | 'large';
+  local_asr_base_url: string;
+  local_asr_speaker_hint: number; // 0 代表自動偵測
   asr_language: string;       // "zh" | "en" | "auto"
   speaker_detection: boolean; // 說話人偵測
   auto_proofread_after_transcription: boolean; // 逐段轉譯完成後自動 AI 校稿

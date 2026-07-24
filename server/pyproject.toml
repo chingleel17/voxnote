@@ -1,0 +1,30 @@
+[project]
+name = "voxnote-local-asr"
+version = "0.1.0"
+description = "VoxNote 本地 Breeze-ASR-26 + WhisperX 語音轉錄服務"
+requires-python = ">=3.10,<3.13"
+
+# 注意：WhisperX / CTranslate2 / pyannote 對 Python 3.13 支援尚不完整，
+# 故限定 <3.13。請以 uv 建立隔離環境，勿安裝至全域 Python：
+#   cd server
+#   uv sync
+#   uv run uvicorn app:app --host 0.0.0.0 --port 8000
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "opencc-python-reimplemented>=0.1.7",
+    "whisperx>=3.1",
+    "ctranslate2>=4.4",
+    "torch>=2.2",
+    "torchaudio>=2.2",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.27",
+]
+
+[tool.uv]
+# torch CUDA 版建議依官方索引安裝，詳見 README 的安裝說明
+package = false

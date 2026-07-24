@@ -4,6 +4,7 @@ use crate::ai::test_llm_connection;
 use crate::config::{load_config, save_config, AppConfig};
 
 const OLLAMA_HTTP_TIMEOUT_SECS: u64 = 10;
+const LOCAL_ASR_HTTP_TIMEOUT_SECS: u64 = 10;
 
 #[tauri::command]
 pub async fn get_settings(app: AppHandle) -> Result<AppConfig, String> {
@@ -36,6 +37,26 @@ pub async fn test_ollama_connection(endpoint: String) -> Result<bool, String> {
         Ok(resp) => Ok(resp.status().is_success()),
         Err(_) => Ok(false),
     }
+}
+
+#[tauri::command]
+pub async fn test_local_asr_connection(base_url: String) -> Result<bool, String> {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.is_empty() {
+        return Err("本地 ASR 伺服器位址未設定".into());
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(LOCAL_ASR_HTTP_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("無法建立本地 ASR 連線：{}", e))?;
+    let response = client
+        .get(format!("{}/health", base_url))
+        .send()
+        .await
+        .map_err(|e| format!("無法連線至本地 ASR 伺服器：{}", e))?;
+
+    Ok(response.status().is_success())
 }
 
 // 取得 Ollama 模型列表（保留）
