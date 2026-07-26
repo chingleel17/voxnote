@@ -1,0 +1,17 @@
+services:
+  local-asr:
+    build: .
+    ports:
+      - "${ASR_PORT:-8000}:8000"
+    environment:
+      # 容器內模型路徑；改用其他模型時一併調整此值與下方掛載來源
+      ASR_MODEL: ${ASR_MODEL:-/models/asr-model}
+      HF_HOME: /root/.cache/huggingface
+      HF_TOKEN_FILE: /run/secrets/hf_token
+    volumes:
+      # host 端模型目錄（預設放 Breeze-ASR-26；可用 .env 的 ASR_MODEL_PATH 覆寫）
+      - ${ASR_MODEL_PATH:-./models/asr-model}:/models/asr-model:ro
+      - ${HF_CACHE_DIR:-./cache/huggingface}:/root/.cache/huggingface
+      - ${HF_TOKEN_FILE:-./secrets/hf_token}:/run/secrets/hf_token:ro
+    gpus: all
+    restart: unless-stopped

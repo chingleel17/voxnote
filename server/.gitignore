@@ -1,0 +1,17 @@
+# Python 環境與快取
+.venv/
+__pycache__/
+*.pyc
+uv.lock
+
+# 模型權重（於部署機器另行下載/轉檔，不進版控）
+models/
+
+# Hugging Face 快取
+cache/
+
+# 機密：pyannote HF token，嚴禁進版控
+secrets/
+
+# 執行期暫存音訊
+voxnote-asr/

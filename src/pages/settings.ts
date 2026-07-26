@@ -2,7 +2,7 @@ import type { AppConfig } from '../types';
 import {
   saveSettings,
   testLlmConnection, testOllamaConnection, getOllamaModels,
-  detectLocalAsrTools,
+  detectLocalAsrTools, testLocalAsrConnection,
   type LocalAsrInfo,
 } from '../api/settings';
 import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
@@ -155,6 +155,7 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
       assembly_ai_key: updated.assembly_ai_key,
       assembly_ai_speech_model: updated.assembly_ai_speech_model,
       local_asr_model: updated.local_asr_model,
+      local_asr_base_url: updated.local_asr_base_url,
       asr_language: updated.asr_language,
       speaker_detection: updated.speaker_detection,
       auto_proofread_after_transcription: updated.auto_proofread_after_transcription,
@@ -264,9 +265,10 @@ function buildAsrSection(
   // 供應商下拉
   const providerGroup = buildSelectGroup(
     '轉錄供應商',
-    [
-      { value: 'assemblyai', label: 'AssemblyAI（雲端）' },
-      { value: 'local', label: '本地 Whisper' },
+      [
+        { value: 'assemblyai', label: 'AssemblyAI（雲端）' },
+        { value: 'local', label: '本地 Whisper' },
+        { value: 'voxnote_asr', label: 'VoxNote 轉錄服務' },
     ],
     config.asr_provider,
     (v) => {
@@ -324,6 +326,46 @@ function buildAsrSection(
   );
   section.appendChild(localSection);
 
+  // 本地 ASR 伺服器
+  const localServerSection = buildProviderSection([]);
+  const endpointGroup = document.createElement('div');
+  endpointGroup.className = 'form-group';
+  const endpointLabel = document.createElement('label');
+  endpointLabel.textContent = 'Base URL';
+  const endpointRow = document.createElement('div');
+  endpointRow.className = 'input-row';
+  const endpointInput = document.createElement('input');
+  endpointInput.type = 'url';
+  endpointInput.className = 'form-control';
+  endpointInput.value = config.local_asr_base_url;
+  endpointInput.placeholder = 'http://localhost:8000';
+  endpointInput.addEventListener('input', () => {
+    config = { ...config, local_asr_base_url: endpointInput.value };
+    onChange(config);
+  });
+  const testServerBtn = document.createElement('button');
+  testServerBtn.type = 'button';
+  testServerBtn.className = 'btn btn-secondary btn-sm';
+  testServerBtn.textContent = '測試連線';
+  testServerBtn.addEventListener('click', async () => {
+    testServerBtn.disabled = true;
+    testServerBtn.textContent = '測試中...';
+    try {
+      const reachable = await testLocalAsrConnection(endpointInput.value);
+      showToast(reachable ? '本地 ASR 伺服器連線成功' : '本地 ASR 伺服器未通過健康檢查', reachable ? 'success' : 'error');
+    } catch (err) {
+      showToast(`本地 ASR 伺服器連線失敗：${String(err)}`, 'error');
+    } finally {
+      testServerBtn.disabled = false;
+      testServerBtn.textContent = '測試連線';
+    }
+  });
+  endpointRow.append(endpointInput, testServerBtn);
+  endpointGroup.append(endpointLabel, endpointRow);
+  localServerSection.appendChild(endpointGroup);
+
+  section.appendChild(localServerSection);
+
   // 偵測邏輯
   const resultEl = localSection.querySelector('.asr-detect-result') as HTMLElement;
   const runDetect = async (): Promise<void> => {
@@ -369,11 +411,11 @@ function buildAsrSection(
     )
   );
 
-  // 說話人偵測（僅 AssemblyAI 支援）
+  // 語者分離（AssemblyAI 與本地伺服器支援）
   const speakerGroup = document.createElement('div');
   speakerGroup.className = 'form-group';
   const speakerLabel = document.createElement('label');
-  speakerLabel.textContent = '說話人偵測（AssemblyAI）';
+  speakerLabel.textContent = '語者分離';
   const speakerToggle = document.createElement('label');
   speakerToggle.className = 'toggle-switch';
   const speakerInput = document.createElement('input');
@@ -389,7 +431,7 @@ function buildAsrSection(
   speakerToggle.appendChild(speakerSlider);
   const speakerHint = document.createElement('small');
   speakerHint.className = 'form-hint';
-  speakerHint.textContent = '啟用後逐字稿將包含時間軸與講者標籤';
+  speakerHint.textContent = 'AssemblyAI 與本地伺服器啟用後，逐字稿將包含時間軸與講者標籤；預期人數會自動取自會議的與會人員。';
   speakerGroup.appendChild(speakerLabel);
   speakerGroup.appendChild(speakerToggle);
   speakerGroup.appendChild(speakerHint);
@@ -424,6 +466,7 @@ function buildAsrSection(
   const updateAsrVisibility = (provider: string): void => {
     assemblySection.style.display = provider === 'assemblyai' ? '' : 'none';
     localSection.style.display = provider === 'local' ? '' : 'none';
+    localServerSection.style.display = provider === 'voxnote_asr' ? '' : 'none';
   };
   updateAsrVisibility(config.asr_provider);
 

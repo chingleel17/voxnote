@@ -2,6 +2,22 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+const LOCAL_ASR_TIMEOUT_SECS: u64 = 600;
+
+#[derive(Debug, Deserialize)]
+struct LocalServerSegment {
+    start: f64,
+    text: String,
+    speaker: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalServerTranscription {
+    text: String,
+    #[serde(default)]
+    segments: Vec<LocalServerSegment>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LocalAsrInfo {
     pub engine: String,
@@ -52,6 +68,8 @@ pub async fn transcribe_assemblyai(
     language: &str,
     speech_model: &str,
     speaker_detection: bool,
+    // 預期講者人數，取自會議與會人員數；0 代表未知，不帶入 API
+    speakers_expected: u32,
     progress_cb: impl Fn(String),
 ) -> Result<String> {
     if api_key.is_empty() {
@@ -93,6 +111,11 @@ pub async fn transcribe_assemblyai(
     }
     if speaker_detection {
         req_body["speaker_labels"] = json!(true);
+        // 已知確切人數時帶入，可提升語者分離準確度；AssemblyAI 支援 1 至 20 人
+        // 註：音檔短於 2 分鐘時此參數會被 AssemblyAI 忽略
+        if (1..=20).contains(&speakers_expected) {
+            req_body["speakers_expected"] = json!(speakers_expected);
+        }
     }
 
     let task_resp = client
@@ -171,6 +194,102 @@ fn build_speech_models(selected_model: &str) -> Vec<&'static str> {
         "universal-3-pro" => vec!["universal-3-pro", "universal-2"],
         _ => vec!["universal-2", "universal-3-pro"],
     }
+}
+
+// 本地 ASR 伺服器轉錄（OpenAI 相容 multipart 端點）
+pub async fn transcribe_voxnote_asr(
+    base_url: &str,
+    file_path: &str,
+    language: &str,
+    speaker_detection: bool,
+    // 預期講者人數，取自會議與會人員數；0 代表未知，交由 pyannote 自動偵測
+    speakers_expected: u32,
+    progress_cb: impl Fn(String),
+) -> Result<String> {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.is_empty() {
+        return Err(anyhow!("本地 ASR 伺服器位址未設定"));
+    }
+
+    let file_bytes = std::fs::read(file_path).map_err(|e| anyhow!("無法讀取音訊檔案：{}", e))?;
+    let file_name = std::path::Path::new(file_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("audio.wav")
+        .to_string();
+    let file_part = reqwest::multipart::Part::bytes(file_bytes).file_name(file_name);
+    let mut form = reqwest::multipart::Form::new().part("file", file_part);
+    if !language.is_empty() && language != "auto" {
+        form = form.text("language", language.to_string());
+    }
+    form = form.text("diarize", speaker_detection.to_string());
+    // 已知確切人數時以 min=max 鎖定，提升 pyannote 分離準確度
+    if speaker_detection && speakers_expected > 0 {
+        let expected = speakers_expected.to_string();
+        form = form
+            .text("min_speakers", expected.clone())
+            .text("max_speakers", expected);
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(tokio::time::Duration::from_secs(LOCAL_ASR_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| anyhow!("無法建立本地 ASR 連線：{}", e))?;
+    let url = format!("{}/v1/audio/transcriptions", base_url);
+
+    progress_cb("上傳音訊中...".into());
+    progress_cb("轉錄中...".into());
+    let response = client
+        .post(&url)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                anyhow!("本地 ASR 伺服器連線逾時")
+            } else if e.is_connect() {
+                anyhow!("無法連線至本地 ASR 伺服器：{}", e)
+            } else {
+                anyhow!("本地 ASR 伺服器請求失敗：{}", e)
+            }
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        return Err(anyhow!("本地 ASR 伺服器回傳錯誤（{}）：{}", status, detail));
+    }
+
+    let result: LocalServerTranscription = response
+        .json()
+        .await
+        .map_err(|e| anyhow!("無法解析本地 ASR 伺服器回應：{}", e))?;
+    progress_cb("轉錄完成".into());
+
+    if speaker_detection && !result.segments.is_empty() {
+        let lines: Vec<String> = result
+            .segments
+            .iter()
+            .map(|segment| {
+                let start_seconds = segment.start.max(0.0) as u64;
+                let mm = start_seconds / 60;
+                let ss = start_seconds % 60;
+                // 僅在服務端實際提供語者標籤時加上講者標記，避免產生誤導性的「講者?」
+                match segment.speaker.as_deref() {
+                    Some(speaker) if !speaker.is_empty() => {
+                        format!("[{:02}:{:02} 講者{}] {}", mm, ss, speaker, segment.text)
+                    }
+                    _ => format!("[{:02}:{:02}] {}", mm, ss, segment.text),
+                }
+            })
+            .collect();
+        return Ok(lines.join("\n"));
+    }
+
+    if result.text.trim().is_empty() {
+        return Err(anyhow!("本地 ASR 伺服器未回傳逐字稿"));
+    }
+    Ok(result.text)
 }
 
 // 本地 Whisper CLI 轉錄

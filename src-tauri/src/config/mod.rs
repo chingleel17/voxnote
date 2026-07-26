@@ -5,7 +5,7 @@ use tauri::AppHandle;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)] // 舊版 config.toml 缺少新欄位時，自動填入 Default 值
 pub struct AppConfig {
-    // ASR 供應商："assemblyai" | "local"
+    // ASR 供應商："assemblyai" | "local" | "voxnote_asr"
     pub asr_provider: String,
     pub assembly_ai_key: String,
     pub assembly_ai_speech_model: String, // "universal-2" | "universal-3-pro"
@@ -15,8 +15,9 @@ pub struct AppConfig {
     pub recording_microphone_device_id: String,
     pub recording_system_device_id: String,
     pub local_asr_model: String, // "tiny" | "base" | "small" | "medium" | "large"
-    pub asr_language: String,    // "zh" | "en" | "auto"
-    pub speaker_detection: bool, // 是否啟用說話人偵測
+    pub local_asr_base_url: String,
+    pub asr_language: String,                     // "zh" | "en" | "auto"
+    pub speaker_detection: bool,                  // 是否啟用說話人偵測
     pub auto_proofread_after_transcription: bool, // 逐段轉譯完成後自動 AI 校稿
 
     // LLM 供應商："openai" | "claude" | "gemini" | "openrouter" | "ollama" | "custom"
@@ -56,6 +57,7 @@ impl Default for AppConfig {
             recording_microphone_device_id: String::new(),
             recording_system_device_id: String::new(),
             local_asr_model: "base".into(),
+            local_asr_base_url: String::new(),
             asr_language: "zh".into(),
             speaker_detection: true,
             auto_proofread_after_transcription: false,

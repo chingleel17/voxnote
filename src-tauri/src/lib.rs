@@ -80,6 +80,7 @@ pub fn run() {
             get_settings,
             save_settings,
             test_ollama_connection,
+            test_local_asr_connection,
             get_ollama_models,
             test_llm_connection_cmd,
             // ai

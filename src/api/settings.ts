@@ -11,6 +11,8 @@ export const getSettings = () => invoke<AppConfig>('get_settings');
 export const saveSettings = (config: AppConfig) => invoke<void>('save_settings', { config });
 export const testLlmConnection = () => invoke<string>('test_llm_connection_cmd');
 export const testOllamaConnection = (endpoint: string) => invoke<boolean>('test_ollama_connection', { endpoint });
+export const testLocalAsrConnection = (baseUrl: string) =>
+  invoke<boolean>('test_local_asr_connection', { baseUrl });
 export const getOllamaModels = (endpoint: string) => invoke<string[]>('get_ollama_models', { endpoint });
 export const detectLocalAsrTools = () => invoke<LocalAsrInfo[]>('detect_local_asr_tools');
 export const startTranscription = (meetingId: string, recordingId: string, filePath: string) =>
