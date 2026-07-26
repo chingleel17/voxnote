@@ -2,10 +2,12 @@
 name = "voxnote-local-asr"
 version = "0.1.0"
 description = "VoxNote 本地 Breeze-ASR-26 + WhisperX 語音轉錄服務"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.11,<3.13"
 
-# 注意：WhisperX / CTranslate2 / pyannote 對 Python 3.13 支援尚不完整，
-# 故限定 <3.13。請以 uv 建立隔離環境，勿安裝至全域 Python：
+# 注意：下限為 3.11、上限 <3.13，原因：
+# - onnxruntime（pyannote 間接相依）僅提供 cp311/cp312 wheel，不支援 3.10
+# - WhisperX / CTranslate2 / pyannote 對 Python 3.13 支援尚不完整
+# 請以 uv 建立隔離環境，勿安裝至全域 Python：
 #   cd server
 #   uv sync
 #   uv run uvicorn app:app --host 0.0.0.0 --port 8000

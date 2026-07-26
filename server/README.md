@@ -47,7 +47,7 @@ API、Docker 與部署契約已完成；`app.py` 的 Breeze-ASR-26 載入、Whis
 
 ## 不使用 Docker 的本機開發（uv）
 
-本服務以 [uv](https://docs.astral.sh/uv/) 管理 Python 環境，請勿將相依安裝至全域 Python。WhisperX / CTranslate2 / pyannote 對 Python 3.13 支援尚不完整，`pyproject.toml` 已限定 `>=3.10,<3.13`。
+本服務以 [uv](https://docs.astral.sh/uv/) 管理 Python 環境，請勿將相依安裝至全域 Python。`pyproject.toml` 已限定 `>=3.11,<3.13`：onnxruntime（pyannote 間接相依）不支援 3.10，WhisperX / CTranslate2 / pyannote 對 3.13 支援則尚不完整。若本機 Python 版本不符，執行 `uv sync` 時 uv 會自動下載 3.11。
 
 ```bash
 cd server
