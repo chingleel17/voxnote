@@ -26,7 +26,19 @@ API、Docker 與部署契約已完成；`app.py` 的 Breeze-ASR-26 載入、Whis
   此檔含機密，已由 `.gitignore` 排除，切勿提交版控。若暫不啟用語者分離，可略過此步。
 
 - [ ] **3. 準備 ASR 模型**
-  預設使用 Breeze-ASR-26（台灣用語最佳）：下載或轉換其 CTranslate2 權重，放到 `server/models/asr-model`（此目錄已由 `.gitignore` 排除）。若想改用其他模型，設定 `ASR_MODEL` 環境變數即可（詳見下方「選擇 ASR 模型」）；使用 WhisperX 內建代號（如 `large-v3`）時可略過本步驟，模型會自動下載。
+  預設使用 Breeze-ASR-26（台灣用語最佳）。它以 safetensors 發布，須先轉為 CTranslate2 格式才能被 faster-whisper 載入。以下指令會自動下載（約 6 GB）並轉檔至 `server/models/asr-model`（此目錄已由 `.gitignore` 排除）：
+
+  ```bash
+  cd server
+  uv run ct2-transformers-converter --model MediaTek-Research/Breeze-ASR-26 --output_dir models/asr-model --quantization float16 --copy_files tokenizer_config.json preprocessor_config.json vocab.json merges.txt added_tokens.json special_tokens_map.json normalizer.json generation_config.json
+  ```
+
+  三點提醒：
+  - **`--copy_files` 清單勿照抄網路範例**。多數教學寫 `tokenizer.json`，但 Breeze 的 repo 並無此檔（只有 `tokenizer_config.json`），照抄會失敗；上方清單為該 repo 實際存在的檔案。
+  - **量化建議用 `float16`**。CTranslate2 允許存檔精度與執行精度不同：float16 的權重可在執行時以 `ASR_COMPUTE_TYPE=int8` 載入（載入時即時量化），因此同一份權重可同時服務小 VRAM 與大 VRAM 機器；若直接轉成 int8 則無法回復較高精度。
+  - **若輸出目錄已存在會中止**（`docker compose` 可能已為 bind mount 自動建立空目錄）。確認目錄為空後，加上 `--force` 覆寫即可。
+
+  若想改用其他模型，設定 `ASR_MODEL` 環境變數即可（詳見下方「選擇 ASR 模型」）；使用 WhisperX 內建代號（如 `large-v3`）時可略過本步驟，模型會自動下載，無須轉檔。
 
 - [ ] **4. 啟動服務**
   ```bash

@@ -48,7 +48,7 @@ Breeze 主要輸出繁體，但為保險，服務端於回傳前套用 OpenCC（
 
 ## Risks / Trade-offs
 
-- **Breeze 權重轉 CTranslate2 相容性未經實測** → 先在部署機器用小段音訊驗證 Breeze→CTranslate2→faster-whisper 可正常載入推論；若不相容，改用 HuggingFace pipeline 後端（WhisperX 支援）或回退決策 1 的 MOSS-TD。
+- ~~**Breeze 權重轉 CTranslate2 相容性未經實測**~~ → **已解除**：`ct2-transformers-converter` 轉 float16 成功（`model.bin` 2.9 GB），faster-whisper 可正常載入。HF pipeline 後端與回退 MOSS-TD 兩個 fallback 均無須執行。
 - **pyannote 3.1 需 HuggingFace 授權同意** → 維運端一次性以 HF 帳號同意條款並在容器內配置 token（不進 app、不進 repo）。
 - **語者數未知時分離品質波動** → pyannote 支援 `min_speakers`/`max_speakers` 提示；設定頁可選填預期人數以提升準確度。
 - **部署機器為單點** → 內網服務；app 端需處理伺服器不可達的降級（回退提示使用者改用雲端或本地 Whisper），不阻斷整體流程。
@@ -65,7 +65,7 @@ Breeze 主要輸出繁體，但為保險，服務端於回傳前套用 OpenCC（
 
 ## Open Questions
 
-- Breeze-ASR-26 轉 CTranslate2 後精度損失是否可接受？（需實機實測）
+- Breeze-ASR-26 轉 CTranslate2 後精度損失是否可接受？（轉檔與載入已驗證可行；**精度品質仍待以實際會議錄音比對**）
 - 服務端是否需要簡易 API key 保護，即使在內網？（預設不做，視組織資安政策）
 
 ## Resolved Decisions（已定案）
