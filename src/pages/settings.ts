@@ -156,7 +156,6 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
       assembly_ai_speech_model: updated.assembly_ai_speech_model,
       local_asr_model: updated.local_asr_model,
       local_asr_base_url: updated.local_asr_base_url,
-      local_asr_speaker_hint: updated.local_asr_speaker_hint,
       asr_language: updated.asr_language,
       speaker_detection: updated.speaker_detection,
       auto_proofread_after_transcription: updated.auto_proofread_after_transcription,
@@ -365,27 +364,6 @@ function buildAsrSection(
   endpointGroup.append(endpointLabel, endpointRow);
   localServerSection.appendChild(endpointGroup);
 
-  const speakerHintGroup = document.createElement('div');
-  speakerHintGroup.className = 'form-group';
-  const speakerHintLabel = document.createElement('label');
-  speakerHintLabel.textContent = '預期人數（選填）';
-  const speakerHintInput = document.createElement('input');
-  speakerHintInput.type = 'number';
-  speakerHintInput.className = 'form-control';
-  speakerHintInput.min = '0';
-  speakerHintInput.step = '1';
-  speakerHintInput.value = config.local_asr_speaker_hint > 0 ? String(config.local_asr_speaker_hint) : '';
-  speakerHintInput.placeholder = '留空代表自動偵測';
-  speakerHintInput.addEventListener('input', () => {
-    const value = Math.max(0, Math.floor(Number(speakerHintInput.value) || 0));
-    config = { ...config, local_asr_speaker_hint: value };
-    onChange(config);
-  });
-  const speakerHintHelp = document.createElement('small');
-  speakerHintHelp.className = 'form-hint';
-  speakerHintHelp.textContent = '填入後會作為語者分離的人數提示；留空時自動偵測。';
-  speakerHintGroup.append(speakerHintLabel, speakerHintInput, speakerHintHelp);
-  localServerSection.appendChild(speakerHintGroup);
   section.appendChild(localServerSection);
 
   // 偵測邏輯
@@ -453,7 +431,7 @@ function buildAsrSection(
   speakerToggle.appendChild(speakerSlider);
   const speakerHint = document.createElement('small');
   speakerHint.className = 'form-hint';
-  speakerHint.textContent = 'AssemblyAI 與本地伺服器啟用後，逐字稿將包含時間軸與講者標籤。';
+  speakerHint.textContent = 'AssemblyAI 與本地伺服器啟用後，逐字稿將包含時間軸與講者標籤；預期人數會自動取自會議的與會人員。';
   speakerGroup.appendChild(speakerLabel);
   speakerGroup.appendChild(speakerToggle);
   speakerGroup.appendChild(speakerHint);

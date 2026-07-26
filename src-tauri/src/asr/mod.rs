@@ -68,6 +68,8 @@ pub async fn transcribe_assemblyai(
     language: &str,
     speech_model: &str,
     speaker_detection: bool,
+    // 預期講者人數，取自會議與會人員數；0 代表未知，不帶入 API
+    speakers_expected: u32,
     progress_cb: impl Fn(String),
 ) -> Result<String> {
     if api_key.is_empty() {
@@ -109,6 +111,11 @@ pub async fn transcribe_assemblyai(
     }
     if speaker_detection {
         req_body["speaker_labels"] = json!(true);
+        // 已知確切人數時帶入，可提升語者分離準確度；AssemblyAI 支援 1 至 20 人
+        // 註：音檔短於 2 分鐘時此參數會被 AssemblyAI 忽略
+        if (1..=20).contains(&speakers_expected) {
+            req_body["speakers_expected"] = json!(speakers_expected);
+        }
     }
 
     let task_resp = client
@@ -195,7 +202,8 @@ pub async fn transcribe_voxnote_asr(
     file_path: &str,
     language: &str,
     speaker_detection: bool,
-    speaker_hint: u32,
+    // 預期講者人數，取自會議與會人員數；0 代表未知，交由 pyannote 自動偵測
+    speakers_expected: u32,
     progress_cb: impl Fn(String),
 ) -> Result<String> {
     let base_url = base_url.trim().trim_end_matches('/');
@@ -215,11 +223,12 @@ pub async fn transcribe_voxnote_asr(
         form = form.text("language", language.to_string());
     }
     form = form.text("diarize", speaker_detection.to_string());
-    if speaker_detection && speaker_hint > 0 {
-        let hint = speaker_hint.to_string();
+    // 已知確切人數時以 min=max 鎖定，提升 pyannote 分離準確度
+    if speaker_detection && speakers_expected > 0 {
+        let expected = speakers_expected.to_string();
         form = form
-            .text("min_speakers", hint.clone())
-            .text("max_speakers", hint);
+            .text("min_speakers", expected.clone())
+            .text("max_speakers", expected);
     }
 
     let client = reqwest::Client::builder()

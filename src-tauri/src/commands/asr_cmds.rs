@@ -9,7 +9,7 @@ use crate::{
     backup::DataOperationLock,
     commands::ai_cmds::proofread_recording_segment_with_config,
     config::load_config,
-    db::{recording, transcript},
+    db::{meeting, recording, transcript},
 };
 
 fn emit_asr_progress(app: &AppHandle, meeting_id: &str, message: &str) {
@@ -37,6 +37,14 @@ pub async fn start_transcription(
     let _guard = data_lock.try_begin_write()?;
     let config = load_config(&app).map_err(|e| e.to_string())?;
 
+    // 預期講者人數取自該會議的與會人員數，可提升語者分離準確度；取不到時以 0 表示未知
+    let speakers_expected = meeting::get_meeting(&pool, &meeting_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|m| m.participants.len() as u32)
+        .unwrap_or(0);
+
     let text = match config.asr_provider.as_str() {
         "assemblyai" => transcribe_assemblyai(
             &config.assembly_ai_key,
@@ -44,6 +52,7 @@ pub async fn start_transcription(
             &config.asr_language,
             &config.assembly_ai_speech_model,
             config.speaker_detection,
+            speakers_expected,
             |msg| emit_asr_progress(&app, &meeting_id, &msg),
         )
         .await
@@ -53,7 +62,7 @@ pub async fn start_transcription(
             &file_path,
             &config.asr_language,
             config.speaker_detection,
-            config.local_asr_speaker_hint,
+            speakers_expected,
             |msg| emit_asr_progress(&app, &meeting_id, &msg),
         )
         .await

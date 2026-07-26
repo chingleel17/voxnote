@@ -16,7 +16,6 @@ pub struct AppConfig {
     pub recording_system_device_id: String,
     pub local_asr_model: String, // "tiny" | "base" | "small" | "medium" | "large"
     pub local_asr_base_url: String,
-    pub local_asr_speaker_hint: u32,              // 0 代表自動偵測
     pub asr_language: String,                     // "zh" | "en" | "auto"
     pub speaker_detection: bool,                  // 是否啟用說話人偵測
     pub auto_proofread_after_transcription: bool, // 逐段轉譯完成後自動 AI 校稿
@@ -59,7 +58,6 @@ impl Default for AppConfig {
             recording_system_device_id: String::new(),
             local_asr_model: "base".into(),
             local_asr_base_url: String::new(),
-            local_asr_speaker_hint: 0,
             asr_language: "zh".into(),
             speaker_detection: true,
             auto_proofread_after_transcription: false,

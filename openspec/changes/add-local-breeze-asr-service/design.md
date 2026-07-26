@@ -72,4 +72,5 @@ Breeze 主要輸出繁體，但為保險，服務端於回傳前套用 OpenCC（
 
 - **PoC 只先跑 Breeze**：第 1 階段集中驗證 Breeze+WhisperX，不並行跑 MOSS-TD。轉 CTranslate2 若失敗，依序回退：HF pipeline 後端 → 最後才考慮 MOSS-TD。避免 PoC 工量加倍。
 - **講者人數採可選填**：設定頁提供選填欄位（空=自動偵測），傳給服務端作為 pyannote 的 min/max_speakers 提示；對應 `local_asr_speaker_hint` 設定欄位（0 代表自動）。
+  - 註：此決策已由後續 change `use-meeting-participants-for-diarization` 取代——人數改為自動取自會議的與會人員數，設定頁欄位已移除。
 - **納入伺服器連線測試按鈕**：設定頁提供「測試連線」按鈕打服務端健康檢查端點；服務端需一併提供健康檢查端點（納入第 2 階段服務端範圍）。
