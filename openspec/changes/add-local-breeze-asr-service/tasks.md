@@ -8,9 +8,9 @@
       faster-whisper 可正常載入（`is_multilingual: True`）
 - [~] 1.3 若 CTranslate2 不相容，改用 WhisperX 的 HuggingFace pipeline 後端載入 Breeze
       —— 不需要：1.2 的 CTranslate2 路線已成功，此 fallback 無須執行
-- [ ] 1.4 以樣本中文會議音訊跑通 WhisperX 全流程（轉錄 + 詞級對齊 + pyannote 語者分離）
+- [x] 1.4 以樣本中文會議音訊跑通 WhisperX 全流程（轉錄 + 詞級對齊 + pyannote 語者分離）
 - [x] 1.5 於 HuggingFace 同意 pyannote 3.1 授權條款並在環境中配置 token（不進 repo）
-- [ ] 1.6 驗證輸出品質：繁中/台灣用語、語者標籤正確性；記錄 RTF 與 VRAM 用量
+- [x] 1.6 驗證輸出品質：繁中/台灣用語、語者標籤正確性；記錄 RTF 與 VRAM 用量
 
 ## 2. 服務端 API 與部署封裝
 
@@ -40,7 +40,7 @@
 
 ## 5. 驗證與交付
 
-- [ ] 5.1 端到端測試：app 選 `voxnote_asr` → 部署服務 → 逐字稿正確回傳並含語者標籤
-- [ ] 5.2 錯誤路徑測試：Base URL 空、伺服器關閉、逾時的降級提示
-- [ ] 5.3 以實際會議錄音對 Breeze+WhisperX 與 AssemblyAI 做 A/B 品質比對並記錄結論
-- [ ] 5.4 更新 README（新增本地伺服器供應商說明與設定步驟）
+- [x] 5.1 端到端測試：app 選 `voxnote_asr` → 部署服務 → 逐字稿正確回傳並含語者標籤
+- [x] 5.2 錯誤路徑測試：Base URL 空、伺服器關閉、逾時的降級提示
+- [x] 5.3 以實際會議錄音對 Breeze+WhisperX 與 AssemblyAI 做 A/B 品質比對並記錄結論
+- [x] 5.4 更新 README（新增本地伺服器供應商說明與設定步驟）
