@@ -18,12 +18,16 @@ API、Docker 與部署契約已完成；`app.py` 的 Breeze-ASR-26 載入、Whis
   能列出 GPU 資訊即代表 `docker-compose.yml` 的 `gpus: all` 可正常生效。
 
 - [ ] **2. 準備 pyannote 授權 token（語者分離所需）**
-  pyannote 3.1 為 gated model，須以 Hugging Face 帳號至模型頁面同意授權條款，取得 access token。將 token 寫入 `server/secrets/hf_token`（單行純文字）：
+  以 Hugging Face 帳號至 [pyannote-community/speaker-diarization-community-1](https://huggingface.co/pyannote-community/speaker-diarization-community-1) 接受使用條款，並於 [設定頁](https://huggingface.co/settings/tokens) 建立 access token。將 token 寫入 `server/secrets/hf_token`（單行純文字）：
   ```bash
   mkdir -p server/secrets
   printf '%s' 'hf_你的_token' > server/secrets/hf_token
   ```
   此檔含機密，已由 `.gitignore` 排除，切勿提交版控。若暫不啟用語者分離，可略過此步。
+
+  兩點注意：
+  - **須確認接受的是 `DIARIZATION_MODEL` 實際指定的那個模型**。WhisperX 內建預設會隨版本變動且指向受限的 `pyannote/` 鏡像，授權與實際載入的模型不符時會得到 HTTP 403 gated repo 錯誤。本服務已明確指定模型以避免此問題。
+  - 若改用舊版 `pyannote/speaker-diarization-3.1`，**須額外接受其相依的 [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) 授權**（兩道授權門）；community-1 僅需一道，且語者計數與指派表現更佳（中文會議語料 AliMeeting DER 24.5% → 20.3%）。
 
 - [ ] **3. 準備 ASR 模型**
   預設使用 Breeze-ASR-26（台灣用語最佳）。它以 safetensors 發布，須先轉為 CTranslate2 格式才能被 faster-whisper 載入。以下指令會自動下載（約 6 GB）並轉檔至 `server/models/asr-model`（此目錄已由 `.gitignore` 排除）：
@@ -87,6 +91,7 @@ torch 的 CUDA 版本請依 NVIDIA 官方索引安裝（對應主機 CUDA 版本
 | `ASR_DEVICE` | 推論裝置 | `cuda` |
 | `ASR_COMPUTE_TYPE` | 運算精度；VRAM 較小建議 `int8`，較充裕可用 `float16` | `int8` |
 | `ASR_BATCH_SIZE` | 批次大小；VRAM 較小時調降 | `8` |
+| `DIARIZATION_MODEL` | 語者分離模型（明確指定，不依賴 WhisperX 會變動的預設值） | `pyannote-community/speaker-diarization-community-1` |
 | `HF_TOKEN` / `HF_TOKEN_FILE` | Hugging Face token（語者分離所需），可直接給值或指向檔案 | 無 |
 | `UPLOAD_DIR` | 上傳音訊暫存目錄 | 系統暫存目錄 |
 

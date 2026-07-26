@@ -1,5 +1,6 @@
 """VoxNote 本地 Breeze ASR 服務。"""
 
+import logging
 import os
 import tempfile
 import uuid
@@ -10,6 +11,9 @@ from typing import Annotated, Any
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from opencc import OpenCC
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("voxnote.asr")
 
 app = FastAPI(title="VoxNote Local ASR", version="0.1.0")
 opencc = OpenCC("s2twp")
@@ -59,6 +63,14 @@ class WhisperXTranscriber:
             or os.getenv("BREEZE_MODEL_DIR")
             or "MediaTek-Research/Breeze-ASR-26"
         )
+        # 語者分離模型。採 community-1：語者計數與指派優於 3.1，於中文會議語料
+        # （AliMeeting、AISHELL-4）改善尤為明顯，且僅需接受單一授權；3.1 另需
+        # 額外接受相依的 pyannote/segmentation-3.0 授權。
+        # 組織名為 pyannote-community；WhisperX 內建預設指向受限的 pyannote/ 鏡像，
+        # 故明確指定以免 403。
+        self._diarization_model = os.getenv(
+            "DIARIZATION_MODEL", "pyannote-community/speaker-diarization-community-1"
+        )
         self._device = os.getenv("ASR_DEVICE", "cuda")
         # VRAM 較小建議 int8 或 int8_float16；較充裕可用 float16
         self._compute_type = os.getenv("ASR_COMPUTE_TYPE", "int8")
@@ -91,15 +103,17 @@ class WhisperXTranscriber:
     def _ensure_diarize_pipeline(self) -> Any:
         """惰性載入 pyannote 3.1 語者分離 pipeline（需 HF token 同意授權）。"""
         if self._diarize_pipeline is None:
-            import whisperx
+            # DiarizationPipeline 僅存在於 whisperx.diarize 子模組，未於頂層匯出
+            from whisperx.diarize import DiarizationPipeline
 
             hf_token = read_hf_token()
             if not hf_token:
                 raise RuntimeError(
-                    "啟用語者分離需要 Hugging Face token，"
-                    "請設定 HF_TOKEN 或 HF_TOKEN_FILE，並先於 HF 網站同意 pyannote 授權條款"
+                    "啟用語者分離需要 Hugging Face token：請設定 HF_TOKEN 或 "
+                    f"HF_TOKEN_FILE，並先於 HF 網站同意 {self._diarization_model} 的授權條款"
                 )
-            self._diarize_pipeline = whisperx.DiarizationPipeline(
+            self._diarize_pipeline = DiarizationPipeline(
+                model_name=self._diarization_model,
                 token=hf_token,
                 device=self._device,
             )
@@ -147,8 +161,15 @@ class WhisperXTranscriber:
                 return_char_alignments=False,
             )
         except Exception:
-            # 對齊失敗不應中斷整體轉錄，退回未對齊的分段結果
-            pass
+            # 對齊失敗不應中斷整體轉錄，退回未對齊的分段結果；但須留下記錄，
+            # 因為缺少詞級時間戳會使後續語者分離無法正確指派
+            logger.warning("詞級對齊失敗，將以未對齊的分段結果繼續", exc_info=True)
+            aligned = False
+        else:
+            aligned = True
+
+        if diarize and not aligned:
+            logger.warning("詞級對齊未完成，語者分離結果可能不完整")
 
         # 3. 可選的語者分離
         if diarize:
@@ -256,8 +277,12 @@ async def create_transcription(
             max_speakers,
         )
     except RuntimeError as error:
+        # 設定或環境問題（模型載入失敗、缺少 token 等），記錄後回報 503
+        logger.error("轉錄前置條件不符：%s", error, exc_info=True)
         raise HTTPException(status_code=503, detail=str(error)) from error
     except Exception as error:
+        # 未預期錯誤須記錄完整 traceback，否則僅憑 HTTP 回應無法診斷
+        logger.exception("轉錄失敗")
         raise HTTPException(status_code=500, detail=f"轉錄失敗：{error}") from error
     finally:
         await file.close()
