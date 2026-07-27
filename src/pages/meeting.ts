@@ -1,4 +1,4 @@
-import type { MeetingWithDetails, Transcript, Summary, Recording, SavedParticipant, CreateTemplateRequest, Tag, SpeakerMapping, Category } from '../types';
+import type { MeetingWithDetails, Transcript, Summary, Recording, SavedParticipant, CreateTemplateRequest, Tag, SpeakerMapping, Category, ExportTextFile } from '../types';
 import { getMeeting, getCategories, updateMeeting, archiveMeeting, unarchiveMeeting } from '../api/meetings';
 import { exportTextFileToPath, getTranscript, saveTranscriptManual, saveTranscriptProofread, switchTranscriptVersion } from '../api/transcripts';
 import { getSummary } from '../api/summaries';
@@ -12,12 +12,26 @@ import { openModal } from '../components/modal';
 import { showToast } from '../components/toast';
 import { createWaveformPlayer } from '../components/audioPlayer';
 import { buildParticipantEditor } from '../components/participantEditor';
-import { save as saveDialog } from '@tauri-apps/plugin-dialog';
+import { save as saveDialog, open as openDialog } from '@tauri-apps/plugin-dialog';
+import { exportMeetingBundle } from '../api/meetingExport';
 import { isProcessing, startProcessing, finishProcessing, onProcessingComplete } from '../utils/processingState';
 import { notifyCompletion } from '../utils/notifications';
 
 type TranscriptVersion = 'original' | 'proofread' | 'manual';
 type ManualBaseVersion = 'original' | 'proofread';
+
+interface TranscriptExportContent {
+  fileName: string;
+  content: string;
+  version: TranscriptVersion;
+}
+
+interface TranscriptSectionResult {
+  el: HTMLElement;
+  refreshMappings: (newMappings: SpeakerMapping[]) => void;
+  /// 供整包匯出取得當下顯示版本的逐字稿；無逐字稿時回傳 null
+  getExportContent: () => TranscriptExportContent | null;
+}
 
 const transcriptUtteranceRe = /^\[(\d+:\d{2})(?:\s+([^\]]+))?\]\s+(.*)$/;
 const MERGED_BREAK_SEPARATOR = '\n\n--- ☕ 中場休息 ---\n\n';
@@ -366,6 +380,47 @@ function buildSummaryExportFileName(meetingTitle: string, meetingDate: string): 
   const safeTitle = sanitizeFileNamePart(meetingTitle) || '未命名會議';
   const safeDate = formatExportDate(meetingDate);
   return `${safeTitle}_${safeDate}_摘要.md`;
+}
+
+const EXPORT_FOLDER_TITLE_MAX_LENGTH = 80;
+
+/// 匯出子資料夾名稱：YYYYMMDD_會議名稱
+function buildExportFolderName(
+  meetingTitle: string,
+  meetingDate: string | null,
+  createdAt: string,
+): string {
+  // formatExportDate 無法解析時回傳「未指定日期」而非退回 createdAt，故先在此判斷可解析性
+  const hasUsableDate = Boolean(meetingDate) && !Number.isNaN(new Date(meetingDate as string).getTime());
+  const safeDate = formatExportDate(hasUsableDate ? (meetingDate as string) : createdAt);
+  const safeTitle = (sanitizeFileNamePart(meetingTitle) || '未命名會議')
+    .slice(0, EXPORT_FOLDER_TITLE_MAX_LENGTH)
+    .trim();
+  return `${safeDate}_${safeTitle}`;
+}
+
+function buildMeetingInfoContent(
+  meeting: MeetingWithDetails,
+  recordings: Recording[],
+  transcriptVersion: TranscriptVersion | null,
+  hasSummary: boolean,
+  exportedAt: Date,
+): string {
+  const participants = meeting.participants.length ? meeting.participants.join('、') : '（未指定）';
+  const tags = meeting.tags.length ? meeting.tags.map((tag) => tag.name).join('、') : '（無）';
+  return [
+    `# ${meeting.title.trim() || '未命名會議'}`,
+    '',
+    `- 會議日期：${meeting.meeting_date ? formatMeetingDisplayDate(meeting.meeting_date) : '（未指定）'}`,
+    `- 分類：${meeting.category_name || '（未分類）'}`,
+    `- 與會者：${participants}`,
+    `- 標籤：${tags}`,
+    `- 錄音段數：${recordings.length}`,
+    `- 逐字稿版本：${transcriptVersion ? getTranscriptVersionLabel(transcriptVersion) : '無'}`,
+    `- 會議摘要：${hasSummary ? '有' : '無'}`,
+    `- 匯出時間：${exportedAt.toLocaleString('zh-TW')}`,
+    '',
+  ].join('\n');
 }
 
 function buildTranscriptMarkdownContent(
@@ -760,7 +815,7 @@ function buildTranscriptSection(
   onSpeakerMappingChanged: (recordingId: string, speakerLabel: string, participantName: string | null) => Promise<void>,
   onSaveManualTranscript: (content: string, baseVersion: ManualBaseVersion) => Promise<Transcript>,
   onRefresh: () => void,
-): { el: HTMLElement; refreshMappings: (newMappings: SpeakerMapping[]) => void } {
+): TranscriptSectionResult {
   const proofreadKey = `proofread:${meetingId}`;
   const section = document.createElement('section');
   section.className = 'detail-section';
@@ -777,7 +832,7 @@ function buildTranscriptSection(
     empty.className = 'empty-hint';
     empty.textContent = '尚無逐字稿，請在上方錄音區塊點擊「產生逐字稿」。';
     section.appendChild(empty);
-    return { el: section, refreshMappings: () => {} };
+    return { el: section, refreshMappings: () => {}, getExportContent: () => null };
   }
 
   const loadedTranscript = transcript;
@@ -1450,7 +1505,24 @@ function buildTranscriptSection(
     showVersion(currentVersion);
   }
 
-  return { el: section, refreshMappings };
+  // 以閉包讀取當下的顯示版本與講者對照，確保匯出內容與畫面一致
+  function getExportContent(): TranscriptExportContent | null {
+    const text = getTranscriptDisplayText(loadedTranscript, recordings, currentVersion, localMappings);
+    return {
+      fileName: buildTranscriptExportFileName(meetingTitle, meetingDate, 'md'),
+      content: buildTranscriptMarkdownContent(
+        meetingTitle,
+        meetingDate,
+        currentVersion,
+        text,
+        recordings,
+        localMappings,
+      ),
+      version: currentVersion,
+    };
+  }
+
+  return { el: section, refreshMappings, getExportContent };
 }
 
 function buildSummarySection(
@@ -1858,7 +1930,7 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
   let allTags: Tag[] = [];
   let speakerMappings: SpeakerMapping[] = [];
   let isRecordingListCollapsed = false;
-  let currentTranscriptSection: { el: HTMLElement; refreshMappings: (m: SpeakerMapping[]) => void } | null = null;
+  let currentTranscriptSection: TranscriptSectionResult | null = null;
 
   try {
     [meeting, categories, transcript, summary, recordings, savedParticipants, allTags, speakerMappings] = await Promise.all([
@@ -1920,6 +1992,12 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
     printBtn.textContent = '匯出 PDF';
     printBtn.addEventListener('click', () => window.print());
 
+    const bundleExportBtn = document.createElement('button');
+    bundleExportBtn.className = 'btn btn-secondary btn-sm';
+    bundleExportBtn.textContent = '匯出整包';
+    bundleExportBtn.title = '將音訊、逐字稿與摘要匯出至指定資料夾';
+    bundleExportBtn.addEventListener('click', () => runBundleExport(bundleExportBtn));
+
     const saveAsTplBtn = document.createElement('button');
     saveAsTplBtn.className = 'btn btn-ghost btn-sm';
     saveAsTplBtn.textContent = '儲存為範本';
@@ -1947,6 +2025,7 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
     topBar.appendChild(editBtn);
     topBar.appendChild(saveAsTplBtn);
     topBar.appendChild(archiveBtn);
+    topBar.appendChild(bundleExportBtn);
     topBar.appendChild(printBtn);
     container.appendChild(topBar);
 
@@ -2160,6 +2239,105 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
       } catch { /* ignore */ }
       build();
     }));
+  }
+
+  function confirmOverwrite(folderName: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      let confirmed = false;
+      openModal({
+        title: '資料夾已存在',
+        content: `「${folderName}」已存在於所選資料夾中。繼續匯出會覆寫其中的同名檔案，其餘檔案保留不動。`,
+        confirmText: '覆寫',
+        cancelText: '取消',
+        onConfirm: () => {
+          confirmed = true;
+        },
+        onCancel: () => resolve(false),
+      });
+      // modal 關閉後才回報結果，避免確認與取消時序交錯
+      const observer = new MutationObserver(() => {
+        if (!document.querySelector('.modal-overlay')) {
+          observer.disconnect();
+          resolve(confirmed);
+        }
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+    });
+  }
+
+  async function runBundleExport(button: HTMLButtonElement): Promise<void> {
+    if (!meeting) return;
+
+    const transcriptExport = currentTranscriptSection?.getExportContent() ?? null;
+    const hasRecordingFile = recordings.some((recording) => recording.file_path);
+    if (!hasRecordingFile && !transcriptExport && !summary) {
+      showToast('這場會議尚無可匯出的內容', 'info');
+      return;
+    }
+
+    const parentDir = await openDialog({ directory: true, title: '選擇匯出的目標資料夾' });
+    if (typeof parentDir !== 'string') {
+      return;
+    }
+
+    const folderName = buildExportFolderName(meeting.title, meeting.meeting_date, meeting.created_at);
+    const textFiles: ExportTextFile[] = [];
+
+    if (transcriptExport) {
+      textFiles.push({ fileName: transcriptExport.fileName, content: transcriptExport.content });
+    }
+
+    if (summary) {
+      textFiles.push({
+        fileName: buildSummaryExportFileName(meeting.title, meeting.meeting_date ?? meeting.created_at),
+        content: summary.content,
+      });
+    }
+
+    textFiles.push({
+      fileName: 'meeting-info.md',
+      content: buildMeetingInfoContent(
+        meeting,
+        recordings,
+        transcriptExport?.version ?? null,
+        Boolean(summary),
+        new Date(),
+      ),
+    });
+
+    const originalLabel = button.textContent;
+    button.disabled = true;
+    button.textContent = '匯出中…';
+
+    try {
+      let result = await exportMeetingBundle(meetingId, parentDir, folderName, textFiles, false);
+
+      if (result.alreadyExists) {
+        // 等待使用者決定期間不應停留在「匯出中…」
+        button.textContent = originalLabel;
+        const shouldOverwrite = await confirmOverwrite(folderName);
+        button.textContent = '匯出中…';
+        if (!shouldOverwrite) {
+          return;
+        }
+        result = await exportMeetingBundle(meetingId, parentDir, folderName, textFiles, true);
+      }
+
+      if (result.skipped.length) {
+        showToast(
+          `匯出完成（${result.written} 個檔案）至「${folderName}」，但有項目被跳過：${result.skipped.join('；')}`,
+          'warning',
+          6000,
+        );
+      } else {
+        showToast(`匯出完成：${result.written} 個檔案已寫入「${folderName}」`, 'success', 4000);
+      }
+    } catch (err) {
+      showToast(`匯出失敗：${String(err)}`, 'error', 5000);
+    } finally {
+      button.disabled = false;
+      button.textContent = originalLabel;
+    }
   }
 
   function openEditModal(): void {

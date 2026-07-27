@@ -197,6 +197,18 @@ export interface Tag {
   created_at: string;
 }
 
+export interface ExportTextFile {
+  fileName: string;
+  content: string;
+}
+
+export interface MeetingExportResult {
+  outputPath: string | null;
+  written: number;
+  skipped: string[];
+  alreadyExists: boolean;
+}
+
 export type BackupImportMode = 'merge' | 'overwrite';
 
 export interface BackupResult {

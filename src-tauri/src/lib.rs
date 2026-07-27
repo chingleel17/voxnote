@@ -9,8 +9,9 @@ mod config;
 mod db;
 
 use commands::{
-    ai_cmds::*, asr_cmds::*, backup_cmds::*, meeting_cmds::*, recording_cmds::*, settings_cmds::*,
-    speaker_mapping_cmds::*, summary_cmds::*, tag_cmds::*, template_cmds::*, transcript_cmds::*,
+    ai_cmds::*, asr_cmds::*, backup_cmds::*, meeting_cmds::*, meeting_export_cmds::*,
+    recording_cmds::*, settings_cmds::*, speaker_mapping_cmds::*, summary_cmds::*, tag_cmds::*,
+    template_cmds::*, transcript_cmds::*,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -46,6 +47,8 @@ pub fn run() {
             create_category,
             update_category,
             delete_category,
+            // meeting export
+            export_meeting_bundle,
             // transcript
             get_transcript,
             save_transcript_original,
