@@ -2,6 +2,7 @@ pub mod ai_cmds;
 pub mod asr_cmds;
 pub mod backup_cmds;
 pub mod meeting_cmds;
+pub mod meeting_export_cmds;
 pub mod recording_cmds;
 pub mod settings_cmds;
 pub mod speaker_mapping_cmds;
