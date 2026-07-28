@@ -84,7 +84,11 @@ pub async fn export_meeting_bundle(
             continue;
         }
 
-        let target_name = format!("{:02}_{}", index + 1, build_audio_file_name(recording, source));
+        let target_name = format!(
+            "{:02}_{}",
+            index + 1,
+            build_audio_file_name(recording.original_file_name.as_deref(), source)
+        );
         match std::fs::copy(source, target_dir.join(&target_name)) {
             Ok(_) => written += 1,
             Err(error) => {
@@ -119,12 +123,18 @@ const DEFAULT_AUDIO_STEM: &str = "recording";
 /// 檔名主體取自 original_file_name（使用者匯入時的原始命名），副檔名一律沿用磁碟上的來源檔。
 /// 兩者必須分開取：commit_temporary_recording 固定以 .wav 落檔，而 original_file_name
 /// 可能為 null 或帶著匯入前的副檔名，直接沿用會產生無法播放的檔名。
-fn build_audio_file_name(recording: &crate::db::models::Recording, source: &Path) -> String {
-    let stem = recording
-        .original_file_name
-        .as_deref()
-        .map(|name| Path::new(name).file_stem().unwrap_or_default().to_string_lossy().to_string())
-        .map(|stem| sanitize_file_name(&stem))
+fn build_audio_file_name(original_file_name: Option<&str>, source: &Path) -> String {
+    let stem = original_file_name
+        // 先清洗再取 stem：original_file_name 是使用者匯入時的檔名，
+        // 其中的 '/' 會被 Path::file_stem() 當成路徑分隔符而丟棄前半段
+        .map(|name| sanitize_file_name(name))
+        .map(|name| {
+            Path::new(&name)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        })
         .filter(|stem| !stem.is_empty())
         .or_else(|| {
             source
@@ -137,6 +147,75 @@ fn build_audio_file_name(recording: &crate::db::models::Recording, source: &Path
     match source.extension().map(|ext| sanitize_file_name(&ext.to_string_lossy())) {
         Some(extension) if !extension.is_empty() => format!("{}.{}", stem, extension),
         _ => stem,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 匯入檔案沿用原始命名主體與磁碟副檔名() {
+        let name = build_audio_file_name(
+            Some("會議錄音 10.m4a"),
+            Path::new(r"C:\data\recordings\abc_1778490519228.m4a"),
+        );
+        assert_eq!(name, "會議錄音 10.m4a");
+    }
+
+    #[test]
+    fn 副檔名分歧時以磁碟來源檔為準() {
+        // original_file_name 帶著匯入前的副檔名，但實際落檔為 .wav
+        let name = build_audio_file_name(
+            Some("錄音.m4a"),
+            Path::new(r"C:\data\recordings\abc_123.wav"),
+        );
+        assert_eq!(name, "錄音.wav");
+    }
+
+    #[test]
+    fn 桌面錄音無原始檔名時退回磁碟檔名() {
+        // commit_temporary_recording 路徑：original_file_name 為 None
+        let name = build_audio_file_name(None, Path::new(r"C:\data\recordings\abc_1778490519228.wav"));
+        assert_eq!(name, "abc_1778490519228.wav");
+    }
+
+    #[test]
+    fn 原始檔名無副檔名時仍補上磁碟副檔名() {
+        let name = build_audio_file_name(Some("我的錄音"), Path::new(r"C:\data\rec.m4a"));
+        assert_eq!(name, "我的錄音.m4a");
+    }
+
+    #[test]
+    fn 原始檔名含非法字元時被清洗() {
+        let name = build_audio_file_name(Some("Q3/Q4 檢討?.mp3"), Path::new(r"C:\data\rec.mp3"));
+        assert_eq!(name, "Q3_Q4 檢討_.mp3");
+    }
+
+    #[test]
+    fn 原始檔名為空白時退回磁碟檔名() {
+        let name = build_audio_file_name(Some("   "), Path::new(r"C:\data\rec_9.m4a"));
+        assert_eq!(name, "rec_9.m4a");
+    }
+
+    #[test]
+    fn 兩者皆無可用檔名時使用預設值() {
+        // 來源路徑取不出任何檔名主體時才會用到預設值
+        let name = build_audio_file_name(None, Path::new(".."));
+        assert_eq!(name, DEFAULT_AUDIO_STEM);
+    }
+
+    #[test]
+    fn 檔名清洗移除路徑分隔符避免寫出至目標目錄之外() {
+        // 分隔符替換為底線後，開頭的點被 trim_matches 移除，無法向上層跳脫
+        let cleaned = sanitize_file_name(r"..\..\etc\passwd");
+        assert_eq!(cleaned, "_.._etc_passwd");
+        assert!(!cleaned.contains('\\') && !cleaned.contains('/'));
+        assert!(!Path::new(&cleaned).components().any(|c| matches!(c, std::path::Component::ParentDir)));
+
+        assert_eq!(sanitize_file_name("a/b"), "a_b");
+        // 全形冒號不屬於 Windows 非法字元，應原樣保留
+        assert_eq!(sanitize_file_name("進度：完成"), "進度：完成");
     }
 }
 
