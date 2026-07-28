@@ -513,14 +513,14 @@ export async function renderHomePage(container: HTMLElement): Promise<void> {
     const listModeGroup = document.createElement('div');
     listModeGroup.className = 'meeting-list-mode-group';
     const activeBtn = document.createElement('button');
-    activeBtn.className = `btn btn-sm ${listMode === 'active' ? 'btn-primary' : 'btn-secondary'}`;
+    activeBtn.className = `btn btn-sm ${listMode === 'active' ? 'btn-primary btn-filter-active' : 'btn-secondary'}`;
     activeBtn.textContent = '一般會議';
     activeBtn.addEventListener('click', () => {
       listMode = 'active';
       buildPage();
     });
     const archivedBtn = document.createElement('button');
-    archivedBtn.className = `btn btn-sm ${listMode === 'archived' ? 'btn-primary' : 'btn-secondary'}`;
+    archivedBtn.className = `btn btn-sm ${listMode === 'archived' ? 'btn-primary btn-filter-active' : 'btn-secondary'}`;
     archivedBtn.textContent = '已封存';
     archivedBtn.addEventListener('click', () => {
       listMode = 'archived';
@@ -538,6 +538,20 @@ export async function renderHomePage(container: HTMLElement): Promise<void> {
     toolbar.appendChild(addBtn);
 
     container.appendChild(toolbar);
+
+    const masthead = document.createElement('section');
+    masthead.className = 'home-masthead';
+    const mastheadKicker = document.createElement('span');
+    mastheadKicker.className = 'home-masthead-kicker';
+    mastheadKicker.textContent = listMode === 'active' ? 'VOXNOTE / MEETING ARCHIVE' : 'VOXNOTE / ARCHIVED RECORDS';
+    const mastheadText = document.createElement('p');
+    mastheadText.className = 'home-masthead-text';
+    mastheadText.textContent = listMode === 'active'
+      ? '把會議留下來，讓下一步變得清楚。'
+      : '已封存的討論，隨時可以重新查閱。';
+    masthead.appendChild(mastheadKicker);
+    masthead.appendChild(mastheadText);
+    container.appendChild(masthead);
 
     // 分類 Tab
     const tabs = document.createElement('div');
