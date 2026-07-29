@@ -71,6 +71,7 @@ VoxNote 是一款以**本地優先**設計的桌面會議助理。所有資料�
 ### 語音轉文字（ASR）
 
 - **AssemblyAI**（雲端）：自動語言偵測、說話者分離
+- **VoxNote 自架 ASR 轉錄服務**：結合 Breeze-ASR-26 與 WhisperX 的自架轉錄端點（需 NVIDIA GPU）
 - **本地 Whisper**：偵測 PATH 中的 `whisper`、`faster-whisper`、`openai-whisper`
 
 ### AI 校對
@@ -87,8 +88,15 @@ VoxNote 是一款以**本地優先**設計的桌面會議助理。所有資料�
 
 ### 匯出
 
+- 整包會議匯出：逐字稿、摘要、音訊一站式打包
 - 逐字稿 TXT（原始版 / 校對版）
 - 摘要 Markdown
+
+### UI 設計
+
+- 全新暖色調檔案館風格主題
+- 垂直單欄會議列表佈局，強調視覺層級
+- 純文字符號導航列，優化可讀性
 
 ---
 
@@ -213,6 +221,34 @@ ollama pull qwen2.5
 
 1. 前往 [AssemblyAI](https://www.assemblyai.com/) 申請 API Key（有免費額度）
 2. 在 VoxNote 設定 → ASR 供應商選「AssemblyAI」，填入 API Key
+
+### VoxNote 自架 ASR 轉錄服務
+
+位於 `server/`，以 **Breeze-ASR-26**（繁體中文台灣用語最佳）搭配 **WhisperX**（詞級對齊與語者分離）提供 OpenAI 相容的轉錄端點，供自有環境部署。
+
+> **狀態**：API、Docker 與部署契約已完成，尚未在具備 GPU 的機器上實機驗證轉錄品質與效能。
+
+#### 前置需求
+
+- 具備 **NVIDIA GPU** 的機器（含 Driver、Docker Engine、NVIDIA Container Toolkit）
+- Hugging Face access token（啟用語者分離時所需）
+- 將 Breeze-ASR-26 權重轉為 CTranslate2 格式（約 6GB）
+
+#### 啟動
+
+```bash
+cd server
+docker compose up -d --build
+curl http://localhost:8000/health
+```
+
+完整部署步驟（模型轉檔、pyannote 授權、環境變數、小 VRAM 機器調校）詳見 **[server/README.md](./server/README.md)**。
+
+#### app 端設定
+
+設定 → 語音轉錄 → 選擇「VoxNote 轉錄服務」，Base URL 填入服務位址（例如 `http://192.168.0.10:8000`）。
+
+> 本服務預設無驗證機制，請部署於受信任的網路環境。
 
 ### 本地 Whisper
 
