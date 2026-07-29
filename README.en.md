@@ -61,13 +61,17 @@ Meeting Recording → Speech-to-Text → AI Proofreading → Smart Summary → E
 
 ### Recording
 
-- Record audio with the browser-native MediaRecorder API in WAV format
+- Desktop recording flow with a preview step before saving
+- On Windows, record from microphone only, system audio only, or a mix of both
 - Upload audio files in `.wav`, `.mp3`, `.m4a`, `.ogg`, `.aac`, and `.flac` up to 500 MB
 - Use the built-in audio player with play, pause, seeking, and mute controls
+
+> System audio capture currently targets Windows first and records from the default playback device.
 
 ### Speech-to-Text
 
 - AssemblyAI cloud transcription with automatic language detection and speaker diarization
+- VoxNote self-hosted ASR service combining Breeze-ASR-26 and WhisperX (requires an NVIDIA GPU)
 - Local Whisper support by detecting `whisper`, `faster-whisper`, or `openai-whisper` from your system PATH
 
 ### AI Proofreading
@@ -84,8 +88,15 @@ Meeting Recording → Speech-to-Text → AI Proofreading → Smart Summary → E
 
 ### Export
 
+- Export a full meeting bundle containing the transcript, summary, and audio file
 - Export transcripts as TXT for original or proofread versions
 - Export summaries as Markdown
+
+### User Interface
+
+- Warm-toned archival theme
+- Single-column meeting list layout with clearer visual hierarchy
+- Text-symbol navigation bar for improved readability
 
 ---
 
@@ -110,7 +121,7 @@ src-tauri/src/          # Rust backend
 ├── commands/           # Tauri IPC handlers
 ├── db/                 # SQLite CRUD and migrations
 ├── ai/                 # Unified LLM entry point (call_llm)
-├── asr/                # Speech recognition (AssemblyAI + local Whisper)
+├── asr/                # Speech recognition (AssemblyAI + self-hosted service + local Whisper)
 └── config/             # AppConfig loading and saving
 ```
 
@@ -211,6 +222,34 @@ Then enter `http://localhost:11434` in VoxNote settings and select a model.
 
 1. Sign up for an API key at [AssemblyAI](https://www.assemblyai.com/)
 2. In VoxNote Settings, choose AssemblyAI as the ASR provider and paste the API key
+
+### VoxNote Self-Hosted ASR Service
+
+Located under `server/`, this service pairs **Breeze-ASR-26** (tuned for Traditional Chinese as used in Taiwan) with **WhisperX** (word-level alignment and speaker diarization) to expose an OpenAI-compatible transcription endpoint for your own infrastructure.
+
+> **Status**: The API, Docker setup, and deployment contract are complete. Transcription quality and performance have not yet been validated on a GPU-equipped machine.
+
+#### Prerequisites
+
+- A machine with an **NVIDIA GPU** (driver, Docker Engine, and NVIDIA Container Toolkit)
+- A Hugging Face access token (required for speaker diarization)
+- Breeze-ASR-26 weights converted to CTranslate2 format (roughly 6 GB)
+
+#### Start the service
+
+```bash
+cd server
+docker compose up -d --build
+curl http://localhost:8000/health
+```
+
+See **[server/README.md](./server/README.md)** for the full deployment guide, covering model conversion, pyannote licensing, environment variables, and tuning for low-VRAM machines.
+
+#### App configuration
+
+Go to Settings → Transcription, select "VoxNote Transcription Service", and enter the service address (for example `http://192.168.0.10:8000`).
+
+> The service ships without authentication. Deploy it only on a trusted network.
 
 ### Local Whisper
 

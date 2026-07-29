@@ -121,7 +121,7 @@ src-tauri/src/          # Rust 後端
 ├── commands/           # Tauri IPC handlers
 ├── db/                 # SQLite CRUD + migration
 ├── ai/                 # LLM 統一呼叫入口（call_llm）
-├── asr/                # 語音辨識（AssemblyAI + 本地 Whisper）
+├── asr/                # 語音辨識（AssemblyAI + 自架服務 + 本地 Whisper）
 └── config/             # AppConfig 讀寫
 ```
 
