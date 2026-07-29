@@ -713,13 +713,18 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
 .transcript-speaker {
   font-weight: 600;
   margin-right: 4px;
+  /* 超過 8 位講者時的保底色，避免與內文同色而無法辨識 */
+  color: var(--color-text-secondary);
 }
-/* 各講者顏色 */
-.speaker-A { color: #6366f1; }
-.speaker-B { color: #22c55e; }
-.speaker-C { color: #f59e0b; }
-.speaker-D { color: #ec4899; }
-.speaker-E { color: #14b8a6; }
+/* 各講者顏色：對應 --color-speaker-N，每位講者色相互異 */
+.speaker-A { color: var(--color-speaker-1); }
+.speaker-B { color: var(--color-speaker-2); }
+.speaker-C { color: var(--color-speaker-3); }
+.speaker-D { color: var(--color-speaker-4); }
+.speaker-E { color: var(--color-speaker-5); }
+.speaker-F { color: var(--color-speaker-6); }
+.speaker-G { color: var(--color-speaker-7); }
+.speaker-H { color: var(--color-speaker-8); }
 
 .speaker-mapping-panel {
   background: var(--color-bg-tertiary);
@@ -1878,6 +1883,15 @@ html[data-theme="dark"] {
   --color-info: #8db8ff;
   --color-danger: #ff8178;
   --color-floating-surface: rgba(32, 35, 31, 0.94);
+  /* 講者色：獨立於語意色，確保相鄰講者在深色背景上可辨識 */
+  --color-speaker-1: #7fc8dd;
+  --color-speaker-2: #e0a3c8;
+  --color-speaker-3: #d8c273;
+  --color-speaker-4: #93cfa0;
+  --color-speaker-5: #b5aeee;
+  --color-speaker-6: #f0a184;
+  --color-speaker-7: #6fc7bc;
+  --color-speaker-8: #c9b39a;
   --radius: 6px;
   --radius-sm: 3px;
   --radius-lg: 10px;
@@ -1909,6 +1923,15 @@ html[data-theme="light"] {
   --color-info: #236fee;
   --color-danger: #b73a34;
   --color-floating-surface: rgba(255, 254, 250, 0.94);
+  /* 講者色：獨立於語意色，確保相鄰講者在淺色背景上可辨識 */
+  --color-speaker-1: #1a6a8c;
+  --color-speaker-2: #a63b78;
+  --color-speaker-3: #8a6410;
+  --color-speaker-4: #2b7548;
+  --color-speaker-5: #5b4bb8;
+  --color-speaker-6: #b4502a;
+  --color-speaker-7: #17706a;
+  --color-speaker-8: #7a5a3c;
   --shadow: 0 1px 2px rgba(45, 38, 28, 0.07);
   --shadow-lg: 0 18px 48px rgba(45, 38, 28, 0.16);
 }
@@ -1963,10 +1986,6 @@ html, body { letter-spacing: 0.005em; }
 .transcript-content { background: transparent; border: none; border-left: 2px solid var(--color-border); border-radius: 0; padding: 2px 0 2px 18px; max-height: 420px; }
 .transcript-row { padding: 8px 0; border-bottom-color: var(--color-border-subtle); }
 .transcript-time { color: var(--color-accent); }
-.speaker-A, .speaker-E { color: var(--color-accent); }
-.speaker-B { color: var(--color-success); }
-.speaker-C { color: var(--color-warning); }
-.speaker-D { color: var(--color-error); }
 
 .category-tabs, .version-tabs { gap: 0; border-bottom: 1px solid var(--color-border); }
 .tab-btn { background: transparent; border: 0; border-radius: 0; margin-bottom: -1px; padding: 7px 12px; }
