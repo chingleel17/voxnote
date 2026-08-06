@@ -1,5 +1,7 @@
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { open } from '@tauri-apps/plugin-dialog';
+import { stat } from '@tauri-apps/plugin-fs';
 import type {
   Category,
   MeetingWithDetails,
@@ -13,10 +15,10 @@ import {
   cancelDesktopRecording,
   commitTemporaryRecording,
   discardTempRecordingFile,
+  importRecordingFile,
   listRecordingDevices,
   startDesktopRecording,
   stopDesktopRecording,
-  writeRecordingFile,
 } from '../api/recordings';
 import { saveSettings } from '../api/settings';
 import { getSavedParticipants, upsertSavedParticipant } from '../api/participants';
@@ -31,7 +33,8 @@ interface RecordingState {
   isRecording: boolean;
   startTime: number;
   timerInterval: number | null;
-  uploadedFile: File | null;
+  uploadedFilePath: string | null;
+  uploadedFileName: string | null;
   previewObjectUrl: string | null;
   previewTempFilePath: string | null;
   previewDurationSeconds: number | null;
@@ -46,7 +49,8 @@ const state: RecordingState = {
   isRecording: false,
   startTime: 0,
   timerInterval: null,
-  uploadedFile: null,
+  uploadedFilePath: null,
+  uploadedFileName: null,
   previewObjectUrl: null,
   previewTempFilePath: null,
   previewDurationSeconds: null,
@@ -152,7 +156,8 @@ async function releasePreviewResources(): Promise<void> {
   state.previewDurationSeconds = null;
   state.previewSourceMode = null;
   state.previewNeedsCleanup = false;
-  state.uploadedFile = null;
+  state.uploadedFilePath = null;
+  state.uploadedFileName = null;
 }
 
 async function stopAllRecordingState(): Promise<void> {
@@ -588,11 +593,6 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
   uploadBtn.className = 'btn btn-secondary';
   uploadBtn.textContent = '上傳音訊';
 
-  const fileInput = document.createElement('input');
-  fileInput.type = 'file';
-  fileInput.accept = 'audio/*';
-  fileInput.style.display = 'none';
-
   const reselectBtn = document.createElement('button');
   reselectBtn.className = 'btn btn-ghost hidden';
   reselectBtn.textContent = '重新選擇';
@@ -600,7 +600,6 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
   controlRow.appendChild(recordBtn);
   controlRow.appendChild(uploadBtn);
   controlRow.appendChild(reselectBtn);
-  controlRow.appendChild(fileInput);
   wrapper.appendChild(controlRow);
 
   const playerSection = document.createElement('div');
@@ -628,8 +627,8 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
     const mode = modeSelect.value as RecordingSourceMode;
     const needsMic = mode === 'microphone' || mode === 'mix';
     const needsSystem = mode === 'system' || mode === 'mix';
-    micGroup.classList.toggle('hidden', !needsMic || state.uploadedFile !== null);
-    systemGroup.classList.toggle('hidden', !needsSystem || state.uploadedFile !== null);
+    micGroup.classList.toggle('hidden', !needsMic || state.uploadedFilePath !== null);
+    systemGroup.classList.toggle('hidden', !needsSystem || state.uploadedFilePath !== null);
 
     if (needsSystem && !recordingDevices.system_audio_supported) {
       supportHint.textContent = '目前僅 Windows 支援電腦本地音訊錄音。請改用僅麥克風或上傳音訊檔案。';
@@ -678,14 +677,14 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
   const resetToRecordingMode = async (): Promise<void> => {
     await releasePreviewResources();
     playerSection.classList.add('hidden');
-    fileInput.value = '';
     audioEl.src = '';
     timer.textContent = '00:00';
     recordBtn.classList.remove('hidden');
     uploadBtn.classList.remove('hidden');
     modeGroup.classList.remove('hidden');
     reselectBtn.classList.add('hidden');
-    state.uploadedFile = null;
+    state.uploadedFilePath = null;
+    state.uploadedFileName = null;
     resetCanvas(canvas);
     syncSourceUi();
   };
@@ -794,13 +793,10 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
     saveBtn.textContent = '儲存中…';
 
     try {
-      if (state.uploadedFile) {
-        const ext = state.uploadedFile.name.split('.').pop() ?? 'wav';
+      if (state.uploadedFilePath) {
+        const ext = (state.uploadedFileName ?? state.uploadedFilePath).split('.').pop() ?? 'wav';
         const fileName = `${meetingId}_${Date.now()}.${ext}`;
-        const response = await fetch(audioEl.src);
-        const buffer = await response.arrayBuffer();
-        const bytes = Array.from(new Uint8Array(buffer));
-        await writeRecordingFile(meetingId, bytes, fileName, state.uploadedFile.name, null);
+        await importRecordingFile(meetingId, state.uploadedFilePath, fileName, state.uploadedFileName, null);
       } else if (state.previewTempFilePath) {
         await commitTemporaryRecording(
           meetingId,
@@ -824,16 +820,22 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
     }
   });
 
-  uploadBtn.addEventListener('click', () => fileInput.click());
+  // 大於此門檻的音訊檔不進行整檔波形解碼，避免長錄音把 webview 記憶體撐爆
+  const WAVEFORM_DECODE_SIZE_LIMIT = 100 * 1024 * 1024; // 100MB
 
-  fileInput.addEventListener('change', async () => {
-    const file = fileInput.files?.[0];
-    if (!file) return;
+  uploadBtn.addEventListener('click', async () => {
+    const selected = await open({
+      multiple: false,
+      filters: [{ name: '音訊檔案', extensions: ['wav', 'mp3', 'm4a', 'aac', 'flac', 'ogg', 'wma'] }],
+    });
+    if (!selected || Array.isArray(selected)) return;
+
+    const filePath = selected;
+    const fileName = filePath.split(/[/\\]/).pop() ?? filePath;
 
     await releasePreviewResources();
-    const objectUrl = URL.createObjectURL(file);
-    state.previewObjectUrl = objectUrl;
-    state.uploadedFile = file;
+    state.uploadedFilePath = filePath;
+    state.uploadedFileName = fileName;
     state.previewDurationSeconds = null;
     state.previewSourceMode = null;
     state.previewNeedsCleanup = false;
@@ -846,7 +848,8 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
     modeGroup.classList.add('hidden');
     reselectBtn.classList.remove('hidden');
 
-    await showPreview(objectUrl, `已載入音訊（${file.name}），請確認後儲存：`, null, null, null, false);
+    const src = convertFileSrc(filePath);
+    await showPreview(src, `已載入音訊（${fileName}），請確認後儲存：`, null, null, null, false);
 
     const waveCtx = canvas.getContext('2d');
     if (waveCtx) {
@@ -858,12 +861,18 @@ export async function renderRecordPage(container: HTMLElement, preselectedMeetin
     }
 
     try {
-      const arrayBuffer = await file.arrayBuffer();
-      const audioCtx = new AudioContext();
-      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-      drawStaticWaveform(canvas, audioBuffer);
-      timer.textContent = formatTime(audioBuffer.duration);
-      await audioCtx.close();
+      const info = await stat(filePath);
+      if (info.size > WAVEFORM_DECODE_SIZE_LIMIT) {
+        resetCanvas(canvas);
+      } else {
+        const response = await fetch(src);
+        const arrayBuffer = await response.arrayBuffer();
+        const audioCtx = new AudioContext();
+        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+        drawStaticWaveform(canvas, audioBuffer);
+        timer.textContent = formatTime(audioBuffer.duration);
+        await audioCtx.close();
+      }
     } catch {
       resetCanvas(canvas);
     }

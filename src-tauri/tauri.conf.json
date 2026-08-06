@@ -24,7 +24,8 @@
         "enable": true,
         "scope": [
           "$APPDATA/**",
-          "$APPDATA"
+          "$APPDATA",
+          "**"
         ]
       }
     }

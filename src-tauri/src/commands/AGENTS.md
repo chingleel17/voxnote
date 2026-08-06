@@ -8,7 +8,7 @@ Tauri IPC handlers。所有 `#[tauri::command]` 函式在此，前端透過 `inv
 | 檔案 | 暴露的 commands |
 |------|----------------|
 | `meeting_cmds.rs` | get_meetings, get_meeting, create_meeting, update_meeting, delete_meeting, get_categories, create_category, delete_category, get_saved_participants, upsert_saved_participant, delete_saved_participant |
-| `recording_cmds.rs` | get_recording, get_recordings, save_recording, write_recording_file, delete_recording |
+| `recording_cmds.rs` | get_recording, get_recordings, save_recording, import_recording_file, delete_recording |
 | `transcript_cmds.rs` | get_transcript, save_transcript_original, save_transcript_proofread, switch_transcript_version |
 | `summary_cmds.rs` | get_summary, save_summary |
 | `settings_cmds.rs` | get_settings, save_settings, test_ollama_connection, get_ollama_models, test_llm_connection_cmd |

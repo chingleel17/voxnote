@@ -52,11 +52,12 @@ pub async fn save_recording(
     .map_err(|e| e.to_string())
 }
 
-/// 接收音訊位元組，寫入 {app_data_dir}/recordings/ 後存路徑至 DB
+/// 將既有音訊檔（來自使用者選檔的真實路徑）複製進 recordings 目錄後存路徑至 DB
+/// 全程在檔案系統層完成，不透過 IPC 傳輸位元組，避免大檔案撐爆 webview 記憶體
 #[tauri::command]
-pub async fn write_recording_file(
+pub async fn import_recording_file(
     meeting_id: String,
-    file_data: Vec<u8>,
+    source_path: String,
     file_name: String,
     original_file_name: Option<String>,
     duration_seconds: Option<i64>,
@@ -66,10 +67,15 @@ pub async fn write_recording_file(
 ) -> Result<Recording, String> {
     let _guard = data_lock.try_begin_write()?;
     let recordings_dir = resolve_recordings_dir(&app_handle).map_err(|e| e.to_string())?;
+    let source = PathBuf::from(&source_path);
+    if !source.exists() {
+        return Err("來源音訊檔不存在".into());
+    }
+
     let file_path = recordings_dir.join(&file_name);
     let file_path = tauri::async_runtime::spawn_blocking(move || -> Result<PathBuf, String> {
         std::fs::create_dir_all(&recordings_dir).map_err(|e| e.to_string())?;
-        std::fs::write(&file_path, &file_data).map_err(|e| e.to_string())?;
+        std::fs::copy(&source, &file_path).map_err(|e| e.to_string())?;
         Ok(file_path)
     })
     .await
@@ -168,13 +174,6 @@ pub async fn commit_temporary_recording(
     )
     .await
     .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn read_recording_file(file_path: String) -> Result<Vec<u8>, String> {
-    tauri::async_runtime::spawn_blocking(move || std::fs::read(file_path).map_err(|e| e.to_string()))
-        .await
-        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]

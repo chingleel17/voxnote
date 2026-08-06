@@ -1,8 +1,9 @@
+import { convertFileSrc } from '@tauri-apps/api/core';
 import type { MeetingWithDetails, Transcript, Summary, Recording, SavedParticipant, CreateTemplateRequest, Tag, SpeakerMapping, Category, ExportTextFile } from '../types';
 import { getMeeting, getCategories, updateMeeting, archiveMeeting, unarchiveMeeting } from '../api/meetings';
 import { exportTextFileToPath, getTranscript, saveTranscriptManual, saveTranscriptProofread, switchTranscriptVersion } from '../api/transcripts';
 import { getSummary } from '../api/summaries';
-import { getRecordings, deleteRecording, setNoBreakBefore, reorderRecordings, remergeSegments, readRecordingFile } from '../api/recordings';
+import { getRecordings, deleteRecording, setNoBreakBefore, reorderRecordings, remergeSegments } from '../api/recordings';
 import { startTranscription, proofreadRecordingSegment, proofreadTranscript, generateSummary } from '../api/settings';
 import { getSavedParticipants, upsertSavedParticipant } from '../api/participants';
 import { deleteSpeakerMapping, getSpeakerMappings, upsertSpeakerMapping } from '../api/speakerMappings';
@@ -35,7 +36,6 @@ interface TranscriptSectionResult {
 
 const transcriptUtteranceRe = /^\[(\d+:\d{2})(?:\s+([^\]]+))?\]\s+(.*)$/;
 const MERGED_BREAK_SEPARATOR = '\n\n--- ☕ 中場休息 ---\n\n';
-const recordingObjectUrls = new Map<string, string>();
 
 function parseTimeToSeconds(timeStr: string): number {
   const [minutesPart, secondsPart] = timeStr.split(':');
@@ -345,23 +345,7 @@ async function resolveRecordingSource(filePath: string): Promise<string> {
     return filePath;
   }
 
-  const cached = recordingObjectUrls.get(filePath);
-  if (cached) {
-    return cached;
-  }
-
-  const bytes = await readRecordingFile(filePath);
-  const blob = new Blob([new Uint8Array(bytes)]);
-  const objectUrl = URL.createObjectURL(blob);
-  recordingObjectUrls.set(filePath, objectUrl);
-  return objectUrl;
-}
-
-function revokeRecordingSources(): void {
-  for (const objectUrl of recordingObjectUrls.values()) {
-    URL.revokeObjectURL(objectUrl);
-  }
-  recordingObjectUrls.clear();
+  return convertFileSrc(filePath);
 }
 
 function buildCodeFence(text: string, language = ''): string {
@@ -1918,8 +1902,6 @@ function buildRecordingSection(
 
 export async function renderMeetingPage(container: HTMLElement, meetingId: string): Promise<void> {
   container.innerHTML = '<div class="loading">載入中...</div>';
-  revokeRecordingSources();
-  window.addEventListener('hashchange', revokeRecordingSources, { once: true });
 
   let meeting: MeetingWithDetails | null = null;
   let categories: Category[] = [];
@@ -1960,7 +1942,6 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
     if (recordings.filter((recording) => recording.file_path).length < 2) {
       isRecordingListCollapsed = false;
     }
-    revokeRecordingSources();
     container.innerHTML = '';
 
     // 頂部導覽

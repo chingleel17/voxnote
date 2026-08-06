@@ -18,6 +18,9 @@ function formatPlayerTime(secs: number): string {
 const NUM_BARS = 300;
 const BAR_COLOR_PLAYED = '#6366f1';
 const BAR_COLOR_UNPLAYED = '#2e3048';
+// 大於此門檻的音訊檔不進行整檔波形解碼，避免長錄音把 webview 記憶體撐爆
+const WAVEFORM_DECODE_SIZE_LIMIT = 100 * 1024 * 1024; // 100MB
+const WAVEFORM_DECODE_DURATION_LIMIT = 60 * 60; // 60 分鐘
 const PLAYHEAD_COLOR = 'rgba(255,255,255,0.85)';
 const CANVAS_HEIGHT = 56;
 
@@ -107,8 +110,17 @@ export function createWaveformPlayer(audioEl: HTMLAudioElement): HTMLElement {
   async function decodeWaveform(): Promise<void> {
     const src = audioEl.src;
     if (!src) return;
+    if (audioEl.duration > WAVEFORM_DECODE_DURATION_LIMIT) {
+      drawCanvas();
+      return;
+    }
     try {
       const resp = await fetch(src);
+      const contentLength = resp.headers.get('content-length');
+      if (contentLength && Number(contentLength) > WAVEFORM_DECODE_SIZE_LIMIT) {
+        drawCanvas();
+        return;
+      }
       const buffer = await resp.arrayBuffer();
       const audioCtx = new AudioContext();
       const decoded = await audioCtx.decodeAudioData(buffer);

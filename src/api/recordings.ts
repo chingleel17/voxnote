@@ -48,13 +48,20 @@ export const commitTemporaryRecording = (
   });
 
 /**
- * 將音訊位元組寫入磁碟並儲存路徑至 DB
+ * 將既有音訊檔（來自使用者選檔的真實路徑）複製進 recordings 目錄後存路徑至 DB
+ * 全程在檔案系統層完成，不透過 IPC 傳輸位元組，避免大檔案撐爆 webview 記憶體
  */
-export const writeRecordingFile = (
+export const importRecordingFile = (
   meetingId: string,
-  fileData: number[],
+  sourcePath: string,
   fileName: string,
   originalFileName: string | null,
   durationSeconds: number | null,
-) => invoke<Recording>('write_recording_file', { meetingId, fileData, fileName, originalFileName, durationSeconds });
-export const readRecordingFile = (filePath: string) => invoke<number[]>('read_recording_file', { filePath });
+) =>
+  invoke<Recording>('import_recording_file', {
+    meetingId,
+    sourcePath,
+    fileName,
+    originalFileName,
+    durationSeconds,
+  });
