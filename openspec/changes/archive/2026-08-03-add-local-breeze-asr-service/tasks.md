@@ -6,7 +6,7 @@
 - [x] 1.2 下載 Breeze-ASR-26 權重，嘗試轉換為 CTranslate2 格式並以 faster-whisper 載入
       —— 已驗證：`ct2-transformers-converter` 轉 float16 成功（`model.bin` 2.9 GB），
       faster-whisper 可正常載入（`is_multilingual: True`）
-- [~] 1.3 若 CTranslate2 不相容，改用 WhisperX 的 HuggingFace pipeline 後端載入 Breeze
+- [x] 1.3 若 CTranslate2 不相容，改用 WhisperX 的 HuggingFace pipeline 後端載入 Breeze
       —— 不需要：1.2 的 CTranslate2 路線已成功，此 fallback 無須執行
 - [x] 1.4 以樣本中文會議音訊跑通 WhisperX 全流程（轉錄 + 詞級對齊 + pyannote 語者分離）
 - [x] 1.5 於 HuggingFace 同意 pyannote 3.1 授權條款並在環境中配置 token（不進 repo）

@@ -25,8 +25,8 @@ const TARGET_CHANNELS: usize = 1;
 const TEMP_RECORDING_DIR: &str = "temp-recordings";
 const TEMP_RECORDING_TTL_HOURS: u64 = 24;
 
-type SharedQueue = Arc<Mutex<VecDeque<f32>>>;
-type SharedError = Arc<Mutex<Option<String>>>;
+pub(crate) type SharedQueue = Arc<Mutex<VecDeque<f32>>>;
+pub(crate) type SharedError = Arc<Mutex<Option<String>>>;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -101,8 +101,8 @@ struct ActiveRecordingSession {
     handle: thread::JoinHandle<()>,
 }
 
-struct SelectedInputDevice {
-    device: cpal::Device,
+pub(crate) struct SelectedInputDevice {
+    pub(crate) device: cpal::Device,
 }
 
 pub fn cleanup_stale_temp_files(app: &AppHandle) -> Result<()> {
@@ -275,6 +275,7 @@ fn run_recording_session(
             mic_queue.clone(),
             error_state.clone(),
             level_value.clone(),
+            TARGET_SAMPLE_RATE,
         )?);
     }
 
@@ -287,6 +288,7 @@ fn run_recording_session(
                 error_state.clone(),
                 running.clone(),
                 level_value.clone(),
+                TARGET_SAMPLE_RATE,
             )?)
         }
         #[cfg(not(target_os = "windows"))]
@@ -405,7 +407,7 @@ fn run_recording_session(
     })
 }
 
-fn select_input_device(device_id: Option<&str>) -> Result<SelectedInputDevice> {
+pub(crate) fn select_input_device(device_id: Option<&str>) -> Result<SelectedInputDevice> {
     let host = cpal::default_host();
     let requested = device_id.unwrap_or_default();
     let default_name = host
@@ -438,11 +440,12 @@ fn select_input_device(device_id: Option<&str>) -> Result<SelectedInputDevice> {
     Err(anyhow!("找不到指定的麥克風裝置"))
 }
 
-fn start_microphone_stream(
+pub(crate) fn start_microphone_stream(
     device: cpal::Device,
     queue: SharedQueue,
     error_state: SharedError,
     level_value: Arc<Mutex<f32>>,
+    target_rate: u32,
 ) -> Result<Stream> {
     let config = device
         .default_input_config()
@@ -457,7 +460,9 @@ fn start_microphone_stream(
         SampleFormat::F32 => device
             .build_input_stream(
                 &stream_config,
-                move |data: &[f32], _| push_resampled_samples(data, channels, sample_rate, &queue, &level_value),
+                move |data: &[f32], _| {
+                    push_resampled_samples(data, channels, sample_rate, target_rate, &queue, &level_value)
+                },
                 err_fn,
                 None,
             )
@@ -470,7 +475,7 @@ fn start_microphone_stream(
                         .iter()
                         .map(|sample| f32::from(*sample) / f32::from(i16::MAX))
                         .collect();
-                    push_resampled_samples(&converted, channels, sample_rate, &queue, &level_value);
+                    push_resampled_samples(&converted, channels, sample_rate, target_rate, &queue, &level_value);
                 },
                 err_fn,
                 None,
@@ -484,7 +489,7 @@ fn start_microphone_stream(
                         .iter()
                         .map(|sample| (f32::from(*sample) / f32::from(u16::MAX)) * 2.0 - 1.0)
                         .collect();
-                    push_resampled_samples(&converted, channels, sample_rate, &queue, &level_value);
+                    push_resampled_samples(&converted, channels, sample_rate, target_rate, &queue, &level_value);
                 },
                 err_fn,
                 None,
@@ -498,10 +503,11 @@ fn push_resampled_samples(
     samples: &[f32],
     channels: usize,
     input_rate: u32,
+    target_rate: u32,
     queue: &SharedQueue,
     level_value: &Arc<Mutex<f32>>,
 ) {
-    let processed = downmix_and_resample(samples, channels, input_rate);
+    let processed = downmix_and_resample(samples, channels, input_rate, target_rate);
     let peak = processed
         .iter()
         .fold(0.0f32, |max, sample| max.max(sample.abs()));
@@ -514,7 +520,7 @@ fn push_resampled_samples(
     }
 }
 
-fn downmix_and_resample(samples: &[f32], channels: usize, input_rate: u32) -> Vec<f32> {
+fn downmix_and_resample(samples: &[f32], channels: usize, input_rate: u32, target_rate: u32) -> Vec<f32> {
     if samples.is_empty() || channels == 0 {
         return Vec::new();
     }
@@ -528,11 +534,11 @@ fn downmix_and_resample(samples: &[f32], channels: usize, input_rate: u32) -> Ve
             .collect()
     };
 
-    if input_rate == TARGET_SAMPLE_RATE {
+    if input_rate == target_rate {
         return mono;
     }
 
-    let ratio = f64::from(input_rate) / f64::from(TARGET_SAMPLE_RATE);
+    let ratio = f64::from(input_rate) / f64::from(target_rate);
     let target_len = ((mono.len() as f64) / ratio).ceil() as usize;
     let mut resampled = Vec::with_capacity(target_len);
 
@@ -600,12 +606,13 @@ fn list_windows_system_outputs() -> Result<Vec<RecordingDevice>> {
 }
 
 #[cfg(target_os = "windows")]
-fn start_windows_loopback_capture(
+pub(crate) fn start_windows_loopback_capture(
     _system_device_id: Option<&str>,
     queue: SharedQueue,
     _error_state: SharedError,
     running: Arc<AtomicBool>,
     level_value: Arc<Mutex<f32>>,
+    target_rate: u32,
 ) -> Result<thread::JoinHandle<Result<()>>> {
     Ok(thread::spawn(move || -> Result<()> {
         use wasapi::{DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
@@ -614,7 +621,7 @@ fn start_windows_loopback_capture(
         let enumerator = DeviceEnumerator::new()?;
         let device = enumerator.get_default_device(&Direction::Render)?;
         let desired_format =
-            WaveFormat::new(32, 32, &SampleType::Float, TARGET_SAMPLE_RATE as usize, 2, None);
+            WaveFormat::new(32, 32, &SampleType::Float, target_rate as usize, 2, None);
         let mut audio_client = device.get_iaudioclient()?;
         let (_, min_time) = audio_client.get_device_period()?;
         let stream_mode = StreamMode::EventsShared {
@@ -622,6 +629,8 @@ fn start_windows_loopback_capture(
             buffer_duration_hns: min_time,
         };
         audio_client.initialize_client(&desired_format, &Direction::Capture, &stream_mode)?;
+
+        let actual_rate = audio_client.get_mixformat()?.get_samplespersec();
 
         let capture_client = audio_client.get_audiocaptureclient()?;
         let event_handle = audio_client.set_get_eventhandle()?;
@@ -637,14 +646,19 @@ fn start_windows_loopback_capture(
                     let right = take_f32_le(&mut sample_queue)?;
                     converted.push((left + right) * 0.5);
                 }
-                let peak = converted
+                let processed = if actual_rate == target_rate {
+                    converted
+                } else {
+                    downmix_and_resample(&converted, 1, actual_rate, target_rate)
+                };
+                let peak = processed
                     .iter()
                     .fold(0.0f32, |max, sample| max.max(sample.abs()));
                 if let Ok(mut level) = level_value.lock() {
                     *level = peak;
                 }
                 if let Ok(mut target) = queue.lock() {
-                    target.extend(converted);
+                    target.extend(processed);
                 }
             }
 

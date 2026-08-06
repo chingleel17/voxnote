@@ -33,3 +33,7 @@ hound = "3.5.1"
 wasapi = "0.23.0"
 zip = { version = "2", features = ["deflate"] }
 fs4 = "1.1.0"
+whisper-rs = { version = "0.16", default-features = false }
+
+[features]
+live-caption-cuda = ["whisper-rs/cuda"]

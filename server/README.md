@@ -10,7 +10,7 @@ API、Docker 與部署契約已完成；`app.py` 的 Breeze-ASR-26 載入、Whis
 
 在要部署的機器（需具備 NVIDIA GPU）上，依序完成下列步驟。前三步是 `docker build` 不會代勞、必須事先準備的前置作業。
 
-- [ ] **1. 準備 GPU 執行環境**
+- [x] **1. 準備 GPU 執行環境**
   安裝 NVIDIA Driver、Docker Engine 與 NVIDIA Container Toolkit。驗證容器可存取 GPU：
   ```bash
   docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
