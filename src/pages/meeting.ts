@@ -1,4 +1,5 @@
 import { convertFileSrc } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import type { MeetingWithDetails, Transcript, Summary, Recording, SavedParticipant, CreateTemplateRequest, Tag, SpeakerMapping, Category, ExportTextFile } from '../types';
 import { getMeeting, getCategories, updateMeeting, archiveMeeting, unarchiveMeeting } from '../api/meetings';
 import { exportTextFileToPath, getTranscript, saveTranscriptManual, saveTranscriptProofread, switchTranscriptVersion } from '../api/transcripts';
@@ -1624,6 +1625,9 @@ function buildRecordingSection(
   onReordered: (recordingId: string, direction: -1 | 1) => Promise<void>,
   onSegmentProofread: (recordingId: string) => Promise<{ warning: string | null }>,
   onBreakChanged: () => void,
+  // 逐字稿的校稿狀態。前端的處理中狀態存於記憶體，離開頁面即消失，
+  // 故重新進入時需改以資料庫狀態判斷背景工作是否仍在進行。
+  proofreadStatus?: string,
 ): HTMLElement {
   const section = document.createElement('section');
   section.className = 'detail-section';
@@ -1699,11 +1703,20 @@ function buildRecordingSection(
       segHeader.appendChild(dur);
     }
 
-    // 轉譯狀態標籤
+    // 轉譯狀態標籤。除了前端記憶體中的處理狀態，另需反映資料庫記錄的背景校稿，
+    // 否則離開頁面再進入時，仍在校稿的段落會被誤標為「轉譯中」。
     const statusBadge = document.createElement('span');
     const isTranscribing = isProcessing(transcribeKey);
-    statusBadge.className = `recording-segment-status ${isTranscribing ? 'processing' : rec.segment_transcript ? 'transcribed' : 'pending'}`;
-    statusBadge.textContent = isTranscribing ? '轉譯中' : rec.segment_transcript ? '已轉譯' : '未轉譯';
+    const isBackgroundProofreading = proofreadStatus === 'running' && Boolean(rec.segment_transcript);
+    const inProgress = isTranscribing || isBackgroundProofreading;
+    statusBadge.className = `recording-segment-status ${inProgress ? 'processing' : rec.segment_transcript ? 'transcribed' : 'pending'}`;
+    statusBadge.textContent = isTranscribing
+      ? '轉譯中'
+      : isBackgroundProofreading
+        ? 'AI 校稿中'
+        : rec.segment_transcript
+          ? '已轉譯'
+          : '未轉譯';
     segHeader.appendChild(statusBadge);
 
     segWrap.appendChild(segHeader);
@@ -1773,6 +1786,10 @@ function buildRecordingSection(
     if (isTranscribing) {
       transcribeBtn.textContent = '轉譯中…';
       transcribeBtn.disabled = true;
+    } else if (isBackgroundProofreading) {
+      // 背景校稿期間不可重新轉譯，否則會與進行中的校稿競寫同一份逐字稿
+      transcribeBtn.textContent = 'AI 校稿中…';
+      transcribeBtn.disabled = true;
     } else {
       transcribeBtn.textContent = rec.segment_transcript ? '重新轉譯' : '產生逐字稿';
     }
@@ -1785,6 +1802,18 @@ function buildRecordingSection(
       statusBadge.className = 'recording-segment-status processing';
       statusBadge.textContent = '轉譯中';
       showToast(`段落 ${segIndex} 轉譯中，請稍候…`, 'info');
+
+      // 後端會在轉錄、AI 校稿等階段發出進度事件。長錄音的校稿需分段送交 LLM，
+      // 耗時可能遠超轉錄本身，若不顯示階段訊息會讓人誤以為程式卡住。
+      const unlistenProgress = await listen<{ meetingId: string; message: string }>(
+        'asr_progress',
+        (event) => {
+          if (event.payload.meetingId !== meetingId) return;
+          statusBadge.textContent = event.payload.message;
+          transcribeBtn.textContent = event.payload.message;
+        },
+      );
+
       try {
         await startTranscription(meetingId, rec.id, rec.file_path!);
         showToast(
@@ -1803,6 +1832,8 @@ function buildRecordingSection(
         transcribeBtn.textContent = rec.segment_transcript ? '重新轉譯' : '產生逐字稿';
         statusBadge.className = `recording-segment-status ${rec.segment_transcript ? 'transcribed' : 'pending'}`;
         statusBadge.textContent = rec.segment_transcript ? '已轉譯' : '未轉譯';
+      } finally {
+        unlistenProgress();
       }
     });
     segActions.appendChild(transcribeBtn);
@@ -2167,6 +2198,7 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
         } catch { /* ignore */ }
         build();
       },
+      transcript?.proofread_status,
     ));
 
     // 逐字稿區塊

@@ -14,6 +14,10 @@ use crate::{
     },
 };
 
+/// AI 校稿的總時間上限。校稿會將逐字稿切片後逐段送交 LLM，失敗時再以更小的片段
+/// 重試至多四輪；長逐字稿累積下來可能耗時數小時，故以此上限中止並保留原始逐字稿。
+const PROOFREAD_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 const PROOFREAD_SYSTEM: &str = "\
 你是一位專業的中文會議記錄校對員。\
 請校正以下逐字稿中的錯字（同音字、漏字、多字、標點錯誤）。\
@@ -376,8 +380,19 @@ async fn proofread_text(
     };
     const CHUNK_SIZES: [usize; 4] = [4000, 2500, 1500, 900];
     let mut last_retry_warning: Option<String> = None;
+    let started_at = std::time::Instant::now();
 
     for (attempt_index, chunk_size) in CHUNK_SIZES.iter().enumerate() {
+        // 每次重試都會以更小的片段重跑整份逐字稿，長逐字稿的片段數可達上百，
+        // 而每個片段各有獨立逾時；若不設總時限，四輪重試累積的等待可長達數小時。
+        if attempt_index > 0 && started_at.elapsed() > PROOFREAD_TOTAL_BUDGET {
+            return Err(format!(
+                "AI 校稿已超過 {} 分鐘的時間上限，已停止重試並保留原始逐字稿。{}",
+                PROOFREAD_TOTAL_BUDGET.as_secs() / 60,
+                last_retry_warning.unwrap_or_else(|| "可於設定頁關閉自動校稿，改為需要時手動執行。".to_string())
+            ));
+        }
+
         let chunks = chunk_transcript(original, *chunk_size);
         let attempt = match proofread_text_for_chunks(config, original, proofread_system, chunks)
             .await
