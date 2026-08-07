@@ -101,17 +101,26 @@ def load_audio_preprocessed(audio_path: Path) -> np.ndarray:
     ]
 
     try:
-        result = subprocess.run(command, capture_output=True, check=True)
+        # stderr 導向 DEVNULL：ffmpeg 的進度輸出對長檔案可達數十 KB，
+        # 以 PIPE 接收卻未同步讀取時，pipe 滿載會使 ffmpeg 阻塞
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
     except FileNotFoundError as error:
         raise RuntimeError("找不到 ffmpeg，無法解碼音訊") from error
     except subprocess.CalledProcessError as error:
-        stderr = error.stderr.decode("utf-8", errors="ignore") if error.stderr else ""
-        raise RuntimeError(f"音訊解碼失敗：{stderr}") from error
+        raise RuntimeError(f"音訊解碼失敗（ffmpeg 結束碼 {error.returncode}）") from error
+
+    if not result.stdout:
+        raise RuntimeError("音訊解碼結果為空，請確認檔案格式是否正確")
 
     if filters:
         logger.info("音訊前處理已套用：%s", filters)
 
-    return np.frombuffer(result.stdout, np.int16).flatten().astype(np.float32) / INT16_MAX_ABS
+    return np.frombuffer(result.stdout, np.int16).astype(np.float32) / INT16_MAX_ABS
 
 
 def _speaker_code(index: int) -> str:

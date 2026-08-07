@@ -2,7 +2,12 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-const LOCAL_ASR_TIMEOUT_SECS: u64 = 600;
+// 整體請求逾時。長會議錄音的處理時間可觀：實測 158 分鐘的錄音，僅音訊前處理即需
+// 約 90 秒，加上轉錄與語者分離總計可達數十分鐘，故放寬至 60 分鐘。
+const LOCAL_ASR_TIMEOUT_SECS: u64 = 3600;
+// 讀取閒置逾時。整體逾時僅涵蓋至回應標頭送達，此值另外限制傳輸期間的無資料時間，
+// 避免伺服器已回 200 卻送不完內容時，前端永久停在「轉譯中」。
+const LOCAL_ASR_READ_IDLE_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Debug, Deserialize)]
 struct LocalServerSegment {
@@ -211,7 +216,11 @@ pub async fn transcribe_voxnote_asr(
         return Err(anyhow!("本地 ASR 伺服器位址未設定"));
     }
 
-    let file_bytes = std::fs::read(file_path).map_err(|e| anyhow!("無法讀取音訊檔案：{}", e))?;
+    // 長錄音檔可達數百 MB，以同步 I/O 讀取會阻塞 tokio 的工作執行緒，
+    // 使同一執行緒上的其他非同步工作（含逾時計時）無法推進
+    let file_bytes = tokio::fs::read(file_path)
+        .await
+        .map_err(|e| anyhow!("無法讀取音訊檔案：{}", e))?;
     let file_name = std::path::Path::new(file_path)
         .file_name()
         .and_then(|name| name.to_str())
@@ -230,8 +239,12 @@ pub async fn transcribe_voxnote_asr(
         form = form.text("max_speakers", speakers_expected.to_string());
     }
 
+    // timeout 僅涵蓋至回應標頭送達為止；長錄音的回應內容可能在標頭之後才緩慢送出，
+    // 甚至因伺服器端異常而永不完結，故另以 read_timeout 限制讀取期間的閒置時間，
+    // 避免 UI 永久停在「轉譯中」。
     let client = reqwest::Client::builder()
         .timeout(tokio::time::Duration::from_secs(LOCAL_ASR_TIMEOUT_SECS))
+        .read_timeout(tokio::time::Duration::from_secs(LOCAL_ASR_READ_IDLE_TIMEOUT_SECS))
         .build()
         .map_err(|e| anyhow!("無法建立本地 ASR 連線：{}", e))?;
     let url = format!("{}/v1/audio/transcriptions", base_url);
@@ -245,7 +258,11 @@ pub async fn transcribe_voxnote_asr(
         .await
         .map_err(|e| {
             if e.is_timeout() {
-                anyhow!("本地 ASR 伺服器連線逾時")
+                anyhow!(
+                    "本地 ASR 伺服器逾時（超過 {} 秒未回應）：長錄音的轉錄與語者分離耗時較長，\
+                     可縮短錄音分段或確認伺服器狀態",
+                    LOCAL_ASR_TIMEOUT_SECS
+                )
             } else if e.is_connect() {
                 anyhow!("無法連線至本地 ASR 伺服器：{}", e)
             } else {
@@ -259,10 +276,18 @@ pub async fn transcribe_voxnote_asr(
         return Err(anyhow!("本地 ASR 伺服器回傳錯誤（{}）：{}", status, detail));
     }
 
-    let result: LocalServerTranscription = response
-        .json()
-        .await
-        .map_err(|e| anyhow!("無法解析本地 ASR 伺服器回應：{}", e))?;
+    // 讀取回應內容同樣需要保護：伺服器已回 200 但內容送不完時，若無此限制會永久等待
+    let result: LocalServerTranscription = response.json().await.map_err(|e| {
+        if e.is_timeout() {
+            anyhow!(
+                "本地 ASR 伺服器已回應但內容讀取逾時（超過 {} 秒無資料）：\
+                 伺服器可能於產生結果時發生異常",
+                LOCAL_ASR_READ_IDLE_TIMEOUT_SECS
+            )
+        } else {
+            anyhow!("無法解析本地 ASR 伺服器回應：{}", e)
+        }
+    })?;
     progress_cb("轉錄完成".into());
 
     if speaker_detection && !result.segments.is_empty() {
