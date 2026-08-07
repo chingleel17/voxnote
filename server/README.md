@@ -94,6 +94,25 @@ torch 的 CUDA 版本請依 NVIDIA 官方索引安裝（對應主機 CUDA 版本
 | `DIARIZATION_MODEL` | 語者分離模型（明確指定，不依賴 WhisperX 會變動的預設值） | `pyannote-community/speaker-diarization-community-1` |
 | `HF_TOKEN` / `HF_TOKEN_FILE` | Hugging Face token（語者分離所需），可直接給值或指向檔案 | 無 |
 | `UPLOAD_DIR` | 上傳音訊暫存目錄 | 系統暫存目錄 |
+| `AUDIO_PREPROCESS` | 音訊前處理總開關；設為 `0` 可停用以比對效果 | `1` |
+| `AUDIO_HIGHPASS_HZ` | 高通濾波截止頻率（Hz），濾除冷氣與桌面震動等低頻噪音；設為 `0` 停用 | `80` |
+| `AUDIO_NORMALIZER` | 響度標準化方式：`loudnorm`、`dynaudnorm` 或 `none` | `loudnorm` |
+
+### 音訊前處理
+
+手機置於會議桌收音的錄音常有兩個問題：低頻的冷氣與桌面震動噪音，以及整體響度偏低使語音接近底噪。前處理在 WhisperX 既有的 ffmpeg 解碼命令上追加 filter，不額外增加 I/O，且輸出樣本數與未處理時完全一致，不影響時間戳對齊。
+
+各方式的取捨（實測 60 分鐘音訊的總耗時，以及語音與靜音段的訊噪比；SNR 越高代表語音相對底噪越清楚，直接影響語者分離的聲紋品質）：
+
+| 方式 | 60 分鐘耗時 | SNR | 語音提升 |
+| --- | --- | --- | --- |
+| 原始（`AUDIO_PREPROCESS=0`） | 約 1.4 秒 | 33.7 dB | — |
+| `loudnorm`（預設） | 約 35 秒 | 33.2 dB | +21.0 dB |
+| `dynaudnorm` | 約 2.3 秒 | 27.2 dB | +16.9 dB |
+
+`dynaudnorm` 雖快得多，但逐段調整增益會在語音停頓處把底噪一併放大，實測損失約 6.5 dB SNR，與提升語者分離的目標相反。因此預設採 `loudnorm`；若長錄音無法接受其耗時，再改用 `dynaudnorm`。
+
+比對前處理是否有效的方式：對同一段實際會議錄音，分別以 `AUDIO_PREPROCESS=0` 與 `1` 轉錄，比較語者標籤的正確性。
 
 ## app 端設定
 

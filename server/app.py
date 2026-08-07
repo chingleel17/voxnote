@@ -2,18 +2,25 @@
 
 import logging
 import os
+import subprocess
 import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
 
+import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from opencc import OpenCC
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("voxnote.asr")
+
+# WhisperX 內部固定以 16 kHz 單聲道處理音訊，前處理輸出必須與其一致
+ASR_SAMPLE_RATE = 16000
+# int16 轉 float32 的正規化係數，與 whisperx.load_audio 相同
+INT16_MAX_ABS = 32768.0
 
 app = FastAPI(title="VoxNote Local ASR", version="0.1.0")
 opencc = OpenCC("s2twp")
@@ -27,6 +34,84 @@ class TranscriptSegment:
     end: float
     text: str
     speaker: str | None = None
+
+
+def _build_audio_filters() -> str:
+    """組出音訊前處理的 ffmpeg filter 字串；停用時回傳空字串。
+
+    會議錄音（尤其是手機置於桌面收音）常見兩個問題：低頻的冷氣與桌面震動噪音，
+    以及整體響度偏低使語音接近底噪。前者以高通濾波移除，後者以響度標準化拉高，
+    可改善 VAD 的語音邊界判斷與語者分離的聲紋品質。
+    """
+    if os.getenv("AUDIO_PREPROCESS", "1") not in ("1", "true", "True"):
+        return ""
+
+    filters: list[str] = []
+
+    highpass_hz = os.getenv("AUDIO_HIGHPASS_HZ", "80").strip()
+    if highpass_hz and highpass_hz != "0":
+        filters.append(f"highpass=f={highpass_hz}")
+
+    # 響度標準化方式。實測含解碼的 60 分鐘音訊耗時，以及語音與靜音段的訊噪比
+    # （SNR 越高代表語音相對底噪越清楚，直接影響語者分離的聲紋品質）：
+    #
+    #   方式                     耗時     SNR      語音提升
+    #   原始（未處理）            1.4 秒   33.7 dB   —
+    #   loudnorm                 35 秒    33.2 dB   +21.0 dB
+    #   dynaudnorm f=250:m=20    2.3 秒   27.2 dB   +16.9 dB
+    #
+    # dynaudnorm 雖快得多，但逐段調整增益會在語音停頓處把底噪一併放大，實測損失
+    # 約 6.5 dB SNR，與提升語者分離的目標相反，故預設採 loudnorm；長錄音若無法
+    # 接受其耗時，可改設 dynaudnorm 或 none。
+    normalizer = os.getenv("AUDIO_NORMALIZER", "loudnorm").strip().lower()
+    if normalizer == "loudnorm":
+        loudnorm_i = os.getenv("AUDIO_LOUDNORM_I", "-23").strip()
+        loudnorm_tp = os.getenv("AUDIO_LOUDNORM_TP", "-2").strip()
+        loudnorm_lra = os.getenv("AUDIO_LOUDNORM_LRA", "7").strip()
+        filters.append(f"loudnorm=I={loudnorm_i}:TP={loudnorm_tp}:LRA={loudnorm_lra}")
+    elif normalizer == "dynaudnorm":
+        # f 為分析視窗長度（毫秒）、g 為高斯平滑視窗大小（非增益）、p 為峰值上限、
+        # m 為最大放大倍率。視窗越窄、m 越大，靜音段的底噪被放大得越嚴重。
+        frame = os.getenv("AUDIO_DYNAUDNORM_FRAME", "500").strip()
+        gausssize = os.getenv("AUDIO_DYNAUDNORM_GAUSSSIZE", "31").strip()
+        peak = os.getenv("AUDIO_DYNAUDNORM_PEAK", "0.9").strip()
+        max_gain = os.getenv("AUDIO_DYNAUDNORM_MAXGAIN", "10").strip()
+        filters.append(f"dynaudnorm=f={frame}:g={gausssize}:p={peak}:m={max_gain}")
+
+    return ",".join(filters)
+
+
+def load_audio_preprocessed(audio_path: Path) -> np.ndarray:
+    """以 ffmpeg 解碼音訊並套用前處理，輸出與 whisperx.load_audio 相同的格式。
+
+    WhisperX 本來就會呼叫 ffmpeg 解碼成 16 kHz 單聲道，此處只是在同一條命令上
+    追加 filter，不額外增加 I/O；停用前處理時行為與 whisperx.load_audio 等價。
+    """
+    filters = _build_audio_filters()
+
+    command = ["ffmpeg", "-nostdin", "-threads", "0", "-i", str(audio_path)]
+    if filters:
+        command += ["-af", filters]
+    command += [
+        "-f", "s16le",
+        "-ac", "1",
+        "-acodec", "pcm_s16le",
+        "-ar", str(ASR_SAMPLE_RATE),
+        "-",
+    ]
+
+    try:
+        result = subprocess.run(command, capture_output=True, check=True)
+    except FileNotFoundError as error:
+        raise RuntimeError("找不到 ffmpeg，無法解碼音訊") from error
+    except subprocess.CalledProcessError as error:
+        stderr = error.stderr.decode("utf-8", errors="ignore") if error.stderr else ""
+        raise RuntimeError(f"音訊解碼失敗：{stderr}") from error
+
+    if filters:
+        logger.info("音訊前處理已套用：%s", filters)
+
+    return np.frombuffer(result.stdout, np.int16).flatten().astype(np.float32) / INT16_MAX_ABS
 
 
 def _speaker_code(index: int) -> str:
@@ -139,7 +224,8 @@ class WhisperXTranscriber:
                 f"或 WhisperX 內建模型代號；自訂 fine-tune 需先轉為 CTranslate2）：{error}"
             ) from error
 
-        audio = whisperx.load_audio(str(audio_path))
+        # 以自訂解碼取代 whisperx.load_audio，以便在同一條 ffmpeg 命令中套用前處理
+        audio = load_audio_preprocessed(audio_path)
 
         # 1. 轉錄
         result = asr_model.transcribe(

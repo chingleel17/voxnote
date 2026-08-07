@@ -223,12 +223,11 @@ pub async fn transcribe_voxnote_asr(
         form = form.text("language", language.to_string());
     }
     form = form.text("diarize", speaker_detection.to_string());
-    // 已知確切人數時以 min=max 鎖定，提升 pyannote 分離準確度
-    if speaker_detection && speakers_expected > 0 {
-        let expected = speakers_expected.to_string();
-        form = form
-            .text("min_speakers", expected.clone())
-            .text("max_speakers", expected);
+    // 與會人員數僅作為上限：單次請求處理的是單一錄音段落，該段未必所有人都發言，
+    // 若以 min=max 鎖死會迫使 pyannote 把少數幾人硬拆成與會人數，反而破壞分離結果。
+    // 與會名單只有 1 人時多半是尚未填寫完整，此時不設上限以免整段被判為單一語者。
+    if speaker_detection && speakers_expected > 1 {
+        form = form.text("max_speakers", speakers_expected.to_string());
     }
 
     let client = reqwest::Client::builder()

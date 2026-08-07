@@ -16,6 +16,8 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "python-multipart>=0.0.9",
     "opencc-python-reimplemented>=0.1.7",
+    # 音訊前處理需直接操作解碼後的 PCM 陣列，故明確宣告（whisperx 亦間接相依）
+    "numpy>=1.26",
     "whisperx>=3.1",
     "ctranslate2>=4.4",
     "torch>=2.2",

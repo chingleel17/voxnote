@@ -121,6 +121,11 @@ export interface AppConfig {
   speaker_detection: boolean; // 說話人偵測
   auto_proofread_after_transcription: boolean; // 逐段轉譯完成後自動 AI 校稿
 
+  // 播放增益（會議錄音響度通常低於一般影音內容）
+  playback_gain: number;         // 增益倍率，1.0 為原始音量
+  playback_compressor: boolean;  // 動態壓縮
+  playback_highpass: boolean;    // 高通濾波
+
   // LLM
   llm_provider: 'openai' | 'claude' | 'gemini' | 'openrouter' | 'ollama' | 'custom';
   openai_key: string;

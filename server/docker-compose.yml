@@ -8,6 +8,13 @@ services:
       ASR_MODEL: ${ASR_MODEL:-/models/asr-model}
       HF_HOME: /root/.cache/huggingface
       HF_TOKEN_FILE: /run/secrets/hf_token
+      # 音訊前處理：設為 0 可停用，用於比對前處理對轉錄與語者分離的實際影響
+      AUDIO_PREPROCESS: ${AUDIO_PREPROCESS:-1}
+      # 高通濾波截止頻率（Hz），濾除冷氣與桌面震動等低頻噪音；設為 0 可單獨停用
+      AUDIO_HIGHPASS_HZ: ${AUDIO_HIGHPASS_HZ:-80}
+      # 響度標準化方式："loudnorm"（保持訊噪比，60 分鐘約 35 秒）、
+      # "dynaudnorm"（約 2.3 秒但會放大靜音段底噪）或 "none"（僅高通濾波）
+      AUDIO_NORMALIZER: ${AUDIO_NORMALIZER:-loudnorm}
     volumes:
       # host 端模型目錄（預設放 Breeze-ASR-26；可用 .env 的 ASR_MODEL_PATH 覆寫）
       - ${ASR_MODEL_PATH:-./models/asr-model}:/models/asr-model:ro

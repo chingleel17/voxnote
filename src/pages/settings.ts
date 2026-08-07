@@ -191,6 +191,19 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
   });
   settingsGrid.appendChild(llmSection);
 
+  // ── 播放增益區塊 ──
+  const playbackSection = buildPlaybackSection(config, (updated) => {
+    config = {
+      ...config,
+      playback_gain: updated.playback_gain,
+      playback_compressor: updated.playback_compressor,
+      playback_highpass: updated.playback_highpass,
+    };
+    setCurrentConfig(config);
+    scheduleAutoSave();
+  });
+  settingsGrid.appendChild(playbackSection);
+
   const notificationSection = buildNotificationSection(config, (updated) => {
     config = {
       ...config,
@@ -593,6 +606,113 @@ function buildBackupSection(): HTMLElement {
       setBusy(false);
     }
   });
+
+  return section;
+}
+
+// ─────────────────────────────────────────────
+// 播放增益區塊
+// ─────────────────────────────────────────────
+function buildPlaybackSection(
+  config: AppConfig,
+  onChange: (c: AppConfig) => void,
+): HTMLElement {
+  const section = document.createElement('section');
+  section.className = 'settings-section';
+
+  const heading = document.createElement('h3');
+  heading.className = 'settings-section-title';
+  heading.textContent = '播放增益';
+  section.appendChild(heading);
+
+  // 增益倍率滑桿
+  const gainGroup = document.createElement('div');
+  gainGroup.className = 'form-group';
+  const gainLabel = document.createElement('label');
+  gainLabel.textContent = '預設播放增益';
+  const gainRow = document.createElement('div');
+  gainRow.className = 'settings-gain-row';
+  const gainSlider = document.createElement('input');
+  gainSlider.type = 'range';
+  gainSlider.min = '1';
+  gainSlider.max = '4';
+  gainSlider.step = '0.1';
+  gainSlider.value = String(config.playback_gain ?? 2);
+  const gainValue = document.createElement('span');
+  gainValue.className = 'settings-gain-value';
+  gainValue.textContent = `${Number(gainSlider.value).toFixed(1)}x`;
+  gainSlider.addEventListener('input', () => {
+    const value = Number(gainSlider.value);
+    gainValue.textContent = `${value.toFixed(1)}x`;
+    config = { ...config, playback_gain: value };
+    onChange(config);
+  });
+  gainRow.appendChild(gainSlider);
+  gainRow.appendChild(gainValue);
+  const gainHint = document.createElement('small');
+  gainHint.className = 'form-hint';
+  gainHint.textContent = '會議錄音的響度通常明顯低於一般影音內容，可在此設定播放時的預設放大倍率。播放器上的滑桿可臨時微調。';
+  gainGroup.appendChild(gainLabel);
+  gainGroup.appendChild(gainRow);
+  gainGroup.appendChild(gainHint);
+  section.appendChild(gainGroup);
+
+  // 動態壓縮開關
+  const compressorGroup = document.createElement('div');
+  compressorGroup.className = 'form-group';
+  const compressorLabel = document.createElement('label');
+  compressorLabel.textContent = '動態壓縮';
+  const compressorToggle = document.createElement('label');
+  compressorToggle.className = 'toggle-switch';
+  const compressorInput = document.createElement('input');
+  compressorInput.type = 'checkbox';
+  compressorInput.checked = config.playback_compressor !== false;
+  compressorInput.addEventListener('change', () => {
+    config = { ...config, playback_compressor: compressorInput.checked };
+    onChange(config);
+  });
+  const compressorSlider = document.createElement('span');
+  compressorSlider.className = 'toggle-slider';
+  compressorToggle.appendChild(compressorInput);
+  compressorToggle.appendChild(compressorSlider);
+  const compressorHint = document.createElement('small');
+  compressorHint.className = 'form-hint';
+  compressorHint.textContent = '拉近大小聲的差距，讓距離較遠的與會者聽起來更清楚。（防止爆音的限幅器一律啟用，不受此設定影響。）';
+  compressorGroup.appendChild(compressorLabel);
+  compressorGroup.appendChild(compressorToggle);
+  compressorGroup.appendChild(compressorHint);
+  section.appendChild(compressorGroup);
+
+  // 高通濾波開關
+  const highpassGroup = document.createElement('div');
+  highpassGroup.className = 'form-group';
+  const highpassLabel = document.createElement('label');
+  highpassLabel.textContent = '低頻噪音濾除';
+  const highpassToggle = document.createElement('label');
+  highpassToggle.className = 'toggle-switch';
+  const highpassInput = document.createElement('input');
+  highpassInput.type = 'checkbox';
+  highpassInput.checked = config.playback_highpass !== false;
+  highpassInput.addEventListener('change', () => {
+    config = { ...config, playback_highpass: highpassInput.checked };
+    onChange(config);
+  });
+  const highpassSlider = document.createElement('span');
+  highpassSlider.className = 'toggle-slider';
+  highpassToggle.appendChild(highpassInput);
+  highpassToggle.appendChild(highpassSlider);
+  const highpassHint = document.createElement('small');
+  highpassHint.className = 'form-hint';
+  highpassHint.textContent = '濾除 80 Hz 以下的冷氣運轉聲與桌面震動等低頻噪音。';
+  highpassGroup.appendChild(highpassLabel);
+  highpassGroup.appendChild(highpassToggle);
+  highpassGroup.appendChild(highpassHint);
+  section.appendChild(highpassGroup);
+
+  const applyHint = document.createElement('small');
+  applyHint.className = 'form-hint';
+  applyHint.textContent = '設定變更後，需重新開啟會議頁面才會套用至播放器。';
+  section.appendChild(applyHint);
 
   return section;
 }

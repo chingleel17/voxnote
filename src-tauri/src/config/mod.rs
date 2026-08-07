@@ -20,6 +20,11 @@ pub struct AppConfig {
     pub speaker_detection: bool,                  // 是否啟用說話人偵測
     pub auto_proofread_after_transcription: bool, // 逐段轉譯完成後自動 AI 校稿
 
+    // 播放增益：會議錄音響度通常遠低於一般影音內容，故播放時額外補償
+    pub playback_gain: f32,          // 增益倍率，1.0 為原始音量
+    pub playback_compressor: bool,   // 動態壓縮，拉近大小聲差距
+    pub playback_highpass: bool,     // 高通濾波，濾除低頻噪音
+
     // LLM 供應商："openai" | "claude" | "gemini" | "openrouter" | "ollama" | "custom"
     pub llm_provider: String,
     pub openai_key: String,
@@ -61,6 +66,10 @@ impl Default for AppConfig {
             asr_language: "zh".into(),
             speaker_detection: true,
             auto_proofread_after_transcription: false,
+            // 預設 2 倍增益並開啟壓縮：手機於會議室桌面收音的錄音多半偏小聲
+            playback_gain: 2.0,
+            playback_compressor: true,
+            playback_highpass: true,
             llm_provider: "openai".into(),
             openai_key: String::new(),
             openai_model: "gpt-4.1-mini".into(),
@@ -100,6 +109,40 @@ pub fn load_config(app: &AppHandle) -> Result<AppConfig> {
     let content = std::fs::read_to_string(&config_path)?;
     let config: AppConfig = toml::from_str(&content)?;
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_config_gets_playback_defaults() {
+        // 既有使用者的 config.toml 沒有播放增益欄位，須靠 serde(default) 補上預設值
+        let legacy = r#"
+asr_provider = "voxnote_asr"
+speaker_detection = true
+"#;
+        let config: AppConfig = toml::from_str(legacy).expect("舊版設定應可解析");
+        assert_eq!(config.playback_gain, 2.0);
+        assert!(config.playback_compressor);
+        assert!(config.playback_highpass);
+        // 既有欄位不應被預設值覆蓋
+        assert_eq!(config.asr_provider, "voxnote_asr");
+    }
+
+    #[test]
+    fn playback_settings_round_trip() {
+        let mut config = AppConfig::default();
+        config.playback_gain = 3.5;
+        config.playback_compressor = false;
+
+        let serialized = toml::to_string_pretty(&config).expect("應可序列化");
+        let reparsed: AppConfig = toml::from_str(&serialized).expect("應可重新解析");
+
+        assert_eq!(reparsed.playback_gain, 3.5);
+        assert!(!reparsed.playback_compressor);
+        assert!(reparsed.playback_highpass);
+    }
 }
 
 pub fn save_config(app: &AppHandle, config: &AppConfig) -> Result<()> {

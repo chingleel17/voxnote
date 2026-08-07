@@ -1196,6 +1196,52 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
   font-variant-numeric: tabular-nums;
 }
 
+/* 設定頁的增益滑桿 */
+.settings-gain-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.settings-gain-row input[type='range'] {
+  flex: 1;
+  accent-color: var(--color-accent);
+  cursor: pointer;
+}
+
+.settings-gain-value {
+  font-size: 13px;
+  color: var(--color-text-muted);
+  min-width: 36px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 播放增益滑桿 */
+.player-gain {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.player-gain-slider {
+  width: 64px;
+  accent-color: var(--color-accent);
+  cursor: pointer;
+}
+
+/* 增益鏈尚未生效（未播放或環境不支援）時淡化顯示 */
+.player-gain.inactive {
+  opacity: 0.45;
+}
+
+.player-gain-label {
+  font-size: 12px;
+  color: var(--color-text-muted);
+  min-width: 30px;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ============================================================
    設定頁
    ============================================================ */

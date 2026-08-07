@@ -11,7 +11,7 @@ import { createTemplate } from '../api/templates';
 import { getTags } from '../api/tags';
 import { openModal } from '../components/modal';
 import { showToast } from '../components/toast';
-import { createWaveformPlayer } from '../components/audioPlayer';
+import { applyMediaCrossOrigin, createWaveformPlayer } from '../components/audioPlayer';
 import { buildParticipantEditor } from '../components/participantEditor';
 import { save as saveDialog, open as openDialog } from '@tauri-apps/plugin-dialog';
 import { exportMeetingBundle } from '../api/meetingExport';
@@ -1722,6 +1722,9 @@ function buildRecordingSection(
     audioEl.dataset.recordingId = rec.id;
     void resolveRecordingSource(rec.file_path!).then((src) => {
       if (audioEl.dataset.recordingId === rec.id) {
+        // crossOrigin 必須早於 src 設定才會生效。asset 協定與本頁不同源，
+        // 未以 CORS 模式載入時播放增益會因規範限制而被消音。
+        applyMediaCrossOrigin(audioEl, src);
         audioEl.src = src;
       }
     }).catch((err) => {
