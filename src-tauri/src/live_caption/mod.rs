@@ -38,6 +38,24 @@ const OVERLAY_EDGE_ZONE_LOGICAL: f64 = 10.0;
 const OVERLAY_HEADER_HEIGHT_LOGICAL: f64 = 34.0;
 const SAMPLE_RATE: u32 = 16_000;
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// 逐段的非語音機率上限，超過即視為模型在近乎無語音的片段上硬吐文字。
+/// 取 0.6 而非更嚴的值，是因為即時字幕的短視窗本就容易讓此機率偏高。
+/// 注意：實測顯示幻覺片段的此機率為 0.000，故此項對該類幻覺無攔截效果。
+const SEGMENT_NO_SPEECH_MAX: f32 = 0.6;
+/// 字幕字級的四檔預設值（S/M/L/XL，單位為像素）。使用者只能由此四檔中選擇，
+/// 不開放輸入任意數字；同時顯示的行數已改由視窗高度與此字級計算，故字級的
+/// 級距不宜過密，否則行數估算會過於敏感。
+const FONT_SIZE_PRESETS: [u32; 4] = [20, 24, 28, 36];
+
+/// 將任意字級數值收斂至最接近的預設檔位，用於既有 config.toml 內非四檔之一的
+/// 舊數值（例如使用者曾以進階設定輸入的任意 px）。
+fn nearest_font_size_preset(value: u32) -> u32 {
+    FONT_SIZE_PRESETS
+        .iter()
+        .copied()
+        .min_by_key(|preset| preset.abs_diff(value))
+        .unwrap_or(28)
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StartLiveCaptionRequest {
@@ -67,7 +85,6 @@ pub struct LiveCaptionStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct LiveCaptionSettingsPayload {
     pub font_size: u32,
-    pub max_lines: usize,
     pub clear_seconds: u32,
     pub click_through: bool,
 }
@@ -196,8 +213,7 @@ impl LiveCaptionManager {
                 let _ = app.emit(
                     LIVE_CAPTION_SETTINGS_EVENT,
                     LiveCaptionSettingsPayload {
-                        font_size: config.live_caption_font_size.clamp(16, 72),
-                        max_lines: config.live_caption_max_lines.clamp(1, 10) as usize,
+                        font_size: nearest_font_size_preset(config.live_caption_font_size),
                         clear_seconds: config.live_caption_clear_seconds.min(60),
                         click_through: config.live_caption_click_through,
                     },
@@ -510,20 +526,7 @@ fn process_caption_windows(
         let peak = window
             .iter()
             .fold(0.0f32, |max, sample| max.max(sample.abs()));
-        // 診斷用：RMS 比 peak 更能反映整體音量，單一尖峰不會造成誤判。
-        let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
-        let non_zero = window.iter().filter(|s| s.abs() > 1e-6).count();
-        println!(
-            "[live-caption] 視窗樣本={} peak={:.6} rms={:.6} 非零樣本={} ({:.1}%) 門檻={:.6}",
-            window.len(),
-            peak,
-            rms,
-            non_zero,
-            non_zero as f32 / window.len() as f32 * 100.0,
-            config.live_caption_silence_threshold,
-        );
         if peak < config.live_caption_silence_threshold {
-            println!("[live-caption] peak 低於靜音門檻，略過本視窗");
             continue;
         }
 
@@ -652,24 +655,33 @@ fn transcribe_with_whisper(
     // 對短視窗而言更容易掰出訓練資料裡的常見字幕文字。
     params.set_temperature(0.0);
     params.set_temperature_inc(0.0);
-    // 即時字幕的視窗遠短於 Whisper 原生的 30 秒設計，短片段的信心分數天生偏低，
-    // 沿用長音檔的預設門檻會把正常語音一併濾掉，故此處放寬三項門檻，
-    // 幻覺改由 is_hallucination 的字串比對把關。
-    params.set_logprob_thold(-2.0);
-    params.set_no_speech_thold(0.9);
-    params.set_entropy_thold(3.2);
+    // 即時字幕的視窗短於 Whisper 原生的 30 秒設計，短片段的信心分數略偏低，
+    // 故較預設（-1.0／2.4）稍微放寬，但不再沿用先前的 -2.0／3.2——那組值等同關閉把關。
+    // 注意：這兩項僅為一般性把關，不足以擋下實測到的幻覺
+    // （"Thank you for watching!" 的 avg_logprobs = -0.967、entropy = 1.946，
+    // 兩者皆優於此處門檻）。該類幻覺實際由下方逐段的 no_speech 判定
+    // 與 HALLUCINATION_MARKERS 字串比對攔截。
+    params.set_logprob_thold(-1.2);
+    params.set_entropy_thold(2.8);
     state
         .full(params, samples)
         .context("Whisper 即時推論失敗")?;
 
     let segment_count = state.full_n_segments();
-    println!("[live-caption] Whisper 段落數={}", segment_count);
     let mut text = String::new();
     for index in 0..segment_count {
+        let segment = state
+            .get_segment(index)
+            .ok_or_else(|| anyhow!("無法讀取 Whisper 段落"))?;
+        // whisper-rs 0.16 的 set_no_speech_thold 於上游尚未實作（見其 whisper_params.rs
+        // 註解「Currently (as of v1.3.0) not implemented」），設定該參數不會生效，
+        // 故改由此處逐段自行判定，濾除模型自認多半非語音卻仍吐字的段落。
+        if segment.no_speech_probability() > SEGMENT_NO_SPEECH_MAX {
+            println!("[live-caption] 段落 {} 非語音機率超過門檻，略過該段", index);
+            continue;
+        }
         text.push_str(
-            &state
-                .get_segment(index)
-                .ok_or_else(|| anyhow!("無法讀取 Whisper 段落"))?
+            &segment
                 .to_str()
                 .context("無法讀取 Whisper 轉錄文字")?,
         );
@@ -713,6 +725,21 @@ const HALLUCINATION_MARKERS: &[&str] = &[
     "amara.org",
     "MBC 뉴스",
     "ご視聴ありがとうございました",
+    // 英文幻覺：Whisper 的訓練資料含大量 YouTube 影片，音訊資訊不足時會傾向
+    // 補出影片結尾的固定套語。以下皆為完整片語比對，不單獨比對 "thank you"、
+    // "subscribe" 等常用詞，避免刪掉正常英文語音。
+    "thank you for watching",
+    "thanks for watching",
+    "thank you so much for watching",
+    "thank you for your watching",
+    "please subscribe",
+    "don't forget to subscribe",
+    "like and subscribe",
+    "see you in the next video",
+    "see you next video",
+    "subtitles by",
+    "transcription by",
+    "transcribed by",
 ];
 
 /// 判斷單段轉錄結果是否為模型幻覺。
@@ -896,7 +923,16 @@ fn close_overlay(app: &AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_display_text, is_hallucination, remove_overlap};
+    use super::{build_display_text, is_hallucination, nearest_font_size_preset, remove_overlap};
+
+    #[test]
+    fn font_size_snaps_to_nearest_preset() {
+        assert_eq!(nearest_font_size_preset(28), 28);
+        assert_eq!(nearest_font_size_preset(16), 20);
+        assert_eq!(nearest_font_size_preset(72), 36);
+        // 25 明確較接近 24（差 1）而非 28（差 3），非中點情境。
+        assert_eq!(nearest_font_size_preset(25), 24);
+    }
 
     #[test]
     fn repeated_short_caption_is_not_emitted_again() {
@@ -930,5 +966,24 @@ mod tests {
     fn ordinary_speech_is_not_filtered() {
         assert!(!is_hallucination("今天我們要討論的是系統架構"));
         assert!(!is_hallucination("Let's talk about distributed systems."));
+    }
+
+    #[test]
+    fn english_outro_hallucinations_are_filtered() {
+        assert!(is_hallucination("Thank you for watching!"));
+        assert!(is_hallucination("Thanks for watching."));
+        assert!(is_hallucination("Please subscribe to my channel"));
+        assert!(is_hallucination("See you in the next video"));
+    }
+
+    /// 英文幻覺清單以完整片語比對，正常語音中出現 thank you、subscribe
+    /// 等常用詞不得被誤刪——技術演講談 pub/sub 訂閱即為典型情境。
+    #[test]
+    fn ordinary_english_containing_common_words_is_not_filtered() {
+        assert!(!is_hallucination("Thank you, that answers my question."));
+        assert!(!is_hallucination(
+            "The client will subscribe to the events topic."
+        ));
+        assert!(!is_hallucination("I was watching the memory usage closely."));
     }
 }

@@ -124,7 +124,6 @@ export interface LiveCaptionErrorPayload {
 
 export interface LiveCaptionSettingsPayload {
   font_size: number;
-  max_lines: number;
   clear_seconds: number;
   click_through: boolean;
 }
@@ -158,8 +157,7 @@ export interface AppConfig {
   live_caption_silence_threshold: number;
   live_caption_translate: boolean;
   live_caption_display_mode: 'translation' | 'original' | 'both';
-  live_caption_font_size: number;
-  live_caption_max_lines: number;
+  live_caption_font_size: number; // 僅接受 S/M/L/XL 四檔預設值，見 liveCaptionSettings.ts
   live_caption_clear_seconds: number;
   live_caption_click_through: boolean;
   // 即時字幕來源語言與遠端端點，與批次流程（asr_language / local_asr_base_url）各自獨立

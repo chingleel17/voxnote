@@ -29,8 +29,11 @@ pub struct AppConfig {
     pub live_caption_silence_threshold: f32,
     pub live_caption_translate: bool,
     pub live_caption_display_mode: String, // "translation" | "original" | "both"
+    // 字級僅接受 S/M/L/XL 四檔預設值（見 live_caption 模組），不開放自由輸入數字；
+    // 欄位型別維持 u32（實際像素）以相容既有 config.toml，介面層負責限制為四檔選項。
     pub live_caption_font_size: u32,
-    pub live_caption_max_lines: u32, // 字幕視窗同時保留的最大行數
+    // 同時顯示的段數已改由字幕視窗高度與目前字級決定，不再由使用者設定固定行數
+    // （2026-08-11：手動設定的行數與視窗高度不一致會導致文字溢出並互相疊字）。
     pub live_caption_clear_seconds: u32, // 無新字幕達此秒數即清空，0 代表不清空
     pub live_caption_click_through: bool, // 字幕視窗是否啟用點擊穿透
     // 即時字幕的來源語言與遠端端點與批次流程（asr_language / local_asr_base_url）各自獨立，
@@ -95,7 +98,6 @@ impl Default for AppConfig {
             live_caption_translate: true,
             live_caption_display_mode: "translation".into(),
             live_caption_font_size: 28,
-            live_caption_max_lines: 5,
             live_caption_clear_seconds: 8,
             live_caption_click_through: true,
             live_caption_language: "auto".into(),
@@ -183,7 +185,6 @@ live_caption_display_mode = "original"
 live_caption_font_size = 28
 "#;
         let config: AppConfig = toml::from_str(existing).expect("既有設定應可解析");
-        assert_eq!(config.live_caption_max_lines, 5);
         assert_eq!(config.live_caption_clear_seconds, 8);
         assert!(config.live_caption_click_through);
         // 既有欄位不應被預設值覆蓋

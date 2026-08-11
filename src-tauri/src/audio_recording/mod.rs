@@ -698,14 +698,22 @@ pub(crate) fn start_windows_loopback_capture(
             };
             audio_client.initialize_client(&desired_format, &Direction::Capture, &stream_mode)?;
 
+            // `initialize_client` 若不接受所請求的格式會回傳 Err（其直接將格式交給
+            // IAudioClient::Initialize，並以該格式的 blockalign 設定 bytes_per_frame），
+            // 因此執行至此即代表 desired_format 已生效，擷取端交付的就是 target_rate。
+            //
+            // 不可改用 get_mixformat() 的取樣率：該方法回傳的是「音訊引擎」的共用模式
+            // 格式（例如 48 kHz），與本 client 經 autoconvert 後實際交付的格式無關。
+            // 曾以其回傳值判斷是否需要重採樣，導致已是 16 kHz 的音訊又被降取樣一次，
+            // 送入模型的音訊變成約 3 倍速（人耳聽起來為花栗鼠聲），字幕全數錯誤。
             let mix_format = audio_client.get_mixformat()?;
-            let actual_rate = mix_format.get_samplespersec();
             println!(
-                "[loopback] 裝置={} 混音格式: 取樣率={} 聲道={} 位元深度={}；目標取樣率={}",
+                "[loopback] 裝置={} 引擎混音格式: 取樣率={} 聲道={} 位元深度={}；\
+                 本 client 經 autoconvert 實際擷取取樣率={}",
                 device
                     .get_friendlyname()
                     .unwrap_or_else(|_| "未知裝置".into()),
-                actual_rate,
+                mix_format.get_samplespersec(),
                 mix_format.get_nchannels(),
                 mix_format.get_bitspersample(),
                 target_rate,
@@ -716,51 +724,26 @@ pub(crate) fn start_windows_loopback_capture(
             audio_client.start_stream()?;
 
             let mut sample_queue: VecDeque<u8> = VecDeque::new();
-            let mut report_counter: u32 = 0;
-            let mut total_emitted: u64 = 0;
-            // 每次事件僅讀到一個裝置週期的資料（約 3 毫秒），若逐批各自重採樣，
-            // 重採樣器會在每批之間重置，且尾端不足一個輸出樣本的餘數會被捨棄，
-            // 導致實際吞吐遠低於即時速率、視窗遲遲無法填滿。
-            // 故改為累積至足夠長度後再一次重採樣，並保留跨批餘數維持波形連續。
+            // 每次事件僅讀到一個裝置週期的資料（約 3 毫秒），逐批推送會讓佇列鎖競爭
+            // 過於頻繁，故累積約 100 毫秒再一次推送。
+            // 擷取端交付的已是 target_rate（見上方 autoconvert 說明），此處不再重採樣。
             let mut pending_mono: Vec<f32> = Vec::new();
-            let resample_chunk = (actual_rate as usize / 10).max(1); // 約 100 毫秒
+            let push_chunk = (target_rate as usize / 10).max(1); // 約 100 毫秒
             while running.load(Ordering::SeqCst) {
                 capture_client.read_from_device_to_deque(&mut sample_queue)?;
                 if !sample_queue.is_empty() {
+                    // desired_format 為雙聲道 f32，故每個 frame 為 8 bytes。
                     while sample_queue.len() >= 8 {
                         let left = take_f32_le(&mut sample_queue)?;
                         let right = take_f32_le(&mut sample_queue)?;
                         pending_mono.push((left + right) * 0.5);
                     }
                 }
-                if pending_mono.len() >= resample_chunk {
-                    let processed = if actual_rate == target_rate {
-                        std::mem::take(&mut pending_mono)
-                    } else {
-                        // 以整數倍的輸入樣本重採樣，餘數留待下批，避免邊界被捨去。
-                        let ratio = actual_rate as f64 / target_rate as f64;
-                        let output_len = (pending_mono.len() as f64 / ratio).floor() as usize;
-                        let consumed = ((output_len as f64) * ratio).floor() as usize;
-                        let consumed = consumed.min(pending_mono.len());
-                        let chunk: Vec<f32> = pending_mono.drain(..consumed).collect();
-                        downmix_and_resample(&chunk, 1, actual_rate, target_rate)
-                    };
+                if pending_mono.len() >= push_chunk {
+                    let processed = std::mem::take(&mut pending_mono);
                     let peak = processed
                         .iter()
                         .fold(0.0f32, |max, sample| max.max(sample.abs()));
-                    // 診斷用：每 10 批輸出一次累計樣本數，可據此確認吞吐是否達到即時速率。
-                    report_counter = report_counter.wrapping_add(1);
-                    total_emitted = total_emitted.saturating_add(processed.len() as u64);
-                    if report_counter % 10 == 0 {
-                        println!(
-                            "[loopback] 第 {} 批，本批樣本={} 累計={} (約 {:.1} 秒) peak={:.6}",
-                            report_counter,
-                            processed.len(),
-                            total_emitted,
-                            total_emitted as f64 / target_rate as f64,
-                            peak,
-                        );
-                    }
                     if let Ok(mut level) = level_value.lock() {
                         *level = peak;
                     }

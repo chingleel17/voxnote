@@ -103,7 +103,6 @@ export async function renderLiveCaptionPage(container: HTMLElement): Promise<voi
       live_caption_translate: updated.live_caption_translate,
       live_caption_display_mode: updated.live_caption_display_mode,
       live_caption_font_size: updated.live_caption_font_size,
-      live_caption_max_lines: updated.live_caption_max_lines,
       live_caption_clear_seconds: updated.live_caption_clear_seconds,
       live_caption_click_through: updated.live_caption_click_through,
     };
@@ -206,7 +205,6 @@ export async function renderLiveCaptionPage(container: HTMLElement): Promise<voi
           live_caption_translate: pendingConfig.live_caption_translate,
           live_caption_display_mode: pendingConfig.live_caption_display_mode,
           live_caption_font_size: pendingConfig.live_caption_font_size,
-          live_caption_max_lines: pendingConfig.live_caption_max_lines,
           live_caption_clear_seconds: pendingConfig.live_caption_clear_seconds,
           live_caption_click_through: pendingConfig.live_caption_click_through,
         };

@@ -2,6 +2,16 @@ import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { getLiveCaptionBuildInfo } from '../api/liveCaption';
 import type { AppConfig } from '../types';
 
+/** 字幕字級的四檔預設值（像素），須與 src-tauri 的 FONT_SIZE_PRESETS 一致。 */
+const FONT_SIZE_PRESETS = [20, 24, 28, 36];
+
+/** 將既有 config.toml 內非四檔之一的數值收斂至最接近的預設檔位，供選單預選使用。 */
+function nearestFontSizePreset(value: number): number {
+  return FONT_SIZE_PRESETS.reduce((closest, preset) =>
+    Math.abs(preset - value) < Math.abs(closest - value) ? preset : closest,
+  );
+}
+
 /**
  * 即時字幕設定表單。
  *
@@ -253,30 +263,24 @@ export function buildLiveCaptionSettings(
     '需要 LLM 供應商可連線；翻譯失敗時回退顯示原文。',
   ));
 
-  container.appendChild(numberGroup(
-    '字幕字級（px）',
-    config.live_caption_font_size || 28,
-    16,
-    72,
-    1,
+  container.appendChild(selectGroup(
+    '字幕字級',
+    [
+      { value: '20', label: '小' },
+      { value: '24', label: '中' },
+      { value: '28', label: '大' },
+      { value: '36', label: '特大' },
+    ],
+    String(nearestFontSizePreset(config.live_caption_font_size || 28)),
     (value) => {
-      config = { ...config, live_caption_font_size: value };
+      config = { ...config, live_caption_font_size: Number(value) };
       onChange(config);
     },
   ));
-
-  container.appendChild(numberGroup(
-    '同時顯示行數',
-    config.live_caption_max_lines || 5,
-    1,
-    10,
-    1,
-    (value) => {
-      config = { ...config, live_caption_max_lines: value };
-      onChange(config);
-    },
-    '新字幕由下往上堆疊，超出行數的舊字幕會捲離。',
-  ));
+  const fontSizeHint = document.createElement('small');
+  fontSizeHint.className = 'form-hint';
+  fontSizeHint.textContent = '同時顯示的段數由字幕視窗大小自動決定，拖曳視窗邊框調整即可，無須另外設定行數。';
+  container.appendChild(fontSizeHint);
 
   container.appendChild(numberGroup(
     '無語音清空秒數',
