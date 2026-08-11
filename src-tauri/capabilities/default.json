@@ -2,9 +2,11 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "VoxNote default capabilities",
-  "windows": ["main"],
+  "windows": ["main", "live-caption-overlay"],
   "permissions": [
     "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-size",
     "opener:default",
     "dialog:default",
     "notification:default",

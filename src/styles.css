@@ -1274,6 +1274,40 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
   margin-bottom: 16px;
 }
 
+.settings-inline-details {
+  margin-top: 14px;
+  border-top: 1px solid var(--color-border);
+}
+
+.settings-inline-details summary {
+  padding: 12px 0 8px;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.settings-inline-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.settings-inline-details summary::after {
+  float: right;
+  color: var(--color-text-muted);
+  content: '+';
+  font-size: 14px;
+}
+
+.settings-inline-details[open] summary::after {
+  content: '-';
+}
+
+.settings-inline-body {
+  padding: 4px 0 2px;
+}
+
 .radio-label {
   display: flex;
   align-items: flex-start;
@@ -2155,10 +2189,88 @@ html, body { letter-spacing: 0.005em; }
 .record-controls { margin: 24px 0 12px; }
 .record-controls .btn-record { min-width: 220px; min-height: 52px; }
 
+.live-caption-panel {
+  max-width: 720px;
+  margin-top: 22px;
+  padding: 28px;
+  border: 1px solid var(--color-border);
+  border-top: 3px solid var(--color-accent);
+  background: color-mix(in srgb, var(--color-surface) 88%, transparent);
+}
+
+.live-caption-intro {
+  margin-bottom: 24px;
+  color: var(--color-text-secondary);
+  font-family: var(--font-display);
+  font-size: 17px;
+  line-height: 1.6;
+}
+
+.live-caption-meta {
+  margin-top: 18px;
+  color: var(--color-text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.live-caption-settings-details {
+  margin-top: 18px;
+  padding: 12px 14px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-tertiary);
+}
+
+.live-caption-settings-details > summary {
+  color: var(--color-text);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  user-select: none;
+}
+
+.live-caption-settings {
+  margin-top: 16px;
+  display: grid;
+  gap: 14px;
+}
+
+.live-caption-restart-hint {
+  margin-top: 10px;
+  color: var(--color-warning, #c98a2b);
+  font-weight: 600;
+}
+
+.live-caption-status {
+  margin-top: 18px;
+  padding: 12px 14px;
+  border-left: 2px solid var(--color-accent);
+  color: var(--color-text);
+  background: var(--color-bg-tertiary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.live-caption-error {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-left: 2px solid var(--color-error);
+  color: var(--color-error);
+  background: color-mix(in srgb, var(--color-error) 8%, transparent);
+  font-size: 13px;
+}
+
+.live-caption-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 24px;
+  flex-wrap: wrap;
+}
+
 @media (max-width: 780px) {
   .home-masthead { align-items: flex-start; flex-direction: column; gap: 6px; }
   .record-wrapper { padding: 22px 18px; }
   .meeting-card { padding-left: 18px; }
+  .live-caption-panel { padding: 22px 18px; }
 }
 
 /* Light theme contrast: filled controls need a paper-white foreground. */

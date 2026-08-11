@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-TW">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>即時字幕</title>
+  </head>
+  <body>
+    <main id="caption-overlay">
+      <header id="caption-drag-handle">
+        <span>即時字幕</span>
+        <div id="caption-controls">
+          <button id="caption-lock" type="button" title="鎖定後滑鼠可穿透至下方視窗">鎖定</button>
+          <button id="caption-close" type="button">關閉</button>
+        </div>
+      </header>
+      <section id="caption-list" aria-live="polite"></section>
+    </main>
+    <script type="module" src="/src/liveCaptionOverlay.ts"></script>
+  </body>
+</html>

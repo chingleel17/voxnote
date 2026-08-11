@@ -211,13 +211,6 @@ pub async fn transcribe_voxnote_asr(
     speakers_expected: u32,
     progress_cb: impl Fn(String),
 ) -> Result<String> {
-    let base_url = base_url.trim().trim_end_matches('/');
-    if base_url.is_empty() {
-        return Err(anyhow!("本地 ASR 伺服器位址未設定"));
-    }
-
-    // 長錄音檔可達數百 MB，以同步 I/O 讀取會阻塞 tokio 的工作執行緒，
-    // 使同一執行緒上的其他非同步工作（含逾時計時）無法推進
     let file_bytes = tokio::fs::read(file_path)
         .await
         .map_err(|e| anyhow!("無法讀取音訊檔案：{}", e))?;
@@ -226,7 +219,51 @@ pub async fn transcribe_voxnote_asr(
         .and_then(|name| name.to_str())
         .unwrap_or("audio.wav")
         .to_string();
-    let file_part = reqwest::multipart::Part::bytes(file_bytes).file_name(file_name);
+    transcribe_voxnote_asr_bytes(
+        base_url,
+        &file_name,
+        file_bytes,
+        language,
+        speaker_detection,
+        speakers_expected,
+        progress_cb,
+    )
+    .await
+}
+
+/// 將記憶體中的 16 kHz mono f32 音訊送至自架 ASR，不建立暫存音訊檔。
+pub async fn transcribe_voxnote_asr_samples(
+    base_url: &str,
+    samples: &[f32],
+    language: &str,
+) -> Result<String> {
+    transcribe_voxnote_asr_bytes(
+        base_url,
+        "live-caption.wav",
+        encode_pcm_wav(samples),
+        language,
+        false,
+        0,
+        |_| {},
+    )
+    .await
+}
+
+async fn transcribe_voxnote_asr_bytes(
+    base_url: &str,
+    file_name: &str,
+    file_bytes: Vec<u8>,
+    language: &str,
+    speaker_detection: bool,
+    speakers_expected: u32,
+    progress_cb: impl Fn(String),
+) -> Result<String> {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.is_empty() {
+        return Err(anyhow!("本地 ASR 伺服器位址未設定"));
+    }
+
+    let file_part = reqwest::multipart::Part::bytes(file_bytes).file_name(file_name.to_string());
     let mut form = reqwest::multipart::Form::new().part("file", file_part);
     if !language.is_empty() && language != "auto" {
         form = form.text("language", language.to_string());
@@ -244,7 +281,9 @@ pub async fn transcribe_voxnote_asr(
     // 避免 UI 永久停在「轉譯中」。
     let client = reqwest::Client::builder()
         .timeout(tokio::time::Duration::from_secs(LOCAL_ASR_TIMEOUT_SECS))
-        .read_timeout(tokio::time::Duration::from_secs(LOCAL_ASR_READ_IDLE_TIMEOUT_SECS))
+        .read_timeout(tokio::time::Duration::from_secs(
+            LOCAL_ASR_READ_IDLE_TIMEOUT_SECS,
+        ))
         .build()
         .map_err(|e| anyhow!("無法建立本地 ASR 連線：{}", e))?;
     let url = format!("{}/v1/audio/transcriptions", base_url);
@@ -314,6 +353,29 @@ pub async fn transcribe_voxnote_asr(
         return Err(anyhow!("本地 ASR 伺服器未回傳逐字稿"));
     }
     Ok(result.text)
+}
+
+fn encode_pcm_wav(samples: &[f32]) -> Vec<u8> {
+    let data_size = (samples.len() * 2) as u32;
+    let riff_size = 36 + data_size;
+    let mut bytes = Vec::with_capacity(riff_size as usize + 8);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&riff_size.to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&16_000u32.to_le_bytes());
+    bytes.extend_from_slice(&32_000u32.to_le_bytes());
+    bytes.extend_from_slice(&2u16.to_le_bytes());
+    bytes.extend_from_slice(&16u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data_size.to_le_bytes());
+    for sample in samples {
+        let value = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
 }
 
 // 本地 Whisper CLI 轉錄

@@ -1,17 +1,18 @@
 use tauri::Manager;
 
-mod audio_recording;
 mod ai;
 mod asr;
+mod audio_recording;
 mod backup;
 mod commands;
 mod config;
 mod db;
+mod live_caption;
 
 use commands::{
-    ai_cmds::*, asr_cmds::*, backup_cmds::*, meeting_cmds::*, meeting_export_cmds::*,
-    recording_cmds::*, settings_cmds::*, speaker_mapping_cmds::*, summary_cmds::*, tag_cmds::*,
-    template_cmds::*, transcript_cmds::*,
+    ai_cmds::*, asr_cmds::*, backup_cmds::*, live_caption_cmds::*, meeting_cmds::*,
+    meeting_export_cmds::*, recording_cmds::*, settings_cmds::*, speaker_mapping_cmds::*,
+    summary_cmds::*, tag_cmds::*, template_cmds::*, transcript_cmds::*,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -28,8 +29,8 @@ pub fn run() {
                 app_handle.manage(pool);
                 app_handle.manage(backup::DataOperationLock::default());
                 app_handle.manage(audio_recording::DesktopRecordingManager::default());
-                audio_recording::cleanup_stale_temp_files(&app_handle)
-                    .expect("暫存錄音清理失敗");
+                app_handle.manage(live_caption::LiveCaptionManager::default());
+                audio_recording::cleanup_stale_temp_files(&app_handle).expect("暫存錄音清理失敗");
             });
             Ok(())
         })
@@ -92,6 +93,13 @@ pub fn run() {
             // asr
             detect_local_asr_tools,
             start_transcription,
+            // live caption
+            start_live_caption,
+            stop_live_caption,
+            get_live_caption_status,
+            list_live_caption_audio_sources,
+            get_live_caption_build_info,
+            set_live_caption_click_through,
             // templates & saved participants
             get_saved_participants,
             upsert_saved_participant,

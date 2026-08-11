@@ -105,6 +105,34 @@ export interface RecordingPreview {
   warning: string | null;
 }
 
+export interface LiveCaptionStatus {
+  active: boolean;
+  backend: 'local_whisper' | 'voxnote_asr' | null;
+  audio_source: 'microphone' | 'system' | null;
+}
+
+export interface LiveCaptionPayload {
+  sequence: number;
+  original: string;
+  translation: string | null;
+  display_text: string;
+}
+
+export interface LiveCaptionErrorPayload {
+  message: string;
+}
+
+export interface LiveCaptionSettingsPayload {
+  font_size: number;
+  max_lines: number;
+  clear_seconds: number;
+  click_through: boolean;
+}
+
+export interface LiveCaptionBuildInfo {
+  cuda_enabled: boolean;
+}
+
 export interface AppConfig {
   // ASR
   asr_provider: 'assemblyai' | 'local' | 'voxnote_asr';
@@ -120,6 +148,25 @@ export interface AppConfig {
   asr_language: string;       // "zh" | "en" | "auto"
   speaker_detection: boolean; // 說話人偵測
   auto_proofread_after_transcription: boolean; // 逐段轉譯完成後自動 AI 校稿
+
+  // 即時字幕
+  live_caption_backend: 'local_whisper' | 'voxnote_asr';
+  live_caption_model_path: string;
+  live_caption_audio_source: 'microphone' | 'system';
+  live_caption_window_seconds: number;
+  live_caption_step_seconds: number;
+  live_caption_silence_threshold: number;
+  live_caption_translate: boolean;
+  live_caption_display_mode: 'translation' | 'original' | 'both';
+  live_caption_font_size: number;
+  live_caption_max_lines: number;
+  live_caption_clear_seconds: number;
+  live_caption_click_through: boolean;
+  // 即時字幕來源語言與遠端端點，與批次流程（asr_language / local_asr_base_url）各自獨立
+  live_caption_language: string; // "zh" | "en" | "auto"
+  live_caption_remote_base_url: string; // 空字串代表沿用 local_asr_base_url
+  live_caption_remote_model: string;
+  live_caption_remote_timeout_seconds: number;
 
   // 播放增益（會議錄音響度通常低於一般影音內容）
   playback_gain: number;         // 增益倍率，1.0 為原始音量

@@ -1,0 +1,134 @@
+:root {
+  --caption-font-size: 28px;
+  --caption-surface: rgba(12, 15, 14, 0.88);
+  --caption-text: #fffdf4;
+  --caption-muted: #b9c8bf;
+  --caption-border: rgba(255, 255, 255, 0.2);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+  color: var(--caption-text);
+  font-family: "Noto Sans TC", "Microsoft JhengHei", "Segoe UI", sans-serif;
+}
+
+#caption-overlay {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  /* 邊框保留感應區供調整大小，故內距不小於 EDGE_ZONE。 */
+  padding: 10px 14px 12px;
+  background: var(--caption-surface);
+  border: 1px solid var(--caption-border);
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.36);
+  transition: border-color 0.12s ease;
+}
+
+/* 游標位於控制列或邊框時高亮邊框，提示目前可互動。 */
+#caption-overlay.is-interactive {
+  border-color: rgba(255, 255, 255, 0.55);
+}
+
+/* 穿透狀態下控制列淡出，避免遮擋影片；互動時才顯示。 */
+#caption-drag-handle {
+  opacity: 0.35;
+  transition: opacity 0.12s ease;
+}
+
+#caption-overlay.is-interactive #caption-drag-handle {
+  opacity: 1;
+}
+
+#caption-drag-handle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 20px;
+  color: var(--caption-muted);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  cursor: move;
+  user-select: none;
+}
+
+#caption-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+#caption-lock,
+#caption-close {
+  padding: 2px 6px;
+  color: var(--caption-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+#caption-lock:hover,
+#caption-close:hover {
+  color: var(--caption-text);
+  border-color: var(--caption-border);
+}
+
+/* 鎖定中以實線邊框標示，讓使用者一眼看出目前為穿透狀態。 */
+#caption-lock.is-locked {
+  color: var(--caption-text);
+  border-color: var(--caption-border);
+}
+
+#caption-list {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 5px;
+  min-height: 0;
+  overflow: hidden;
+  padding-top: 4px;
+}
+
+.caption-line {
+  margin: 0;
+  overflow: hidden;
+  color: var(--caption-text);
+  font-size: var(--caption-font-size);
+  font-weight: 600;
+  line-height: 1.25;
+  text-align: center;
+  text-shadow: 0 2px 5px rgba(0, 0, 0, 0.85);
+  white-space: pre-wrap;
+  text-overflow: ellipsis;
+}
+
+.caption-line.caption-empty {
+  color: var(--caption-muted);
+  font-size: 14px;
+  font-weight: 400;
+}
+
+#caption-list {
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+#caption-list::-webkit-scrollbar {
+  display: none;
+}

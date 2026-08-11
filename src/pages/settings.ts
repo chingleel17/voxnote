@@ -204,6 +204,8 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
   });
   settingsGrid.appendChild(playbackSection);
 
+  // 即時字幕的設定改由即時字幕頁提供，此處不再重複。
+
   const notificationSection = buildNotificationSection(config, (updated) => {
     config = {
       ...config,
@@ -292,6 +294,16 @@ function buildAsrSection(
   );
   section.appendChild(providerGroup);
 
+  const advancedDetails = document.createElement('details');
+  advancedDetails.className = 'settings-inline-details';
+  const advancedSummary = document.createElement('summary');
+  advancedSummary.textContent = '進階語音轉錄設定';
+  advancedDetails.appendChild(advancedSummary);
+  const advancedBody = document.createElement('div');
+  advancedBody.className = 'settings-inline-body';
+  advancedDetails.appendChild(advancedBody);
+  section.appendChild(advancedDetails);
+
   // AssemblyAI Key
   const assemblySection = document.createElement('div');
   assemblySection.appendChild(
@@ -311,7 +323,7 @@ function buildAsrSection(
       }
     )
   );
-  section.appendChild(assemblySection);
+  advancedBody.appendChild(assemblySection);
 
   // 本地 Whisper
   const localSection = document.createElement('div');
@@ -337,10 +349,10 @@ function buildAsrSection(
       }
     )
   );
-  section.appendChild(localSection);
+  advancedBody.appendChild(localSection);
 
   // 本地 ASR 伺服器
-  const localServerSection = buildProviderSection([]);
+  const localServerSection = document.createElement('div');
   const endpointGroup = document.createElement('div');
   endpointGroup.className = 'form-group';
   const endpointLabel = document.createElement('label');
@@ -377,7 +389,7 @@ function buildAsrSection(
   endpointGroup.append(endpointLabel, endpointRow);
   localServerSection.appendChild(endpointGroup);
 
-  section.appendChild(localServerSection);
+  advancedBody.appendChild(localServerSection);
 
   // 偵測邏輯
   const resultEl = localSection.querySelector('.asr-detect-result') as HTMLElement;
@@ -405,8 +417,8 @@ function buildAsrSection(
   detectBtn.addEventListener('click', () => void runDetect());
   void runDetect();
 
-  // 語言設定（共用）
-  section.appendChild(
+  // 語言設定（僅供批次逐字稿使用）
+  advancedBody.appendChild(
     buildSelectGroup(
       '轉錄語言',
       [
@@ -423,6 +435,10 @@ function buildAsrSection(
       }
     )
   );
+  const asrLanguageHint = document.createElement('small');
+  asrLanguageHint.className = 'form-hint';
+  asrLanguageHint.textContent = '此語言與遠端端點僅套用於批次逐字稿（會議錄音）。即時字幕的來源語言與遠端端點為獨立設定，請至「即時字幕」頁的字幕設定調整。';
+  advancedBody.appendChild(asrLanguageHint);
 
   // 語者分離（AssemblyAI 與本地伺服器支援）
   const speakerGroup = document.createElement('div');
@@ -448,7 +464,7 @@ function buildAsrSection(
   speakerGroup.appendChild(speakerLabel);
   speakerGroup.appendChild(speakerToggle);
   speakerGroup.appendChild(speakerHint);
-  section.appendChild(speakerGroup);
+  advancedBody.appendChild(speakerGroup);
 
   const autoProofreadGroup = document.createElement('div');
   autoProofreadGroup.className = 'form-group';
@@ -473,7 +489,7 @@ function buildAsrSection(
   autoProofreadGroup.appendChild(autoProofreadLabel);
   autoProofreadGroup.appendChild(autoProofreadToggle);
   autoProofreadGroup.appendChild(autoProofreadHint);
-  section.appendChild(autoProofreadGroup);
+  advancedBody.appendChild(autoProofreadGroup);
 
   // 可見性控制
   const updateAsrVisibility = (provider: string): void => {

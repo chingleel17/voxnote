@@ -4,6 +4,7 @@ import { renderManagePage } from './pages/manage';
 import { renderMeetingPage } from './pages/meeting';
 import { renderRecordPage } from './pages/record';
 import { renderSettingsPage } from './pages/settings';
+import { renderLiveCaptionPage } from './pages/liveCaption';
 import { initStatusBar } from './components/statusBar';
 import { initConfigStore } from './utils/configStore';
 import { initNotificationFocusTracking } from './utils/notifications';
@@ -40,6 +41,9 @@ async function renderPage(container: HTMLElement, route: ParsedRoute): Promise<v
       break;
     case 'settings':
       await renderSettingsPage(container);
+      break;
+    case 'live-caption':
+      await renderLiveCaptionPage(container);
       break;
     default:
       await renderHomePage(container);

@@ -7,8 +7,9 @@ use crate::audio_recording::{
     self, DesktopRecordingManager, RecordingDeviceList, RecordingPreview, StartRecordingRequest,
 };
 use crate::backup::DataOperationLock;
-use crate::db::{models::Recording, recording, transcript};
 use crate::config::load_config;
+use crate::db::{models::Recording, recording, transcript};
+use crate::live_caption::LiveCaptionManager;
 
 #[tauri::command]
 pub async fn get_recording(
@@ -105,7 +106,11 @@ pub async fn start_desktop_recording(
     request: StartRecordingRequest,
     app_handle: AppHandle,
     manager: State<'_, DesktopRecordingManager>,
+    live_caption_manager: State<'_, LiveCaptionManager>,
 ) -> Result<(), String> {
+    if live_caption_manager.status().active {
+        return Err("目前有即時字幕進行中，無法開始桌面錄音".into());
+    }
     audio_recording::start_recording(manager.inner(), &app_handle, request)
         .map_err(|e| e.to_string())
 }
@@ -153,12 +158,13 @@ pub async fn commit_temporary_recording(
 
     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         std::fs::create_dir_all(&recordings_dir).map_err(|e| e.to_string())?;
-        std::fs::rename(&temp_path, &final_path_for_move).or_else(|_| {
-            std::fs::copy(&temp_path, &final_path_for_move)
-                .map(|_| ())
-                .and_then(|_| std::fs::remove_file(&temp_path))
-        })
-        .map_err(|e| e.to_string())?;
+        std::fs::rename(&temp_path, &final_path_for_move)
+            .or_else(|_| {
+                std::fs::copy(&temp_path, &final_path_for_move)
+                    .map(|_| ())
+                    .and_then(|_| std::fs::remove_file(&temp_path))
+            })
+            .map_err(|e| e.to_string())?;
         Ok(())
     })
     .await

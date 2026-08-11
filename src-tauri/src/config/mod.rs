@@ -20,10 +20,30 @@ pub struct AppConfig {
     pub speaker_detection: bool,                  // 是否啟用說話人偵測
     pub auto_proofread_after_transcription: bool, // 逐段轉譯完成後自動 AI 校稿
 
+    // 即時字幕
+    pub live_caption_backend: String, // "local_whisper" | "voxnote_asr"
+    pub live_caption_model_path: String, // GGML .bin 模型路徑
+    pub live_caption_audio_source: String, // "microphone" | "system"
+    pub live_caption_window_seconds: u32,
+    pub live_caption_step_seconds: u32,
+    pub live_caption_silence_threshold: f32,
+    pub live_caption_translate: bool,
+    pub live_caption_display_mode: String, // "translation" | "original" | "both"
+    pub live_caption_font_size: u32,
+    pub live_caption_max_lines: u32, // 字幕視窗同時保留的最大行數
+    pub live_caption_clear_seconds: u32, // 無新字幕達此秒數即清空，0 代表不清空
+    pub live_caption_click_through: bool, // 字幕視窗是否啟用點擊穿透
+    // 即時字幕的來源語言與遠端端點與批次流程（asr_language / local_asr_base_url）各自獨立，
+    // 因為即時字幕的實際用途（如觀看外語影片）常與批次會議轉錄的語言相反。
+    pub live_caption_language: String, // "zh" | "en" | "auto"
+    pub live_caption_remote_base_url: String, // 空字串代表沿用 local_asr_base_url
+    pub live_caption_remote_model: String,
+    pub live_caption_remote_timeout_seconds: u32, // 即時逾時，與批次的 LOCAL_ASR_TIMEOUT_SECS 分離
+
     // 播放增益：會議錄音響度通常遠低於一般影音內容，故播放時額外補償
-    pub playback_gain: f32,          // 增益倍率，1.0 為原始音量
-    pub playback_compressor: bool,   // 動態壓縮，拉近大小聲差距
-    pub playback_highpass: bool,     // 高通濾波，濾除低頻噪音
+    pub playback_gain: f32,        // 增益倍率，1.0 為原始音量
+    pub playback_compressor: bool, // 動態壓縮，拉近大小聲差距
+    pub playback_highpass: bool,   // 高通濾波，濾除低頻噪音
 
     // LLM 供應商："openai" | "claude" | "gemini" | "openrouter" | "ollama" | "custom"
     pub llm_provider: String,
@@ -66,6 +86,22 @@ impl Default for AppConfig {
             asr_language: "zh".into(),
             speaker_detection: true,
             auto_proofread_after_transcription: false,
+            live_caption_backend: "local_whisper".into(),
+            live_caption_model_path: String::new(),
+            live_caption_audio_source: "system".into(),
+            live_caption_window_seconds: 5,
+            live_caption_step_seconds: 3,
+            live_caption_silence_threshold: 0.01,
+            live_caption_translate: true,
+            live_caption_display_mode: "translation".into(),
+            live_caption_font_size: 28,
+            live_caption_max_lines: 5,
+            live_caption_clear_seconds: 8,
+            live_caption_click_through: true,
+            live_caption_language: "auto".into(),
+            live_caption_remote_base_url: String::new(),
+            live_caption_remote_model: String::new(),
+            live_caption_remote_timeout_seconds: 8,
             // 預設 2 倍增益並開啟壓縮：手機於會議室桌面收音的錄音多半偏小聲
             playback_gain: 2.0,
             playback_compressor: true,
@@ -128,6 +164,50 @@ speaker_detection = true
         assert!(config.playback_highpass);
         // 既有欄位不應被預設值覆蓋
         assert_eq!(config.asr_provider, "voxnote_asr");
+    }
+
+    #[test]
+    fn existing_config_gets_new_live_caption_defaults() {
+        // 既有使用者的 config.toml 已有即時字幕欄位，但沒有後續新增的三項；
+        // 若 serde(default) 未涵蓋，載入會失敗導致應用程式無法啟動。
+        let existing = r#"
+asr_language = "zh"
+live_caption_backend = "local_whisper"
+live_caption_model_path = 'C:\models\ggml-small.bin'
+live_caption_audio_source = "system"
+live_caption_window_seconds = 15
+live_caption_step_seconds = 3
+live_caption_silence_threshold = 0.01
+live_caption_translate = false
+live_caption_display_mode = "original"
+live_caption_font_size = 28
+"#;
+        let config: AppConfig = toml::from_str(existing).expect("既有設定應可解析");
+        assert_eq!(config.live_caption_max_lines, 5);
+        assert_eq!(config.live_caption_clear_seconds, 8);
+        assert!(config.live_caption_click_through);
+        // 既有欄位不應被預設值覆蓋
+        assert_eq!(config.live_caption_window_seconds, 15);
+        assert!(!config.live_caption_translate);
+        assert_eq!(config.live_caption_display_mode, "original");
+    }
+
+    #[test]
+    fn existing_config_gets_live_caption_remote_defaults() {
+        // 既有使用者的 config.toml 沒有即時字幕獨立語言／遠端端點欄位，
+        // 若 serde(default) 未涵蓋，載入會失敗導致應用程式無法啟動。
+        let existing = r#"
+asr_language = "zh"
+live_caption_backend = "voxnote_asr"
+live_caption_click_through = true
+"#;
+        let config: AppConfig = toml::from_str(existing).expect("既有設定應可解析");
+        assert_eq!(config.live_caption_language, "auto");
+        assert_eq!(config.live_caption_remote_base_url, "");
+        assert_eq!(config.live_caption_remote_model, "");
+        assert_eq!(config.live_caption_remote_timeout_seconds, 8);
+        // 既有欄位不應被預設值覆蓋
+        assert_eq!(config.asr_language, "zh");
     }
 
     #[test]

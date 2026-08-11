@@ -1,0 +1,77 @@
+## 0. 前置
+
+- [x] 0.1 確認 `add-live-caption-overlay` 的未完成任務（1.5、1.6、2.6、8.5、10.x）已完成或明確決定不阻擋本變更
+  - 1.5、1.6、2.6、8.5 已於工作區完成（見該變更 tasks.md）。10.x（設定調校）不阻擋本次「設定、背景穿透」範圍，將於本變更 7.x 實測階段一併處理。
+- [ ] 0.2 於 RTX 4090 主機部署適合英文低延遲轉錄的 ASR 服務實例（與既有 Breeze-ASR 實例並存），記錄其位址與所載入的模型
+  - 環境部署，非程式碼範圍，本次（設定／背景穿透功能）未執行。
+- [ ] 0.3 以 `curl` 對該端點發出一次 `/v1/audio/transcriptions` 請求，確認回應格式與既有自架服務相容
+  - 依賴 0.2，本次未執行。
+
+## 1. 即時字幕獨立設定項
+
+- [x] 1.1 於 `AppConfig`（`src-tauri/src/config/mod.rs`）新增 `live_caption_language`（預設 `auto`）
+- [x] 1.2 於 `AppConfig` 新增 `live_caption_remote_base_url` 與 `live_caption_remote_model`
+- [x] 1.3 新增即時逾時秒數欄位（`live_caption_remote_timeout_seconds`，預設 8 秒）
+  - 未新增 `live_caption_ignore_cursor_events` 持久化欄位：與既有 `live_caption_click_through`（自動游標感應穿透）語意重複。手動穿透改實作為 session 級 runtime override（不落盤），詳見第 5 節。
+- [x] 1.4 於 `src/types/index.ts` 同步新增對應 TypeScript 型別欄位
+- [x] 1.5 將 `live_caption/mod.rs` 的 `&config.asr_language`（原 462、467 行，現約 493、497 行）改為 `live_caption_language`；同步將端點改為 `live_caption_remote_base_url`（空值回退 `local_asr_base_url`），並更新 `live_caption_cmds.rs` 的啟動健康檢查
+- [x] 1.6 確認批次流程（`commands/asr_cmds.rs`）仍使用 `asr_language` 與 `local_asr_base_url`，未受影響（僅新增回退讀取，未修改批次呼叫路徑）
+
+## 2. 即時專用的遠端轉錄路徑
+
+- [ ] 2.1 於 `src-tauri/src/asr/mod.rs` 新增 `transcribe_live_caption_remote()`，接受外部傳入的 `reqwest::Client`
+- [ ] 2.2 該函式使用秒級逾時常數（與 `LOCAL_ASR_TIMEOUT_SECS` 分離），逾時回傳可辨識的錯誤型別
+- [ ] 2.3 該函式不實作重試；逾時或失敗即回報，由呼叫端丟棄該視窗
+- [ ] 2.4 於 session 啟動時建立一個 `reqwest::Client` 存入 session 狀態，供所有視窗共用
+- [ ] 2.5 將 `live_caption/mod.rs` 的 `voxnote_asr` 分支改為呼叫新函式並傳入共用 client 與專屬端點
+- [ ] 2.6 確認既有 `transcribe_voxnote_asr` 與 `transcribe_voxnote_asr_bytes` 的行為與逾時值完全未變
+- [ ] 2.7 確認 `transcribe_voxnote_asr_samples` 若已無呼叫端則移除，避免留下死碼
+
+## 3. 音訊佇列背壓
+
+- [ ] 3.1 定義待處理音訊的上限（以秒數表示）並加入設定或常數
+- [ ] 3.2 於 `live_caption/mod.rs` 的取樣消費迴圈實作超過上限時丟棄最舊樣本
+- [ ] 3.3 偵測到丟棄行為時，透過既有錯誤事件通道提示使用者字幕有所遺漏（需節流，避免持續落後時洗版）
+- [ ] 3.4 檢視 `block_on()` 呼叫（`live_caption/mod.rs:464`）在背壓機制下是否仍會阻塞取樣消費；若會，調整為轉錄與取樣分離
+
+## 4. 重疊去重與視窗設定
+
+- [ ] 4.1 將 `live_caption/mod.rs` 的 `remove_overlap()`（前後綴精確比對）替換為相似度去重
+- [ ] 4.2 保留最近 N 筆已輸出結果（參考實作為 10 筆）供比對，取代目前僅比對前一筆的 `previous_text`
+- [ ] 4.3 實作子字串重疊度與字元相似度的雙重判定，並設定最短長度門檻避免短句誤判
+- [ ] 4.4 於設定新增視窗長度與步進的情境預設組合（低延遲／一般／長句完整），維持視窗重疊
+- [ ] 4.5 確認不導入 VAD 至即時路徑；伺服器端批次流程既有的 VAD 使用不受影響
+
+## 5. 字幕視窗滑鼠穿透
+
+- [x] 5.1 於 `src-tauri/src/commands/live_caption_cmds.rs` 的 `set_live_caption_click_through` command 改為呼叫 `LiveCaptionManager::set_manual_click_through()`（該 command 前一變更已建立，本次改為手動切換語意）
+  - 語意定為「鎖定」＝穿透模式：`LiveCaptionManager::set_lock()` 切換 session 級 `click_through_enabled` 旗標。鎖定開啟時 watcher 持續依游標位置動態切換（游標移到標題列／邊框仍可互動，供拖曳、調整大小、按下關閉鈕）；鎖定關閉時 watcher 強制維持可互動、不套用穿透。watcher 全程運作，不會被手動切換停用，避免「移到標題列卻點不到關閉鈕」的問題
+- [x] 5.2 於 `src-tauri/capabilities/default.json` 補上所需權限（若適用）
+  - 不適用：前端透過自訂 `#[tauri::command]` 呼叫，非 `@tauri-apps/api/window` 的 JS API，自訂 command 不需要 capability 條目
+- [x] 5.3 加入切換入口，確保穿透開啟時仍可觸及
+  - 依使用者要求改置於字幕視窗自身的標題列（`overlay.html` 的 `#caption-lock`，與關閉鈕並列），而非主控制面板。穿透狀態下 watcher 會在游標移入標題列時恢復互動，故該按鈕仍可點擊，不會把使用者鎖在穿透狀態
+  - 為此將標題列感應高度 `OVERLAY_HEADER_HEIGHT_LOGICAL` 由 24px 放寬至 34px，涵蓋 CSS 上內距與標題列本身，避免游標落在標題列下緣時感應不到
+- [x] 5.4 確認穿透關閉時，字幕視窗的拖曳與調整大小（前一變更任務 8.4）仍正常
+  - 未變更 `liveCaptionOverlay.ts` 的拖曳／調整大小邏輯；鎖定關閉時 watcher 強制可互動，拖曳與調整大小行為不受影響
+
+## 6. 設定介面
+
+- [x] 6.1 於即時字幕的設定區塊新增來源語言、遠端端點位址、遠端模型、即時逾時等設定項
+  - 前一變更任務 7.6 已將即時字幕設定自 `settings.ts` 移至 `src/components/liveCaptionSettings.ts`（即時字幕頁使用），故新欄位加於該檔案而非 `settings.ts`；滑鼠穿透維持既有的自動穿透開關（`live_caption_click_through`），手動穿透為 runtime 切換不落盤，故未在此新增欄位
+- [x] 6.2 明確標示即時字幕的語言與端點與批次逐字稿為獨立設定，避免使用者誤以為共用
+  - 兩側皆已加註：`liveCaptionSettings.ts` 的來源語言欄位旁提示「與設定頁批次逐字稿各自獨立」；`settings.ts` 批次轉錄語言欄位旁提示「即時字幕為獨立設定，請至即時字幕頁調整」
+
+## 7. 實測與調校
+
+- [ ] 7.1 以實際英文影片實測：來源語言設為英文、後端指向 4090 主機，記錄字幕正確性與端到端延遲
+- [ ] 7.2 對照組實測：批次逐字稿以中文錄音轉錄，確認語言與端點皆未受即時字幕設定影響
+- [ ] 7.3 實測相似度去重與原前後綴比對的字幕品質差異（重複、漏字、誤刪短句），記錄結果
+- [ ] 7.4 實測背壓：以刻意降速或高負載情境確認字幕能追上當下聲音且記憶體維持在上限內
+- [ ] 7.5 實測遠端逾時路徑：中斷 4090 主機連線，確認單段失敗略過且 session 不中止
+- [ ] 7.6 依 7.1、7.3 的實測結果調校即時逾時、視窗情境預設組合與相似度門檻（含前一變更任務 10.3 的調校範圍）
+- [ ] 7.7 實測滑鼠穿透：於影片播放器上方疊放字幕視窗，確認點擊傳遞且可退出穿透狀態
+
+## 8. 文件
+
+- [ ] 8.1 於 README 說明即時字幕的來源語言與遠端端點為獨立設定，並說明適用情境（批次中文會議／即時英文影片）
+- [ ] 8.2 於 README 說明遠端 ASR 主機的部署需求與建議模型

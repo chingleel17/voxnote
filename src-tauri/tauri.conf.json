@@ -16,6 +16,22 @@
         "title": "VoxNote",
         "width": 800,
         "height": 600
+      },
+      {
+        "label": "live-caption-overlay",
+        "title": "即時字幕",
+        "url": "overlay.html",
+        "width": 720,
+        "height": 180,
+        "minWidth": 360,
+        "minHeight": 100,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "transparent": true,
+        "resizable": true,
+        "visible": false,
+        "focus": false
       }
     ],
     "security": {

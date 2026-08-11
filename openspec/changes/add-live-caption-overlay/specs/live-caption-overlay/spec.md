@@ -116,7 +116,9 @@
 
 系統 MUST 以獨立的浮動視窗顯示即時字幕。該視窗 MUST 永遠置於其他視窗之上，MUST 可由使用者移動與調整大小，且 MUST 不出現於工作列的獨立項目干擾主視窗操作。
 
-字幕視窗 MUST 僅保留最近的若干段字幕，較舊的內容 MUST 隨新字幕產生而捲離，避免無限增長。
+字幕視窗 MUST 僅保留最近的若干段字幕，較舊的內容 MUST 隨新字幕產生而捲離，避免無限增長。保留行數 MUST 可由使用者設定。
+
+當距離最後一段字幕超過使用者設定的秒數仍未產生新字幕時，字幕視窗 MUST 清空既有內容，避免舊字幕長時間停留在畫面上。該秒數 MUST 可由使用者設定，且 MUST 支援設為零以停用自動清空。
 
 #### Scenario: User overlays captions on a video player
 
@@ -127,6 +129,57 @@
 
 - **WHEN** 即時字幕 session 長時間執行並產生大量字幕
 - **THEN** 字幕視窗 MUST 僅保留最近的字幕內容，且 MUST 不因內容累積而持續消耗記憶體
+
+#### Scenario: Audio goes silent for an extended period
+
+- **WHEN** 影片暫停或音訊靜音達到使用者設定的清空秒數且期間未產生新字幕
+- **THEN** 字幕視窗 MUST 清空既有字幕並回到等待狀態
+
+#### Scenario: User disables automatic clearing
+
+- **WHEN** 使用者將清空秒數設為零
+- **THEN** 字幕 MUST 持續保留最近的若干行，MUST 不因長時間無語音而清空
+
+### Requirement: System allows interacting with content beneath the caption window
+
+字幕視窗 MUST 提供點擊穿透，使使用者能直接操作視窗下方的影片播放器。點擊穿透 MUST 可由使用者停用。
+
+啟用點擊穿透時，字幕文字區域 MUST 讓滑鼠事件穿透至下層視窗；標題列與視窗邊框感應區 MUST 在游標移入時恢復互動，使拖曳、調整大小與關閉等操作仍可執行。
+
+字幕視窗 MUST 可由視窗四邊與四角的邊框感應區調整大小，MUST 不僅依賴單一角落的控制點。
+
+#### Scenario: User clicks a video player beneath the captions
+
+- **WHEN** 點擊穿透啟用且使用者點擊字幕文字所覆蓋的影片區域
+- **THEN** 該點擊 MUST 傳遞至影片播放器，MUST 不被字幕視窗攔截
+
+#### Scenario: User moves the cursor to the caption window border
+
+- **WHEN** 點擊穿透啟用且使用者將游標移至字幕視窗的標題列或邊框感應區
+- **THEN** 字幕視窗 MUST 恢復接收滑鼠事件，使用者 MUST 能拖曳視窗、調整大小或關閉字幕
+
+#### Scenario: User disables click-through
+
+- **WHEN** 使用者停用點擊穿透
+- **THEN** 字幕視窗整體 MUST 恢復接收滑鼠事件
+
+### Requirement: System applies caption settings on the next session
+
+即時字幕的設定 MUST 由即時字幕頁提供，MUST 不要求使用者前往設定頁調整。
+
+啟動字幕前，系統 MUST 先將未儲存的設定寫入設定檔，確保本次啟動採用使用者當前所見的設定值。
+
+字幕進行中變更設定時，系統 MUST 告知使用者需停止並重新開始字幕才會套用。
+
+#### Scenario: User changes settings then starts captions
+
+- **WHEN** 使用者在即時字幕頁調整參數後立即按下開始
+- **THEN** 系統 MUST 先儲存設定再啟動，本次 session MUST 採用新設定值
+
+#### Scenario: User changes settings while captions are running
+
+- **WHEN** 使用者於字幕進行中變更設定
+- **THEN** 系統 MUST 顯示需重新啟動才會套用的提示
 
 ### Requirement: System reports live caption failures without terminating silently
 
