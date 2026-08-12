@@ -76,6 +76,17 @@ API、Docker 與部署契約已完成；`app.py` 的 Breeze-ASR-26 載入、Whis
 
 > 模型權重與 Hugging Face 快取以 volume 掛載，重建容器不會重新下載。升級時重新執行 `docker compose up -d --build`，再以健康檢查確認狀態。
 
+### 關於 image 大小與 CUDA 來源
+
+image 約 12.8 GB，其中約 7.7 GB 為 Python 相依，最大宗是 torch wheel 自帶的 CUDA runtime（`site-packages/nvidia/*` 約 4.1 GB）與 torch 本身（約 1.7 GB）。
+
+base image 使用純 `ubuntu:22.04` 而非 `nvidia/cuda:*-cudnn-runtime`：PyPI 的 torch wheel 已自帶完整 CUDA 與 cuDNN，與 base image 內建者重複，且實際載入的是前者——換言之厚重的 CUDA base image 從未被真正使用。改用純 Ubuntu 後 image 由 18.2 GB 降至 12.8 GB，已實測 `ctranslate2` 與 `torch` 皆能正常使用 GPU（`int8` 與 `float16` 皆驗證通過，含 pyannote VAD 路徑）。
+
+兩點影響：
+
+- GPU 存取改由 NVIDIA Container Toolkit 於執行期注入驅動，故步驟 1 的驗證仍是必要前提。
+- **CUDA 版本完全由 torch wheel 決定**（目前為 cu128），升級 torch 等同升級 CUDA。若日後改以系統 CUDA 為準，需同時調整 base image 與 torch 的安裝索引。
+
 ## 不使用 Docker 的本機開發（uv）
 
 本服務以 [uv](https://docs.astral.sh/uv/) 管理 Python 環境，請勿將相依安裝至全域 Python。`pyproject.toml` 已限定 `>=3.11,<3.13`：onnxruntime（pyannote 間接相依）不支援 3.10，WhisperX / CTranslate2 / pyannote 對 3.13 支援則尚不完整。若本機 Python 版本不符，執行 `uv sync` 時 uv 會自動下載 3.11。
