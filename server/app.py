@@ -1,16 +1,20 @@
 """VoxNote 本地 Breeze ASR 服務。"""
 
+import asyncio
 import logging
 import os
 import subprocess
 import tempfile
+import threading
+import time
 import uuid
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Callable
 
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from opencc import OpenCC
 
@@ -25,6 +29,35 @@ INT16_MAX_ABS = 32768.0
 app = FastAPI(title="VoxNote Local ASR", version="0.1.0")
 opencc = OpenCC("s2twp")
 
+TASK_RETENTION_SECONDS = 60 * 60
+MAX_COMPLETED_TASKS = 1000
+
+
+class TaskStatus(str, Enum):
+    """轉錄任務的生命週期狀態。"""
+
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    DONE = "done"
+    FAILED = "failed"
+
+
+@dataclass
+class TranscriptionTask:
+    """記憶體中的轉錄任務狀態。"""
+
+    status: TaskStatus = TaskStatus.QUEUED
+    progress: int = 0
+    result: dict[str, object] | None = None
+    error: str | None = None
+    created_at: float = 0.0
+    completed_at: float | None = None
+
+
+tasks: dict[str, TranscriptionTask] = {}
+tasks_lock = threading.Lock()
+transcription_lock = asyncio.Lock()
+
 
 @dataclass
 class TranscriptSegment:
@@ -34,6 +67,80 @@ class TranscriptSegment:
     end: float
     text: str
     speaker: str | None = None
+
+
+def _cleanup_tasks_locked() -> None:
+    """清除過期或超過上限的已完成任務；呼叫端必須持有 tasks_lock。"""
+    now = time.time()
+    expired_ids = [
+        task_id
+        for task_id, task in tasks.items()
+        if task.status in (TaskStatus.DONE, TaskStatus.FAILED)
+        and task.completed_at is not None
+        and now - task.completed_at >= TASK_RETENTION_SECONDS
+    ]
+    for task_id in expired_ids:
+        del tasks[task_id]
+
+    completed_ids = [
+        (task.completed_at or task.created_at, task_id)
+        for task_id, task in tasks.items()
+        if task.status in (TaskStatus.DONE, TaskStatus.FAILED)
+    ]
+    completed_ids.sort()
+    for _, task_id in completed_ids[:-MAX_COMPLETED_TASKS]:
+        del tasks[task_id]
+
+
+def _task_response(task: TranscriptionTask) -> dict[str, object]:
+    """將任務狀態轉成不暴露內部欄位的 API 回應。"""
+    response: dict[str, object] = {
+        "status": task.status.value,
+        "progress": task.progress,
+    }
+    if task.result is not None:
+        response["result"] = task.result
+    if task.error is not None:
+        response["error"] = task.error
+    return response
+
+
+def _update_task(
+    task_id: str,
+    *,
+    status: TaskStatus | None = None,
+    progress: int | None = None,
+    result: dict[str, object] | None = None,
+    error: str | None = None,
+) -> None:
+    """以執行緒安全方式更新任務狀態。"""
+    with tasks_lock:
+        task = tasks.get(task_id)
+        if task is None:
+            return
+        if status is not None:
+            task.status = status
+        if progress is not None:
+            task.progress = progress
+        if result is not None:
+            task.result = result
+        if error is not None:
+            task.error = error
+        if task.status in (TaskStatus.DONE, TaskStatus.FAILED):
+            task.completed_at = time.time()
+
+
+def _validate_speaker_options(
+    min_speakers: int | None,
+    max_speakers: int | None,
+) -> None:
+    """驗證語者數量參數。"""
+    if min_speakers is not None and min_speakers < 1:
+        raise HTTPException(status_code=422, detail="min_speakers 必須大於 0")
+    if max_speakers is not None and max_speakers < 1:
+        raise HTTPException(status_code=422, detail="max_speakers 必須大於 0")
+    if min_speakers and max_speakers and min_speakers > max_speakers:
+        raise HTTPException(status_code=422, detail="min_speakers 不可大於 max_speakers")
 
 
 def _build_audio_filters() -> str:
@@ -220,6 +327,7 @@ class WhisperXTranscriber:
         diarize: bool,
         min_speakers: int | None,
         max_speakers: int | None,
+        progress_callback: Callable[[int], None] | None = None,
     ) -> list[TranscriptSegment]:
         """執行轉錄、詞級對齊及可選的語者分離。"""
         import whisperx
@@ -242,6 +350,8 @@ class WhisperXTranscriber:
             batch_size=self._batch_size,
             language=language,
         )
+        if progress_callback:
+            progress_callback(33)
         detected_language = result.get("language", language or "zh")
 
         # 2. 詞級強制對齊
@@ -266,6 +376,9 @@ class WhisperXTranscriber:
         if diarize and not aligned:
             logger.warning("詞級對齊未完成，語者分離結果可能不完整")
 
+        if progress_callback:
+            progress_callback(66)
+
         # 3. 可選的語者分離
         if diarize:
             diarize_pipeline = self._ensure_diarize_pipeline()
@@ -277,6 +390,8 @@ class WhisperXTranscriber:
             diarize_segments = diarize_pipeline(audio, **diarize_kwargs)
             result = whisperx.assign_word_speakers(diarize_segments, result)
 
+        if progress_callback:
+            progress_callback(100)
         return self._to_segments(result.get("segments", []))
 
     @staticmethod
@@ -341,19 +456,16 @@ async def health() -> dict[str, str]:
 
 @app.post("/v1/audio/transcriptions")
 async def create_transcription(
+    background_tasks: BackgroundTasks,
     file: Annotated[UploadFile, File()],
     language: Annotated[str | None, Form()] = None,
     diarize: Annotated[bool, Form()] = False,
     min_speakers: Annotated[int | None, Form()] = None,
     max_speakers: Annotated[int | None, Form()] = None,
+    sync: Annotated[bool, Form()] = False,
 ) -> dict[str, object]:
-    """以 OpenAI 相容 multipart 契約接收音訊並回傳逐字稿與片段。"""
-    if min_speakers is not None and min_speakers < 1:
-        raise HTTPException(status_code=422, detail="min_speakers 必須大於 0")
-    if max_speakers is not None and max_speakers < 1:
-        raise HTTPException(status_code=422, detail="max_speakers 必須大於 0")
-    if min_speakers and max_speakers and min_speakers > max_speakers:
-        raise HTTPException(status_code=422, detail="min_speakers 不可大於 max_speakers")
+    """接收音訊；預設建立背景任務，sync=true 時直接回傳逐字稿。"""
+    _validate_speaker_options(min_speakers, max_speakers)
 
     upload_dir = Path(os.getenv("UPLOAD_DIR", tempfile.gettempdir())) / "voxnote-asr"
     upload_dir.mkdir(parents=True, exist_ok=True)
@@ -363,26 +475,69 @@ async def create_transcription(
 
     try:
         audio_path.write_bytes(await file.read())
-        segments = await run_in_threadpool(
-            transcriber.transcribe,
+        await file.close()
+
+        if sync:
+            try:
+                # 同步模式刻意不使用任務表或 BackgroundTasks，供即時字幕使用。
+                return await _transcribe_audio(
+                    audio_path,
+                    language,
+                    diarize,
+                    min_speakers,
+                    max_speakers,
+                )
+            except RuntimeError as error:
+                logger.error("轉錄前置條件不符：%s", error, exc_info=True)
+                raise HTTPException(status_code=503, detail=str(error)) from error
+            except Exception as error:
+                logger.exception("轉錄失敗")
+                raise HTTPException(status_code=500, detail=f"轉錄失敗：{error}") from error
+            finally:
+                audio_path.unlink(missing_ok=True)
+
+        task_id = uuid.uuid4().hex
+        with tasks_lock:
+            _cleanup_tasks_locked()
+            tasks[task_id] = TranscriptionTask(created_at=time.time())
+        background_tasks.add_task(
+            _run_transcription_task,
+            task_id,
             audio_path,
-            language if language and language != "auto" else None,
+            language,
             diarize,
             min_speakers,
             max_speakers,
         )
-    except RuntimeError as error:
-        # 設定或環境問題（模型載入失敗、缺少 token 等），記錄後回報 503
-        logger.error("轉錄前置條件不符：%s", error, exc_info=True)
-        raise HTTPException(status_code=503, detail=str(error)) from error
-    except Exception as error:
-        # 未預期錯誤須記錄完整 traceback，否則僅憑 HTTP 回應無法診斷
-        logger.exception("轉錄失敗")
-        raise HTTPException(status_code=500, detail=f"轉錄失敗：{error}") from error
-    finally:
+        return {"task_id": task_id, "status": TaskStatus.QUEUED.value, "progress": 0}
+    except HTTPException:
         await file.close()
         audio_path.unlink(missing_ok=True)
+        raise
+    except Exception:
+        await file.close()
+        audio_path.unlink(missing_ok=True)
+        raise
 
+
+async def _transcribe_audio(
+    audio_path: Path,
+    language: str | None,
+    diarize: bool,
+    min_speakers: int | None,
+    max_speakers: int | None,
+    progress_callback: Callable[[int], None] | None = None,
+) -> dict[str, object]:
+    """執行共用的轉錄與輸出格式化流程。"""
+    segments = await run_in_threadpool(
+        transcriber.transcribe,
+        audio_path,
+        language if language and language != "auto" else None,
+        diarize,
+        min_speakers,
+        max_speakers,
+        progress_callback,
+    )
     normalized_segments = [normalize_segment(segment, diarize) for segment in segments]
     return {
         "text": "\n".join(str(segment["text"]) for segment in normalized_segments),
@@ -390,3 +545,50 @@ async def create_transcription(
         "language": language or "auto",
         "diarization_enabled": diarize,
     }
+
+
+async def _run_transcription_task(
+    task_id: str,
+    audio_path: Path,
+    language: str | None,
+    diarize: bool,
+    min_speakers: int | None,
+    max_speakers: int | None,
+) -> None:
+    """在單一程序內循序執行背景轉錄任務。"""
+    try:
+        async with transcription_lock:
+            _update_task(task_id, status=TaskStatus.PROCESSING, progress=0)
+            result = await _transcribe_audio(
+                audio_path,
+                language,
+                diarize,
+                min_speakers,
+                max_speakers,
+                lambda progress: _update_task(task_id, progress=progress),
+            )
+            _update_task(
+                task_id,
+                status=TaskStatus.DONE,
+                progress=100,
+                result=result,
+            )
+    except RuntimeError as error:
+        logger.error("轉錄前置條件不符：%s", error, exc_info=True)
+        _update_task(task_id, status=TaskStatus.FAILED, error=f"轉錄失敗：{error}")
+    except Exception as error:
+        logger.exception("轉錄失敗")
+        _update_task(task_id, status=TaskStatus.FAILED, error=f"轉錄失敗：{error}")
+    finally:
+        audio_path.unlink(missing_ok=True)
+
+
+@app.get("/v1/tasks/{task_id}")
+async def get_transcription_task(task_id: str) -> dict[str, object]:
+    """查詢背景轉錄任務狀態與完成結果。"""
+    with tasks_lock:
+        _cleanup_tasks_locked()
+        task = tasks.get(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"找不到轉錄任務：{task_id}")
+        return {"task_id": task_id, **_task_response(task)}

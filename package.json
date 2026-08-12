@@ -8,7 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "tauri:build:cuda": "cross-env CMAKE_CUDA_ARCHITECTURES=120 tauri build --config src-tauri/tauri.cuda.conf.json --features live-caption-cuda"
+    "tauri:build:cuda": "cross-env CMAKE_CUDA_ARCHITECTURES=120 tauri build --config src-tauri/tauri.cuda.conf.json --features live-caption-cuda && node scripts/rename-cuda-bundle.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0",

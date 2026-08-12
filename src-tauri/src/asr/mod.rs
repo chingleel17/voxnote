@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::time::Instant;
 
 // 整體請求逾時。長會議錄音的處理時間可觀：實測 158 分鐘的錄音，僅音訊前處理即需
 // 約 90 秒，加上轉錄與語者分離總計可達數十分鐘，故放寬至 60 分鐘。
@@ -21,6 +22,16 @@ struct LocalServerTranscription {
     text: String,
     #[serde(default)]
     segments: Vec<LocalServerSegment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalServerTask {
+    task_id: String,
+    status: String,
+    #[serde(default)]
+    progress: u8,
+    result: Option<LocalServerTranscription>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -231,22 +242,66 @@ pub async fn transcribe_voxnote_asr(
     .await
 }
 
-/// 將記憶體中的 16 kHz mono f32 音訊送至自架 ASR，不建立暫存音訊檔。
-pub async fn transcribe_voxnote_asr_samples(
+/// 即時字幕逾時錯誤，供呼叫端辨識並略過該視窗（不重試、不中止 session）。
+#[derive(Debug)]
+pub struct LiveCaptionTimeoutError;
+
+impl std::fmt::Display for LiveCaptionTimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "即時字幕遠端轉錄逾時")
+    }
+}
+
+impl std::error::Error for LiveCaptionTimeoutError {}
+
+/// 將記憶體中的 16 kHz mono f32 音訊送至即時字幕專用的遠端 ASR，不建立暫存音訊檔。
+///
+/// 與批次的 `transcribe_voxnote_asr_bytes` 分離：使用呼叫端傳入、跨視窗共用的
+/// `reqwest::Client`（避免每視窗重建連線），逾時為秒級（與批次的 3600 秒無關），
+/// 且不重試——逾時或失敗即回傳錯誤，由呼叫端捨棄該視窗、繼續下一段。
+pub async fn transcribe_live_caption_remote(
+    client: &reqwest::Client,
     base_url: &str,
     samples: &[f32],
     language: &str,
+    timeout_seconds: u64,
 ) -> Result<String> {
-    transcribe_voxnote_asr_bytes(
-        base_url,
+    let base_url = normalize_local_asr_url(base_url)?;
+    let form = build_local_asr_form(
         "live-caption.wav",
         encode_pcm_wav(samples),
         language,
         false,
         0,
-        |_| {},
-    )
-    .await
+        true,
+    );
+    let url = format!("{}/v1/audio/transcriptions", base_url);
+
+    let response = client
+        .post(&url)
+        .timeout(tokio::time::Duration::from_secs(timeout_seconds))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                anyhow::Error::new(LiveCaptionTimeoutError)
+            } else {
+                anyhow!("即時字幕遠端轉錄請求失敗：{}", error)
+            }
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        return Err(anyhow!("即時字幕遠端伺服器回傳錯誤（{}）：{}", status, detail));
+    }
+
+    let result: LocalServerTranscription = response
+        .json()
+        .await
+        .map_err(|e| anyhow!("無法解析即時字幕遠端回應：{}", e))?;
+    format_local_asr_result(result, false)
 }
 
 async fn transcribe_voxnote_asr_bytes(
@@ -258,11 +313,119 @@ async fn transcribe_voxnote_asr_bytes(
     speakers_expected: u32,
     progress_cb: impl Fn(String),
 ) -> Result<String> {
+    let base_url = normalize_local_asr_url(base_url)?;
+    let form = build_local_asr_form(
+        file_name,
+        file_bytes,
+        language,
+        speaker_detection,
+        speakers_expected,
+        false,
+    );
+    let client = build_local_asr_client()?;
+    let url = format!("{}/v1/audio/transcriptions", base_url);
+
+    progress_cb("上傳音訊中...".into());
+    let response = client
+        .post(&url)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| map_local_asr_request_error(e, "建立轉錄任務"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        return Err(anyhow!("本地 ASR 伺服器回傳錯誤（{}）：{}", status, detail));
+    }
+
+    let task: LocalServerTask = response
+        .json()
+        .await
+        .map_err(|e| anyhow!("無法解析本地 ASR 任務回應：{}", e))?;
+    if task.task_id.is_empty() {
+        return Err(anyhow!("本地 ASR 伺服器未回傳任務 ID"));
+    }
+
+    let poll_url = format!("{}/v1/tasks/{}", base_url, task.task_id);
+    let started_at = Instant::now();
+    let mut last_progress = None;
+    loop {
+        if started_at.elapsed().as_secs() >= LOCAL_ASR_TIMEOUT_SECS {
+            return Err(anyhow!(
+                "本地 ASR 任務輪詢逾時（超過 {} 秒）：伺服器可能仍在處理或已中斷，請確認伺服器狀態後重試",
+                LOCAL_ASR_TIMEOUT_SECS
+            ));
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+        let response = client.get(&poll_url).send().await.map_err(|e| {
+            if e.is_timeout() {
+                anyhow!(
+                    "本地 ASR 任務狀態查詢逾時（超過 {} 秒無回應）",
+                    LOCAL_ASR_READ_IDLE_TIMEOUT_SECS
+                )
+            } else if e.is_connect() {
+                anyhow!("本地 ASR 伺服器在輪詢期間無法連線：{}", e)
+            } else {
+                anyhow!("本地 ASR 任務狀態查詢失敗：{}", e)
+            }
+        })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let detail = response.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "本地 ASR 任務狀態查詢失敗（{}）：{}",
+                status,
+                detail
+            ));
+        }
+
+        let task: LocalServerTask = response
+            .json()
+            .await
+            .map_err(|e| anyhow!("無法解析本地 ASR 任務狀態：{}", e))?;
+        if last_progress != Some(task.progress) {
+            progress_cb(format!("轉錄中（{}%）...", task.progress));
+            last_progress = Some(task.progress);
+        }
+
+        match task.status.as_str() {
+            "queued" | "processing" => continue,
+            "done" => {
+                progress_cb("轉錄完成".into());
+                let result = task
+                    .result
+                    .ok_or_else(|| anyhow!("本地 ASR 任務完成但未回傳結果"))?;
+                return format_local_asr_result(result, speaker_detection);
+            }
+            "failed" => {
+                return Err(anyhow!(
+                    "本地 ASR 轉錄失敗：{}",
+                    task.error.unwrap_or_else(|| "未知錯誤".into())
+                ));
+            }
+            other => return Err(anyhow!("本地 ASR 回傳未知任務狀態：{}", other)),
+        }
+    }
+}
+
+fn normalize_local_asr_url(base_url: &str) -> Result<String> {
     let base_url = base_url.trim().trim_end_matches('/');
     if base_url.is_empty() {
         return Err(anyhow!("本地 ASR 伺服器位址未設定"));
     }
+    Ok(base_url.to_string())
+}
 
+fn build_local_asr_form(
+    file_name: &str,
+    file_bytes: Vec<u8>,
+    language: &str,
+    speaker_detection: bool,
+    speakers_expected: u32,
+    sync: bool,
+) -> reqwest::multipart::Form {
     let file_part = reqwest::multipart::Part::bytes(file_bytes).file_name(file_name.to_string());
     let mut form = reqwest::multipart::Form::new().part("file", file_part);
     if !language.is_empty() && language != "auto" {
@@ -275,60 +438,41 @@ async fn transcribe_voxnote_asr_bytes(
     if speaker_detection && speakers_expected > 1 {
         form = form.text("max_speakers", speakers_expected.to_string());
     }
+    if sync {
+        form = form.text("sync", "true");
+    }
+    form
+}
 
-    // timeout 僅涵蓋至回應標頭送達為止；長錄音的回應內容可能在標頭之後才緩慢送出，
-    // 甚至因伺服器端異常而永不完結，故另以 read_timeout 限制讀取期間的閒置時間，
-    // 避免 UI 永久停在「轉譯中」。
-    let client = reqwest::Client::builder()
+fn build_local_asr_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
         .timeout(tokio::time::Duration::from_secs(LOCAL_ASR_TIMEOUT_SECS))
         .read_timeout(tokio::time::Duration::from_secs(
             LOCAL_ASR_READ_IDLE_TIMEOUT_SECS,
         ))
         .build()
-        .map_err(|e| anyhow!("無法建立本地 ASR 連線：{}", e))?;
-    let url = format!("{}/v1/audio/transcriptions", base_url);
+        .map_err(|e| anyhow!("無法建立本地 ASR 連線：{}", e))
+}
 
-    progress_cb("上傳音訊中...".into());
-    progress_cb("轉錄中...".into());
-    let response = client
-        .post(&url)
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                anyhow!(
-                    "本地 ASR 伺服器逾時（超過 {} 秒未回應）：長錄音的轉錄與語者分離耗時較長，\
-                     可縮短錄音分段或確認伺服器狀態",
-                    LOCAL_ASR_TIMEOUT_SECS
-                )
-            } else if e.is_connect() {
-                anyhow!("無法連線至本地 ASR 伺服器：{}", e)
-            } else {
-                anyhow!("本地 ASR 伺服器請求失敗：{}", e)
-            }
-        })?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let detail = response.text().await.unwrap_or_default();
-        return Err(anyhow!("本地 ASR 伺服器回傳錯誤（{}）：{}", status, detail));
+fn map_local_asr_request_error(error: reqwest::Error, action: &str) -> anyhow::Error {
+    if error.is_timeout() {
+        anyhow!(
+            "本地 ASR {}逾時（超過 {} 秒）：長錄音的轉錄與語者分離耗時較長，\
+             可縮短錄音分段或確認伺服器狀態",
+            action,
+            LOCAL_ASR_TIMEOUT_SECS
+        )
+    } else if error.is_connect() {
+        anyhow!("無法連線至本地 ASR 伺服器（{}）：{}", action, error)
+    } else {
+        anyhow!("本地 ASR {}請求失敗：{}", action, error)
     }
+}
 
-    // 讀取回應內容同樣需要保護：伺服器已回 200 但內容送不完時，若無此限制會永久等待
-    let result: LocalServerTranscription = response.json().await.map_err(|e| {
-        if e.is_timeout() {
-            anyhow!(
-                "本地 ASR 伺服器已回應但內容讀取逾時（超過 {} 秒無資料）：\
-                 伺服器可能於產生結果時發生異常",
-                LOCAL_ASR_READ_IDLE_TIMEOUT_SECS
-            )
-        } else {
-            anyhow!("無法解析本地 ASR 伺服器回應：{}", e)
-        }
-    })?;
-    progress_cb("轉錄完成".into());
-
+fn format_local_asr_result(
+    result: LocalServerTranscription,
+    speaker_detection: bool,
+) -> Result<String> {
     if speaker_detection && !result.segments.is_empty() {
         let lines: Vec<String> = result
             .segments
@@ -337,7 +481,6 @@ async fn transcribe_voxnote_asr_bytes(
                 let start_seconds = segment.start.max(0.0) as u64;
                 let mm = start_seconds / 60;
                 let ss = start_seconds % 60;
-                // 僅在服務端實際提供語者標籤時加上講者標記，避免產生誤導性的「講者?」
                 match segment.speaker.as_deref() {
                     Some(speaker) if !speaker.is_empty() => {
                         format!("[{:02}:{:02} 講者{}] {}", mm, ss, speaker, segment.text)

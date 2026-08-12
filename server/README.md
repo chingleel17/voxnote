@@ -237,7 +237,23 @@ docker compose up -d --build asr-batch gateway
 
 > 未經 gateway 的舊部署（單一容器直接開埠）同樣不需前綴，設定完全相容。
 
-`POST /v1/audio/transcriptions` 使用 multipart：`file` 為音訊檔；可選 `language`、`diarize`、`min_speakers` 與 `max_speakers`。回應的 `segments` 陣列含秒數 `start`、`end`、`text` 與啟用語者分離時的 `speaker`。
+### 轉錄 API
+
+`POST /v1/audio/transcriptions` 使用 multipart：`file` 為音訊檔；可選 `language`、`diarize`、`min_speakers` 與 `max_speakers`。預設為非同步模式，服務會立即回傳：
+
+```json
+{"task_id":"<uuid>","status":"queued","progress":0}
+```
+
+客戶端接著輪詢 `GET /v1/tasks/<task_id>`。任務狀態為 `queued`、`processing`、`done` 或 `failed`，`progress` 會依轉錄、對齊、語者分離三階段回報 `0`、`33`、`66`、`100`。完成時回應的 `result` 內容包含 `text`、`segments`、`language` 與 `diarization_enabled`；`segments` 含秒數 `start`、`end`、`text`，啟用語者分離時另含 `speaker`。失敗時回應 `error` 繁體中文錯誤訊息。
+
+```json
+{"task_id":"<uuid>","status":"done","progress":100,"result":{"text":"...","segments":[]}}
+```
+
+即時字幕可在同一個 multipart 請求加入 `sync=true`，直接取得上述 `result` 格式，不建立任務，也不經背景佇列。批次流程不要帶 `sync`，避免長音訊請求被同步等待。任務只保留一小時，或保留最多 1000 筆已完成任務；服務重啟後記憶體中的任務會清除。
+
+gateway 的 `/batch/v1/tasks/<task_id>` 會依既有 `/batch/` 前綴轉發至批次實例，未帶前綴的 `/v1/tasks/<task_id>` 也會轉發至批次實例；兩者都是短輪詢請求，不會等待整段轉錄，因此不受批次長連線逾時影響。
 
 ## 小 VRAM 機器的冒煙測試
 

@@ -5,7 +5,7 @@ use std::{
         mpsc, Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -16,7 +16,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 use crate::{
     ai::call_llm,
-    asr::transcribe_voxnote_asr_samples,
+    asr::transcribe_live_caption_remote,
     audio_recording::{
         self, DesktopRecordingManager, RecordingDeviceList, SharedError, SharedQueue,
     },
@@ -48,6 +48,12 @@ const SEGMENT_NO_SPEECH_MAX: f32 = 0.6;
 /// 此值僅為每次啟動時的初始高度。
 const OVERLAY_DEFAULT_HEIGHT_LOGICAL: f64 = 130.0;
 const OVERLAY_DEFAULT_WIDTH_LOGICAL: f64 = 720.0;
+/// 待處理音訊佇列的上限（秒）。轉錄落後擷取時（遠端逾時、負載過高），
+/// 佇列會持續累積；超過此上限即丟棄最舊樣本，讓字幕追上當下聲音而非
+/// 越積越舊、記憶體無限成長。取視窗長度的數倍，容許短暫落後但不無限等待。
+const MAX_PENDING_AUDIO_SECONDS: usize = 30;
+/// 丟棄提示的節流間隔：持續落後時避免每次丟棄都洗版錯誤事件通道。
+const DROP_NOTICE_THROTTLE: Duration = Duration::from_secs(10);
 /// 預設垂直位置：螢幕下方三分之一處（視窗頂部離螢幕底部的距離為螢幕高度的
 /// 1/3，而非視窗頂部緊貼該線），對應常見影片字幕的視覺位置。
 /// 字幕字級的四檔預設值（S/M/L/XL，單位為像素）。使用者只能由此四檔中選擇，
@@ -456,6 +462,17 @@ fn run_live_caption_session(
     #[cfg(not(target_os = "windows"))]
     let loopback_handle: Option<thread::JoinHandle<Result<()>>> = None;
 
+    // 供本 session 所有視窗共用，避免每視窗重建連線與 TLS 交握。
+    let remote_client = if backend == "voxnote_asr" {
+        Some(
+            reqwest::Client::builder()
+                .build()
+                .map_err(|error| anyhow!("無法建立即時字幕遠端連線：{}", error))?,
+        )
+    } else {
+        None
+    };
+
     ready_tx
         .send(Ok(()))
         .map_err(|_| anyhow!("即時字幕啟動狀態無法回傳"))?;
@@ -465,6 +482,7 @@ fn run_live_caption_session(
         &config,
         &backend,
         whisper_context.as_ref(),
+        remote_client.as_ref(),
         &queue,
         &error_state,
         &running,
@@ -500,6 +518,7 @@ fn process_caption_windows(
     config: &AppConfig,
     backend: &str,
     whisper_context: Option<&WhisperContext>,
+    remote_client: Option<&reqwest::Client>,
     queue: &SharedQueue,
     error_state: &SharedError,
     running: &Arc<AtomicBool>,
@@ -507,10 +526,12 @@ fn process_caption_windows(
 ) -> Result<()> {
     let window_samples = config.live_caption_window_seconds as usize * SAMPLE_RATE as usize;
     let step_samples = config.live_caption_step_seconds as usize * SAMPLE_RATE as usize;
+    let max_pending_samples = MAX_PENDING_AUDIO_SECONDS * SAMPLE_RATE as usize;
     let mut samples = VecDeque::new();
-    let mut previous_text = String::new();
+    let mut recent_results: VecDeque<String> = VecDeque::new();
     let translation_failure_reported = Arc::new(AtomicBool::new(false));
     let mut sequence = 0u64;
+    let mut last_drop_notice: Option<Instant> = None;
 
     while running.load(Ordering::SeqCst) {
         if stop_rx.try_recv().is_ok() {
@@ -521,6 +542,19 @@ fn process_caption_windows(
         }
 
         drain_queue(queue, &mut samples);
+        if samples.len() > max_pending_samples {
+            let overflow = samples.len() - max_pending_samples;
+            for _ in 0..overflow {
+                let _ = samples.pop_front();
+            }
+            let should_notify = last_drop_notice
+                .map(|at| at.elapsed() >= DROP_NOTICE_THROTTLE)
+                .unwrap_or(true);
+            if should_notify {
+                last_drop_notice = Some(Instant::now());
+                emit_error(app, "轉錄速度跟不上聲音，已捨棄部分較舊音訊以追上進度".into());
+            }
+        }
         if samples.len() < window_samples {
             thread::sleep(CAPTURE_POLL_INTERVAL);
             continue;
@@ -528,6 +562,11 @@ fn process_caption_windows(
 
         // 推論可能比擷取音訊更慢；每次取最新視窗，避免字幕逐段追播舊音訊。
         let available_samples = samples.len();
+        println!(
+            "[live-caption][timing] 取樣時佇列堆積={:.1}秒（上限 {} 秒）",
+            available_samples as f64 / SAMPLE_RATE as f64,
+            MAX_PENDING_AUDIO_SECONDS
+        );
         let window: Vec<f32> = samples
             .iter()
             .skip(available_samples - window_samples)
@@ -538,6 +577,9 @@ fn process_caption_windows(
         for _ in 0..drop_samples {
             let _ = samples.pop_front();
         }
+        // 視窗涵蓋的音訊已擷取完畢的時間點；用於量測「聲音發生」到「字幕顯示」的實際延遲，
+        // 而非僅轉錄本身耗時（後者不含視窗填滿等待與佇列處理排隊時間）。
+        let window_ready_at = Instant::now();
 
         let peak = window
             .iter()
@@ -546,19 +588,27 @@ fn process_caption_windows(
             continue;
         }
 
+        let transcribe_started_at = Instant::now();
         let transcription = match backend {
             "local_whisper" => transcribe_with_whisper(
                 whisper_context.ok_or_else(|| anyhow!("本地 Whisper 模型未初始化"))?,
                 &window,
                 &config.live_caption_language,
             ),
-            "voxnote_asr" => tauri::async_runtime::block_on(transcribe_voxnote_asr_samples(
+            "voxnote_asr" => tauri::async_runtime::block_on(transcribe_live_caption_remote(
+                remote_client.ok_or_else(|| anyhow!("即時字幕遠端連線未初始化"))?,
                 live_caption_remote_base_url(config),
                 &window,
                 &config.live_caption_language,
+                config.live_caption_remote_timeout_seconds as u64,
             )),
             _ => Err(anyhow!("不支援的即時字幕轉錄後端：{}", backend)),
         };
+        println!(
+            "[live-caption][timing] 後端={} 轉錄耗時={:.2}秒",
+            backend,
+            transcribe_started_at.elapsed().as_secs_f64()
+        );
 
         let transcription = match transcription {
             Ok(text) if !text.trim().is_empty() => {
@@ -579,14 +629,18 @@ fn process_caption_windows(
                 continue;
             }
         };
-        let text = remove_overlap(&previous_text, &transcription);
-        if text.trim().is_empty() {
-            println!("[live-caption] 與前段完全重疊，略過");
+        if is_duplicate(&recent_results, &transcription) {
+            println!("[live-caption] 與近期輸出高度相似，判定為重疊，略過");
             continue;
         }
-        previous_text = transcription;
+        let text = transcription.clone();
+        push_recent_result(&mut recent_results, transcription);
 
         sequence += 1;
+        println!(
+            "[live-caption][timing] 視窗結束到字幕顯示的延遲={:.2}秒",
+            window_ready_at.elapsed().as_secs_f64()
+        );
         let display_text = build_display_text(&text, None, &config.live_caption_display_mode);
         let _ = app.emit(
             LIVE_CAPTION_EVENT,
@@ -841,50 +895,103 @@ fn take_error(error_state: &SharedError) -> Option<anyhow::Error> {
         .map(|message| anyhow!("{}", message))
 }
 
-fn remove_overlap(previous: &str, current: &str) -> String {
-    if previous.is_empty() {
-        return current.trim().to_string();
+/// 保留供比對的最近已輸出結果筆數（參考實作 `translate_meeting.py` 的
+/// `deque(maxlen=10)`）。滑動視窗重疊時，同一段語音可能被辨識兩次且結果
+/// 未必逐字相同，故比對範圍需涵蓋多筆而非僅前一筆。
+const RECENT_RESULTS_CAPACITY: usize = 10;
+/// 子字串重疊度門檻：兩段文字中較短者，有超過此比例的內容是另一段的子字串。
+const OVERLAP_RATIO_THRESHOLD: f64 = 0.7;
+/// 字元相似度門檻（Levenshtein 距離換算的相似比）。
+const SIMILARITY_RATIO_THRESHOLD: f64 = 0.6;
+/// 短句長度門檻：短於此長度的文字不參與相似度判定，避免短句被誤判為重複。
+const DUPLICATE_MIN_LENGTH: usize = 8;
+
+fn push_recent_result(recent_results: &mut VecDeque<String>, text: String) {
+    if recent_results.len() >= RECENT_RESULTS_CAPACITY {
+        recent_results.pop_front();
     }
-    let normalized_previous: String = previous
-        .chars()
-        .filter(|char| char.is_alphanumeric())
-        .collect();
-    let normalized_current: String = current
-        .chars()
-        .filter(|char| char.is_alphanumeric())
-        .collect();
-    if normalized_previous.chars().count() >= 4 && normalized_previous == normalized_current {
-        return String::new();
-    }
-    let previous_chars: Vec<char> = previous
+    recent_results.push_back(text);
+}
+
+/// 判斷 `current` 是否與 `recent_results` 中任一筆高度重疊，視為重複視窗。
+///
+/// 雙重判定：子字串重疊度（其一為另一子字串時比例超過門檻）或字元相似度
+/// （Levenshtein 相似比超過門檻），符合任一者即視為重複。取自參考實作
+/// `is_duplicate()` 的判定邏輯。
+fn is_duplicate(recent_results: &VecDeque<String>, current: &str) -> bool {
+    let current_normalized: Vec<char> = current
         .chars()
         .filter(|char| !char.is_whitespace())
         .collect();
-    let current_chars: Vec<char> = current.chars().collect();
-    let compact_current: Vec<char> = current_chars
-        .iter()
-        .copied()
-        .filter(|char| !char.is_whitespace())
-        .collect();
-    let max_overlap = previous_chars.len().min(compact_current.len()).min(120);
-    for overlap in (8..=max_overlap).rev() {
-        if previous_chars[previous_chars.len() - overlap..] == compact_current[..overlap] {
-            let mut compact_seen = 0;
-            for (index, char) in current_chars.iter().enumerate() {
-                if !char.is_whitespace() {
-                    compact_seen += 1;
-                }
-                if compact_seen == overlap {
-                    return current_chars[index + 1..]
-                        .iter()
-                        .collect::<String>()
-                        .trim()
-                        .to_string();
-                }
+    if current_normalized.len() < DUPLICATE_MIN_LENGTH {
+        return false;
+    }
+    recent_results.iter().any(|previous| {
+        let previous_normalized: Vec<char> = previous
+            .chars()
+            .filter(|char| !char.is_whitespace())
+            .collect();
+        if previous_normalized.len() < DUPLICATE_MIN_LENGTH {
+            return false;
+        }
+        substring_overlap_ratio(&previous_normalized, &current_normalized) > OVERLAP_RATIO_THRESHOLD
+            || char_similarity_ratio(&previous_normalized, &current_normalized)
+                > SIMILARITY_RATIO_THRESHOLD
+    })
+}
+
+/// 較短序列有多大比例是較長序列的子字串（以較長的公共子字串長度估算）。
+fn substring_overlap_ratio(a: &[char], b: &[char]) -> f64 {
+    let (shorter, longer) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if shorter.is_empty() {
+        return 0.0;
+    }
+    let overlap = longest_common_substring_len(shorter, longer);
+    overlap as f64 / shorter.len() as f64
+}
+
+fn longest_common_substring_len(a: &[char], b: &[char]) -> usize {
+    let mut previous_row = vec![0usize; b.len() + 1];
+    let mut best = 0;
+    for a_char in a {
+        let mut current_row = vec![0usize; b.len() + 1];
+        for (index, b_char) in b.iter().enumerate() {
+            if a_char == b_char {
+                current_row[index + 1] = previous_row[index] + 1;
+                best = best.max(current_row[index + 1]);
             }
         }
+        previous_row = current_row;
     }
-    current.trim().to_string()
+    best
+}
+
+/// 以 Levenshtein 編輯距離換算相似比：`1 - 距離 / 較長長度`，對應
+/// `difflib.SequenceMatcher.ratio()` 的量級（非逐位元相同實作，但同樣
+/// 反映「需多少編輯才能讓兩段文字相同」）。
+fn char_similarity_ratio(a: &[char], b: &[char]) -> f64 {
+    let max_len = a.len().max(b.len());
+    if max_len == 0 {
+        return 1.0;
+    }
+    let distance = levenshtein_distance(a, b);
+    1.0 - (distance as f64 / max_len as f64)
+}
+
+fn levenshtein_distance(a: &[char], b: &[char]) -> usize {
+    let mut previous_row: Vec<usize> = (0..=b.len()).collect();
+    for (i, a_char) in a.iter().enumerate() {
+        let mut current_row = vec![i + 1];
+        for (j, b_char) in b.iter().enumerate() {
+            let cost = if a_char == b_char { 0 } else { 1 };
+            let value = (previous_row[j + 1] + 1)
+                .min(current_row[j] + 1)
+                .min(previous_row[j] + cost);
+            current_row.push(value);
+        }
+        previous_row = current_row;
+    }
+    previous_row[b.len()]
 }
 
 /// 決定單段字幕應執行翻譯或校稿，兩者最多擇一。
@@ -1048,9 +1155,10 @@ fn close_overlay(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_display_text, is_hallucination, nearest_font_size_preset,
-        resolve_translate_or_proofread, remove_overlap,
+        build_display_text, is_duplicate, is_hallucination, nearest_font_size_preset,
+        push_recent_result, resolve_translate_or_proofread,
     };
+    use std::collections::VecDeque;
 
     #[test]
     fn only_translation_enabled_with_different_source_language_translates() {
@@ -1124,8 +1232,39 @@ mod tests {
     }
 
     #[test]
-    fn repeated_short_caption_is_not_emitted_again() {
-        assert_eq!(remove_overlap("字幕製作：貝爾", "（字幕製作：貝爾）"), "");
+    fn overlapping_sliding_window_result_is_flagged_duplicate() {
+        // 同一段語音在重疊滑動視窗中被辨識兩次，結果未必逐字相同。
+        let mut recent = VecDeque::new();
+        push_recent_result(&mut recent, "今天我們要討論系統架構的設計".into());
+        assert!(is_duplicate(
+            &recent,
+            "我們要討論系統架構的設計方向"
+        ));
+    }
+
+    #[test]
+    fn distinct_new_content_is_not_flagged_duplicate() {
+        let mut recent = VecDeque::new();
+        push_recent_result(&mut recent, "今天我們要討論系統架構的設計".into());
+        assert!(!is_duplicate(&recent, "接下來進入資料庫的部分"));
+    }
+
+    #[test]
+    fn short_text_is_not_flagged_duplicate() {
+        let mut recent = VecDeque::new();
+        push_recent_result(&mut recent, "字幕製作：貝爾".into());
+        // 短於 DUPLICATE_MIN_LENGTH 的文字不參與判定，避免短句誤判。
+        assert!(!is_duplicate(&recent, "字幕製作"));
+    }
+
+    #[test]
+    fn recent_results_capacity_evicts_oldest() {
+        let mut recent = VecDeque::new();
+        for index in 0..12 {
+            push_recent_result(&mut recent, format!("片段{}", index));
+        }
+        assert_eq!(recent.len(), super::RECENT_RESULTS_CAPACITY);
+        assert_eq!(recent.front().unwrap(), "片段2");
     }
 
     #[test]

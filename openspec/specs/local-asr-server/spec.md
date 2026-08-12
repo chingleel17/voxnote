@@ -20,17 +20,61 @@
 
 ### Requirement: 透過 OpenAI 相容端點進行轉錄
 
-系統 SHALL 以 HTTP multipart 上傳音訊檔至伺服器的 `/v1/audio/transcriptions` 端點，並解析回傳結果為逐字稿文字。
+系統 SHALL 以 HTTP multipart 上傳音訊檔至伺服器的 `/v1/audio/transcriptions` 端點。該端點預設採非同步任務模式：立即回傳 `task_id`，客戶端 SHALL 透過任務狀態查詢端點取得最終逐字稿結果。
+
+該端點 SHALL 同時保留同步回應模式供即時呼叫方使用（見「即時呼叫方保留同步轉錄模式」）。
+
+#### Scenario: 成功建立轉錄任務
+
+- **WHEN** 音訊檔成功上傳且未要求同步回應
+- **THEN** 系統 SHALL 立即回傳 `task_id`，並於背景執行轉錄；客戶端 SHALL 輪詢任務狀態直至完成後取得逐字稿
 
 #### Scenario: 成功轉錄
 
-- **WHEN** 音訊檔成功上傳且伺服器回傳完成狀態
-- **THEN** 系統 SHALL 取得逐字稿內容並回傳給呼叫端
+- **WHEN** 客戶端輪詢任務狀態且該任務已完成
+- **THEN** 系統 SHALL 回傳完整逐字稿內容供呼叫端使用
 
 #### Scenario: 伺服器不可達或回傳錯誤
 
 - **WHEN** 伺服器連線失敗、逾時或回傳非成功狀態碼
 - **THEN** 系統 SHALL 回傳含伺服器錯誤內容的明確錯誤訊息，且 SHALL NOT 產生空白逐字稿
+
+### Requirement: 即時呼叫方保留同步轉錄模式
+
+轉錄端點 MUST 提供由呼叫方於請求中指定 `sync=true` 的同步回應模式，使呼叫方能於單一請求內取得逐字稿而無須建立任務並輪詢。
+
+同步模式 MUST 由呼叫方於請求中明確指定 `sync=true`，MUST NOT 依伺服器端設定決定，使同一服務實例可同時服務批次與即時兩種呼叫方。
+
+同步模式下的轉錄 MUST 與非同步模式共用相同的轉錄邏輯與輸出格式，MUST NOT 各自維護可能分歧的實作。
+
+#### Scenario: 即時字幕以同步模式呼叫
+
+- **WHEN** 即時字幕對某個數秒長度的音訊視窗發出轉錄請求並指定同步模式
+- **THEN** 系統 MUST 於該次請求的回應中直接回傳逐字稿，MUST NOT 要求呼叫方另行輪詢
+
+#### Scenario: 批次流程以非同步模式呼叫同一服務
+
+- **WHEN** 批次逐字稿對同一服務實例發出轉錄請求且未指定同步模式
+- **THEN** 系統 MUST 以任務模式回應，回傳 `task_id` 供輪詢
+
+#### Scenario: 兩種模式的輸出格式一致
+
+- **WHEN** 相同音訊分別以同步與非同步模式轉錄
+- **THEN** 兩者所得的逐字稿內容與分段格式 MUST 一致
+
+### Requirement: Rust app 使用非同步任務流程
+
+Rust app 使用 `voxnote_asr` 進行一般轉錄時 SHALL 先建立非同步任務，再輪詢 `GET /v1/tasks/{task_id}` 直到任務完成或失敗，並透過既有 `asr_progress` 事件回報服務端進度。
+
+#### Scenario: 建立任務後輪詢
+
+- **WHEN** Rust app 將音訊送至 `/v1/audio/transcriptions` 且未指定 `sync=true`
+- **THEN** Rust app SHALL 取得 `task_id`，持續輪詢對應任務狀態，並於 `done` 時取得逐字稿結果
+
+#### Scenario: 任務失敗或輪詢不可用
+
+- **WHEN** 任務狀態為 `failed`，或輪詢期間服務端不可達、逾時
+- **THEN** Rust app SHALL 回傳明確錯誤或降級提示，且 SHALL NOT 產生空白逐字稿
 
 ### Requirement: 語者分離輸出格式一致性
 

@@ -1,4 +1,4 @@
-use tauri::Manager;
+use tauri::{Manager, WindowEvent};
 
 mod ai;
 mod asr;
@@ -22,6 +22,32 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_notification::init())
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let app_handle = window.app_handle().clone();
+                let live_caption_manager = app_handle.state::<live_caption::LiveCaptionManager>();
+                if live_caption_manager.status().active {
+                    if let Err(error) = live_caption_manager.stop(&app_handle) {
+                        println!("[shutdown] 停止即時字幕失敗：{error}");
+                    }
+                }
+
+                let recording_manager =
+                    app_handle.state::<audio_recording::DesktopRecordingManager>();
+                if audio_recording::is_recording(&recording_manager) {
+                    if let Err(error) = audio_recording::stop_recording(&recording_manager) {
+                        println!("[shutdown] 停止桌面錄音失敗：{error}");
+                    }
+                }
+
+                app_handle.exit(0);
+            }
+        })
         .setup(|app| {
             let app_handle = app.handle().clone();
             tauri::async_runtime::block_on(async move {
@@ -30,7 +56,16 @@ pub fn run() {
                 app_handle.manage(backup::DataOperationLock::default());
                 app_handle.manage(audio_recording::DesktopRecordingManager::default());
                 app_handle.manage(live_caption::LiveCaptionManager::default());
-                audio_recording::cleanup_stale_temp_files(&app_handle).expect("暫存錄音清理失敗");
+            });
+            if let Some(main_window) = app.get_webview_window("main") {
+                main_window.show().expect("主視窗顯示失敗");
+            }
+
+            let cleanup_app_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                if let Err(error) = audio_recording::cleanup_stale_temp_files(&cleanup_app_handle) {
+                    eprintln!("[startup] 暫存錄音清理失敗：{error}");
+                }
             });
             Ok(())
         })
