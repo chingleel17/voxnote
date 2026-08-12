@@ -25,11 +25,11 @@ Windows 10 版本 2004 起提供 **process loopback**（`ActivateAudioInterfaceA
 
 ## Dependency
 
-本變更依賴 `add-live-caption-overlay` 先行完成並歸檔（該變更定義了即時字幕的音訊來源機制與 session 生命週期）。因此本變更的 spec delta 以 `## ADDED Requirements` 撰寫。
+`add-live-caption-overlay` 已於 2026-08-11 完成並歸檔，`live-caption-overlay` 已進入 `openspec/specs/` 基準（該基準定義了即時字幕的音訊來源機制與 session 生命週期）。本變更的 spec delta 以 `## ADDED Requirements` 撰寫，新增基準未涵蓋的音訊來源。
 
 本變更與 `add-live-caption-remote-asr` 無相依，兩者可獨立進行。
 
-**排程建議**：本變更應排在即時字幕的轉錄正確性問題解決之後。目前字幕輸出存在模型幻覺問題（與音訊來源無關，屬 `add-live-caption-overlay` 任務 10 的實測調校範圍）；在轉錄結果尚未穩定前導入新的音訊來源，將無法分辨品質變化來自何者。
+**排程建議**：先前的排程前提（等待轉錄正確性穩定）已解除——取樣率錯配與幻覺過濾已於 commit `06233f6` 修正並歸檔。本變更現可開始，惟實測時仍應以「電腦音訊（全系統）」作為對照組，確認品質差異來自音訊來源而非轉錄路徑。
 
 ## Impact
 

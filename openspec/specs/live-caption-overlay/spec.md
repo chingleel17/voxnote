@@ -2,7 +2,7 @@
 
 讓使用者在電腦正在播放聲音的當下，即時取得對應的繁體中文字幕，並以可疊放於任意應用程式上方的浮動視窗呈現，適用於觀看無字幕影片、參與線上會議等即時聆聽情境。
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: System can start and stop a live caption session
 
@@ -154,17 +154,24 @@
 
 ### Requirement: System skips the LLM call when translation would be a no-op
 
-僅啟用翻譯（未啟用校稿）時，若目標顯示語言與來源語言相同，系統 MUST NOT 呼叫翻譯模型，MUST 直接顯示轉錄原文。此為節省延遲與費用的最佳化，翻譯開關本身的其餘行為不受影響。
+僅啟用翻譯（未啟用校稿）時，若使用者已明確指定來源語言且該語言與目標顯示語言相同，系統 MUST NOT 呼叫翻譯模型，MUST 直接顯示轉錄原文。此為節省延遲與費用的最佳化，翻譯開關本身的其餘行為不受影響。
+
+此最佳化 MUST 僅於來源語言為明確指定時適用。當來源語言設為自動偵測時，系統無法在呼叫轉錄後端之前得知實際語言，MUST NOT 嘗試判斷是否為同語言，MUST 依一般翻譯流程處理（不套用此最佳化）。
 
 #### Scenario: Target language equals source language with only translation enabled
 
-- **WHEN** 使用者啟用翻譯、未啟用校稿，且目標顯示語言與轉錄來源語言相同
+- **WHEN** 使用者啟用翻譯、未啟用校稿，且已明確指定來源語言，該語言與轉錄目標顯示語言相同
 - **THEN** 系統 MUST 直接顯示轉錄原文，MUST NOT 對該段發出翻譯請求
 
 #### Scenario: Target language equals source language with both enabled
 
-- **WHEN** 使用者同時啟用翻譯與校稿，且目標顯示語言與來源語言相同
+- **WHEN** 使用者同時啟用翻譯與校稿，且已明確指定來源語言，該語言與目標顯示語言相同
 - **THEN** 系統 MUST 執行校稿並顯示校正後的原語言字幕，此情境 MUST NOT 被本最佳化跳過（此時校稿本身即為使用者要的處理，見「Translation and proofreading are independent options」的同語言校稿情境）
+
+#### Scenario: Source language is set to automatic detection
+
+- **WHEN** 使用者將來源語言設為自動偵測，且啟用翻譯
+- **THEN** 系統 MUST NOT 嘗試判斷偵測結果是否與目標語言相同，MUST 依一般翻譯流程處理該段字幕
 
 ### Requirement: Live caption proofreading shares its prompt with batch transcript proofreading
 
@@ -237,6 +244,54 @@
 
 - **WHEN** 某段字幕的文字長度超過字幕視窗寬度
 - **THEN** 該段字幕 MUST 自動換行完整顯示，MUST NOT 被截斷或以省略號略去內容
+
+### Requirement: Caption window has a default size and position on session start
+
+字幕視窗目前無位置持久化機制，每次啟動 session 皆套用固定的預設大小與位置。系統 MUST 將預設高度設為恰好容納固定保留段數（2 段）文字的高度，MUST 將預設位置設定於使用者目前所在螢幕下方三分之一區域、水平置中。
+
+多螢幕環境下，系統 MUST 依使用者目前作用中的螢幕計算預設位置，MUST NOT 使視窗預設出現於非使用者當前所在的螢幕。取得螢幕資訊失敗時，系統 MUST 略過套用預設大小／位置並記錄訊息，MUST NOT 因此阻斷字幕啟動。
+
+使用者於 session 進行中手動調整視窗大小或位置為既有行為，本需求 MUST NOT 影響使用者手動調整的能力；下次啟動 session 時 MUST 仍套用預設值（而非記住使用者上次手動調整的結果）。
+
+#### Scenario: User starts a live caption session
+
+- **WHEN** 使用者啟動即時字幕且字幕視窗成功顯示
+- **THEN** 字幕視窗高度 MUST 恰好容納 2 段字幕文字，位置 MUST 落於目前所在螢幕下方三分之一區域且水平置中
+
+#### Scenario: User has multiple monitors
+
+- **WHEN** 使用者於多螢幕環境啟動即時字幕
+- **THEN** 字幕視窗 MUST 出現於使用者目前作用中的螢幕，MUST NOT 出現於其他螢幕
+
+#### Scenario: Monitor information is unavailable
+
+- **WHEN** 系統無法取得目前螢幕的尺寸或位置資訊
+- **THEN** 系統 MUST 略過套用預設大小與位置並記錄訊息，MUST 仍正常啟動字幕功能
+
+### Requirement: Caption window length is configurable via scenario presets
+
+系統 MUST 允許使用者調整轉錄視窗長度與步進，以因應不同語速與情境對「語意完整度」與「首次出字延遲」的不同取捨。
+
+系統 MUST 提供對應常見情境的預設組合（例如線上會議、教育訓練、演講簡報、快速字幕），使使用者無須理解視窗長度與步進等參數細節即可選用。此為即時字幕頁「收起進階參數」的一部分，與字級預設、固定保留段數同屬簡化操作的設計方向，不得讓使用者在一般使用情境下需要直接輸入秒數。
+
+相鄰視窗 MUST 維持重疊，以降低語句於視窗邊界被切斷的機率。
+
+進階使用者 MAY 仍可展開精確調整個別參數，但此非預設可見的操作路徑。
+
+#### Scenario: User watches fast-paced English content
+
+- **WHEN** 使用者觀看語速較快的內容且字幕頻繁在語句中途切斷
+- **THEN** 使用者 MUST 能夠選用較長的視窗情境預設以改善語意完整度，MUST NOT 被要求先理解「視窗長度」與「步進」的意義才能調整
+
+#### Scenario: User prioritizes lowest latency
+
+- **WHEN** 使用者希望字幕盡早出現而可接受語意較不完整
+- **THEN** 使用者 MUST 能夠選用較短的視窗情境預設
+
+#### Scenario: User wants precise control over parameters
+
+- **WHEN** 使用者不滿足於情境預設，希望直接調整視窗長度與步進的數值
+- **THEN** 系統 MUST 提供可展開的進階選項供直接調整，MUST NOT 完全移除精確控制的能力
 
 ### Requirement: Caption font size is chosen from preset sizes
 

@@ -28,6 +28,11 @@ pub struct AppConfig {
     pub live_caption_step_seconds: u32,
     pub live_caption_silence_threshold: f32,
     pub live_caption_translate: bool,
+    // 校稿與翻譯為獨立開關：翻譯輸出語言可能與來源不同，校稿則輸出語言等於來源，
+    // 僅修正辨識錯誤（同音字、標點、斷句）。兩者互不取代，見
+    // add-live-caption-overlay 的「Translation and proofreading are
+    // independent options」。
+    pub live_caption_proofread: bool,
     pub live_caption_display_mode: String, // "translation" | "original" | "both"
     // 字級僅接受 S/M/L/XL 四檔預設值（見 live_caption 模組），不開放自由輸入數字；
     // 欄位型別維持 u32（實際像素）以相容既有 config.toml，介面層負責限制為四檔選項。
@@ -96,6 +101,7 @@ impl Default for AppConfig {
             live_caption_step_seconds: 3,
             live_caption_silence_threshold: 0.01,
             live_caption_translate: true,
+            live_caption_proofread: false,
             live_caption_display_mode: "translation".into(),
             live_caption_font_size: 28,
             live_caption_clear_seconds: 8,
@@ -187,6 +193,7 @@ live_caption_font_size = 28
         let config: AppConfig = toml::from_str(existing).expect("既有設定應可解析");
         assert_eq!(config.live_caption_clear_seconds, 8);
         assert!(config.live_caption_click_through);
+        assert!(!config.live_caption_proofread);
         // 既有欄位不應被預設值覆蓋
         assert_eq!(config.live_caption_window_seconds, 15);
         assert!(!config.live_caption_translate);

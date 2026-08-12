@@ -13,6 +13,27 @@ function nearestFontSizePreset(value: number): number {
 }
 
 /**
+ * 視窗長度／步進的情境預設組合。數值取自 jt-live-whisper 的 SCENE_PRESETS
+ * （見 add-live-caption-remote-asr/design.md 的查證記錄），與本專案現行的
+ * 5 秒／3 秒同構，故「線上會議」維持原預設值不變。
+ */
+const WINDOW_SCENE_PRESETS: Array<{ value: string; label: string; windowSeconds: number; stepSeconds: number }> = [
+  { value: 'meeting', label: '線上會議', windowSeconds: 5, stepSeconds: 3 },
+  { value: 'training', label: '教育訓練', windowSeconds: 8, stepSeconds: 3 },
+  { value: 'presentation', label: '演講簡報', windowSeconds: 12, stepSeconds: 4 },
+  { value: 'fast', label: '快速字幕', windowSeconds: 3, stepSeconds: 2 },
+];
+const CUSTOM_WINDOW_SCENE = 'custom';
+
+/** 依目前的視窗長度／步進找出對應的情境代碼；找不到完全匹配則回傳「自訂」。 */
+function matchWindowScene(windowSeconds: number, stepSeconds: number): string {
+  const matched = WINDOW_SCENE_PRESETS.find(
+    (preset) => preset.windowSeconds === windowSeconds && preset.stepSeconds === stepSeconds,
+  );
+  return matched?.value ?? CUSTOM_WINDOW_SCENE;
+}
+
+/**
  * 即時字幕設定表單。
  *
  * 這些參數屬於「每次使用時會調整」的操作項目，故由即時字幕頁直接提供，
@@ -260,7 +281,17 @@ export function buildLiveCaptionSettings(
       config = { ...config, live_caption_translate: checked };
       onChange(config);
     },
-    '需要 LLM 供應商可連線；翻譯失敗時回退顯示原文。',
+    '需要 LLM 供應商可連線；翻譯失敗時回退顯示原文。來源語言為中文時不會呼叫翻譯（無須把中文譯成中文），可改用下方的校稿。',
+  ));
+
+  container.appendChild(toggleGroup(
+    '校稿（修正同音字、標點、斷句）',
+    config.live_caption_proofread === true,
+    (checked) => {
+      config = { ...config, live_caption_proofread: checked };
+      onChange(config);
+    },
+    '僅在來源語言為中文時生效，輸出仍為中文，不是翻譯；來源語言為其他語言或自動偵測時，此開關不影響結果。',
   ));
 
   container.appendChild(selectGroup(
@@ -305,6 +336,36 @@ export function buildLiveCaptionSettings(
     '開啟後滑鼠可直接操作字幕下方的影片；游標移到標題列或視窗邊框時會自動恢復互動，供拖曳與調整大小。',
   ));
 
+  // ── 視窗長度情境預設 ──
+  // 主要操作路徑：使用者選情境即可，不需理解「視窗長度」「步進」的意義。
+  // 精確調整仍保留在下方的進階區塊，供想直接輸入秒數的使用者使用。
+  const sceneGroup = document.createElement('div');
+  sceneGroup.className = 'form-group';
+  const sceneLabel = document.createElement('label');
+  sceneLabel.textContent = '字幕情境';
+  const sceneSelect = document.createElement('select');
+  sceneSelect.className = 'form-control';
+  for (const preset of WINDOW_SCENE_PRESETS) {
+    const option = document.createElement('option');
+    option.value = preset.value;
+    option.textContent = preset.label;
+    sceneSelect.appendChild(option);
+  }
+  const customOption = document.createElement('option');
+  customOption.value = CUSTOM_WINDOW_SCENE;
+  customOption.textContent = '自訂';
+  // 「自訂」僅為狀態顯示（手動調整後的數值不匹配任何情境時顯示），
+  // 不可被使用者主動選取——選取它沒有對應的秒數可套用，等於無效選項。
+  customOption.disabled = true;
+  sceneSelect.appendChild(customOption);
+  sceneGroup.appendChild(sceneLabel);
+  sceneGroup.appendChild(sceneSelect);
+  const sceneHint = document.createElement('small');
+  sceneHint.className = 'form-hint';
+  sceneHint.textContent = '語速快、字幕常在句中被切斷時選較長的情境；想盡快看到字可選較短的情境。可於下方「進階字幕參數」精確調整。';
+  sceneGroup.appendChild(sceneHint);
+  container.appendChild(sceneGroup);
+
   // ── 進階參數 ──
   const advancedDetails = document.createElement('details');
   advancedDetails.className = 'settings-inline-details';
@@ -316,30 +377,97 @@ export function buildLiveCaptionSettings(
   advancedDetails.appendChild(advancedBody);
   container.appendChild(advancedDetails);
 
-  advancedBody.appendChild(numberGroup(
-    '視窗長度（秒）',
-    config.live_caption_window_seconds || 5,
-    1,
-    30,
-    1,
-    (value) => {
-      config = { ...config, live_caption_window_seconds: value };
+  const windowSecondsGroup = document.createElement('div');
+  windowSecondsGroup.className = 'form-group';
+  const windowSecondsLabel = document.createElement('label');
+  windowSecondsLabel.textContent = '視窗長度（秒）';
+  const windowSecondsInput = document.createElement('input');
+  windowSecondsInput.type = 'number';
+  windowSecondsInput.className = 'form-control';
+  windowSecondsInput.min = '1';
+  windowSecondsInput.max = '30';
+  windowSecondsInput.step = '1';
+  windowSecondsInput.value = String(config.live_caption_window_seconds || 5);
+  windowSecondsGroup.append(windowSecondsLabel, windowSecondsInput);
+  const windowSecondsHint = document.createElement('small');
+  windowSecondsHint.className = 'form-hint';
+  windowSecondsHint.textContent = '每次送交辨識的音訊長度；過短會降低辨識準確度。';
+  windowSecondsGroup.appendChild(windowSecondsHint);
+  advancedBody.appendChild(windowSecondsGroup);
+
+  const stepSecondsGroup = document.createElement('div');
+  stepSecondsGroup.className = 'form-group';
+  const stepSecondsLabel = document.createElement('label');
+  stepSecondsLabel.textContent = '步進（秒）';
+  const stepSecondsInput = document.createElement('input');
+  stepSecondsInput.type = 'number';
+  stepSecondsInput.className = 'form-control';
+  stepSecondsInput.min = '1';
+  stepSecondsInput.max = '30';
+  stepSecondsInput.step = '1';
+  stepSecondsInput.value = String(config.live_caption_step_seconds || 3);
+  stepSecondsGroup.append(stepSecondsLabel, stepSecondsInput);
+  const stepSecondsHint = document.createElement('small');
+  stepSecondsHint.className = 'form-hint';
+  stepSecondsHint.textContent = '每隔多久輸出一次字幕；必須小於或等於視窗長度。';
+  stepSecondsGroup.appendChild(stepSecondsHint);
+  advancedBody.appendChild(stepSecondsGroup);
+
+  // 情境選單 → 兩個數值輸入：套用預設值。
+  // 注意：這裡直接寫 .value 而不 dispatchEvent('change')——兩個輸入框各自的
+  // change handler 也會寫 config／呼叫 syncSceneFromValues，若在此觸發會造成
+  // 情境選單被 syncSceneFromValues 立即覆寫回去，形成無謂的往返。
+  // config 已在此處原子性地一次寫入兩個欄位，不需要靠輸入框的 handler 補寫。
+  sceneSelect.addEventListener('change', () => {
+    const preset = WINDOW_SCENE_PRESETS.find((item) => item.value === sceneSelect.value);
+    if (!preset) return; // 使用者選「自訂」時不代表任何數值，不做變更。
+    windowSecondsInput.value = String(preset.windowSeconds);
+    stepSecondsInput.value = String(preset.stepSeconds);
+    config = {
+      ...config,
+      live_caption_window_seconds: preset.windowSeconds,
+      live_caption_step_seconds: preset.stepSeconds,
+    };
+    onChange(config);
+  });
+
+  // 兩個數值輸入 → 情境選單：手動調整時同步回報目前對應哪個情境（或「自訂」）。
+  const syncSceneFromValues = (): void => {
+    const windowSeconds = Number(windowSecondsInput.value);
+    const stepSeconds = Number(stepSecondsInput.value);
+    sceneSelect.value = matchWindowScene(windowSeconds, stepSeconds);
+  };
+  windowSecondsInput.addEventListener('change', () => {
+    const next = Number(windowSecondsInput.value);
+    if (Number.isFinite(next)) {
+      // 步進不得大於視窗長度（後端 validate_caption_window 會拒絕啟動）；
+      // 縮小視窗時若原步進已超出新視窗長度，一併收緊，避免存下無法啟動的組合。
+      const clampedStep = Math.min(Number(stepSecondsInput.value) || 3, next);
+      if (clampedStep !== Number(stepSecondsInput.value)) {
+        stepSecondsInput.value = String(clampedStep);
+      }
+      config = { ...config, live_caption_window_seconds: next, live_caption_step_seconds: clampedStep };
       onChange(config);
-    },
-    '每次送交辨識的音訊長度；過短會降低辨識準確度。',
-  ));
-  advancedBody.appendChild(numberGroup(
-    '步進（秒）',
-    config.live_caption_step_seconds || 3,
-    1,
-    30,
-    1,
-    (value) => {
-      config = { ...config, live_caption_step_seconds: value };
+    }
+    syncSceneFromValues();
+  });
+  stepSecondsInput.addEventListener('change', () => {
+    const next = Number(stepSecondsInput.value);
+    if (Number.isFinite(next)) {
+      // 反向同理：步進不得大於視窗長度，調大步進時若已超出視窗長度，
+      // 一併調大視窗長度以維持合法組合（而非反向收緊步進，避免使用者
+      // 剛設定的值被自己的操作覆蓋，體感更符合「補足」而非「拒絕」）。
+      const clampedWindow = Math.max(Number(windowSecondsInput.value) || 5, next);
+      if (clampedWindow !== Number(windowSecondsInput.value)) {
+        windowSecondsInput.value = String(clampedWindow);
+      }
+      config = { ...config, live_caption_step_seconds: next, live_caption_window_seconds: clampedWindow };
       onChange(config);
-    },
-    '每隔多久輸出一次字幕；必須小於或等於視窗長度。',
-  ));
+    }
+    syncSceneFromValues();
+  });
+  syncSceneFromValues();
+
   advancedBody.appendChild(numberGroup(
     '靜音門檻（0 至 1）',
     config.live_caption_silence_threshold ?? 0.01,

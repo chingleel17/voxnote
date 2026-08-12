@@ -171,6 +171,21 @@ cargo build --manifest-path src-tauri/Cargo.toml
 cargo build --manifest-path src-tauri/Cargo.toml --features live-caption-cuda
 ```
 
+若編譯時 cmake 找不到目標顯卡的 CUDA 架構（例如新款顯卡未被預設架構清單涵蓋），
+需另外指定 `CMAKE_CUDA_ARCHITECTURES` 環境變數。可用 `nvidia-smi --query-gpu=compute_cap --format=csv`
+查詢顯卡的 compute capability（例如 `12.0` 對應 `120`）。
+
+打包 CUDA 版安裝檔請用：
+
+```bash
+bun run tauri:build:cuda
+```
+
+此指令固定以 `CMAKE_CUDA_ARCHITECTURES=120`（RTX 50 系列 / sm_120）建置；
+若目標顯卡架構不同，需修改 `package.json` 中 `tauri:build:cuda` script 的對應值。
+輸出檔名會加上 `-CUDA` 後綴（如 `VoxNote-CUDA_x.x.x_x64-setup.exe`），
+與一般 CPU 版（`VoxNote_x.x.x_x64-setup.exe`）不會互相覆蓋。
+
 ---
 
 ## 快速開始

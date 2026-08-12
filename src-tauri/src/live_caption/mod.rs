@@ -20,6 +20,7 @@ use crate::{
     audio_recording::{
         self, DesktopRecordingManager, RecordingDeviceList, SharedError, SharedQueue,
     },
+    commands::ai_cmds::PROOFREAD_CORE_SYSTEM,
     config::AppConfig,
 };
 
@@ -42,6 +43,13 @@ const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// 取 0.6 而非更嚴的值，是因為即時字幕的短視窗本就容易讓此機率偏高。
 /// 注意：實測顯示幻覺片段的此機率為 0.000，故此項對該類幻覺無攔截效果。
 const SEGMENT_NO_SPEECH_MAX: f32 = 0.6;
+/// 字幕視窗的預設高度（邏輯像素），約可容納兩行文字（預設字級 28px、
+/// line-height 1.25 → 35px／行）加上標題列與內距。使用者仍可自行拖曳調整，
+/// 此值僅為每次啟動時的初始高度。
+const OVERLAY_DEFAULT_HEIGHT_LOGICAL: f64 = 130.0;
+const OVERLAY_DEFAULT_WIDTH_LOGICAL: f64 = 720.0;
+/// 預設垂直位置：螢幕下方三分之一處（視窗頂部離螢幕底部的距離為螢幕高度的
+/// 1/3，而非視窗頂部緊貼該線），對應常見影片字幕的視覺位置。
 /// 字幕字級的四檔預設值（S/M/L/XL，單位為像素）。使用者只能由此四檔中選擇，
 /// 不開放輸入任意數字；同時顯示的行數已改由視窗高度與此字級計算，故字級的
 /// 級距不宜過密，否則行數估算會過於敏感。
@@ -210,6 +218,10 @@ impl LiveCaptionManager {
                     let _ = handle.join();
                     return Err(anyhow!("無法開啟即時字幕浮動視窗：{error}"));
                 }
+                // 每次啟動皆套用預設大小與位置：目前無位置持久化機制，
+                // 沿用既有行為（每次開啟皆回到固定初始狀態）。失敗僅記錄，
+                // 不影響字幕啟動——大小／位置本就可由使用者手動調整。
+                apply_default_overlay_geometry(&overlay);
                 let _ = app.emit(
                     LIVE_CAPTION_SETTINGS_EVENT,
                     LiveCaptionSettingsPayload {
@@ -582,14 +594,21 @@ fn process_caption_windows(
             },
         );
 
-        // 翻譯不得阻塞下一段 ASR；完成後用相同 sequence 更新已顯示的字幕。
-        if config.live_caption_translate && config.live_caption_display_mode != "original" {
+        let (should_translate, should_proofread) = resolve_translate_or_proofread(
+            config.live_caption_translate,
+            config.live_caption_proofread,
+            &config.live_caption_display_mode,
+            &config.live_caption_language,
+        );
+
+        if should_translate {
             let translation_app = app.clone();
             let translation_config = config.clone();
             let translation_text = text.clone();
             let translation_sequence = sequence;
             let translation_mode = config.live_caption_display_mode.clone();
             let translation_failure_reported = translation_failure_reported.clone();
+            // 翻譯不得阻塞下一段 ASR；完成後用相同 sequence 更新已顯示的字幕。
             thread::spawn(move || {
                 match tauri::async_runtime::block_on(call_llm(
                     &translation_config,
@@ -619,6 +638,48 @@ fn process_caption_windows(
                             emit_error(
                                 &translation_app,
                                 format!("字幕翻譯暫時不可用，將維持顯示原文：{}", error),
+                            );
+                        }
+                    }
+                }
+            });
+        } else if should_proofread {
+            let proofread_app = app.clone();
+            let proofread_config = config.clone();
+            let proofread_text = text.clone();
+            let proofread_sequence = sequence;
+            let proofread_failure_reported = translation_failure_reported.clone();
+            // 校稿是「修正原文」而非另一種呈現，故以校正後文字取代 original／
+            // display_text，translation 欄位維持 None——與翻譯的語意區分開來。
+            thread::spawn(move || {
+                match tauri::async_runtime::block_on(call_llm(
+                    &proofread_config,
+                    PROOFREAD_CORE_SYSTEM,
+                    &proofread_text,
+                )) {
+                    Ok(value) if !value.trim().is_empty() => {
+                        let value = value.trim().to_string();
+                        proofread_failure_reported.store(false, Ordering::SeqCst);
+                        let _ = proofread_app.emit(
+                            LIVE_CAPTION_EVENT,
+                            LiveCaptionPayload {
+                                sequence: proofread_sequence,
+                                original: value.clone(),
+                                // 不透過 build_display_text：該函式依 mode 在原文／譯文間選擇，
+                                // 但此處沒有「譯文」，三種 mode 目前都恰好收斂回 value，純屬巧合
+                                // （並非刻意設計）。直接指定 value，避免日後修改
+                                // build_display_text 的行為時，此處被意外連動改變。
+                                display_text: value.clone(),
+                                translation: None,
+                            },
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        if !proofread_failure_reported.swap(true, Ordering::SeqCst) {
+                            emit_error(
+                                &proofread_app,
+                                format!("字幕校稿暫時不可用，將維持顯示原文：{}", error),
                             );
                         }
                     }
@@ -822,6 +883,27 @@ fn remove_overlap(previous: &str, current: &str) -> String {
     current.trim().to_string()
 }
 
+/// 決定單段字幕應執行翻譯或校稿，兩者最多擇一。
+///
+/// 翻譯與校稿互斥：來源語言為中文時（翻譯目標與來源相同），翻譯是 no-op，
+/// 改執行校稿；來源語言非中文時，校稿的「輸出語言等於輸入語言」前提不成立，
+/// 執行翻譯。
+///
+/// 「auto」情境無法在此得知實際轉錄語言（whisper 逐段偵測結果未回傳至此層級），
+/// 故不試圖精準判斷，一律視為需要翻譯的情境——只有明確指定來源語言為中文時，
+/// 才確定目標與來源相同。
+fn resolve_translate_or_proofread(
+    translate_enabled: bool,
+    proofread_enabled: bool,
+    display_mode: &str,
+    source_language: &str,
+) -> (bool, bool) {
+    let source_is_chinese = source_language == "zh";
+    let should_translate = translate_enabled && display_mode != "original" && !source_is_chinese;
+    let should_proofread = proofread_enabled && source_is_chinese;
+    (should_translate, should_proofread)
+}
+
 fn build_display_text(original: &str, translation: Option<&str>, mode: &str) -> String {
     match mode {
         "original" => original.to_string(),
@@ -838,6 +920,44 @@ fn emit_error(app: &AppHandle, message: String) {
         LIVE_CAPTION_ERROR_EVENT,
         LiveCaptionErrorPayload { message },
     );
+}
+
+/// 將字幕視窗設為預設大小（約可容納兩行文字）與位置（螢幕下方三分之一處、
+/// 水平置中）。失敗時僅記錄，不影響字幕啟動——使用者原本就能手動調整視窗。
+fn apply_default_overlay_geometry(overlay: &tauri::WebviewWindow) {
+    let monitor = match overlay.current_monitor() {
+        Ok(Some(monitor)) => monitor,
+        Ok(None) => {
+            println!("[live-caption] 找不到目前所在螢幕，略過套用預設視窗位置");
+            return;
+        }
+        Err(error) => {
+            println!("[live-caption] 無法取得螢幕資訊，略過套用預設視窗位置：{error}");
+            return;
+        }
+    };
+    // 使用該螢幕自身的 scale_factor／position，避免與其他螢幕的縮放或座標混用。
+    let scale = monitor.scale_factor();
+    let monitor_origin_x_logical = monitor.position().x as f64 / scale;
+    let monitor_origin_y_logical = monitor.position().y as f64 / scale;
+    let screen_width_logical = monitor.size().width as f64 / scale;
+    let screen_height_logical = monitor.size().height as f64 / scale;
+
+    let width = OVERLAY_DEFAULT_WIDTH_LOGICAL.min(screen_width_logical);
+    let height = OVERLAY_DEFAULT_HEIGHT_LOGICAL;
+    let x = monitor_origin_x_logical + (screen_width_logical - width) / 2.0;
+    // 視窗頂部落在螢幕高度 72% 處，使視窗主體落於螢幕下方三分之一區域內。
+    let y = monitor_origin_y_logical + screen_height_logical * 0.72;
+
+    if let Err(error) = overlay.set_size(tauri::LogicalSize::new(width, height)) {
+        println!("[live-caption] 無法設定字幕視窗預設大小：{error}");
+    }
+    if let Err(error) = overlay.set_position(tauri::LogicalPosition::new(
+        x.max(monitor_origin_x_logical),
+        y.max(monitor_origin_y_logical),
+    )) {
+        println!("[live-caption] 無法設定字幕視窗預設位置：{error}");
+    }
 }
 
 /// 切換字幕視窗的點擊穿透狀態。
@@ -923,7 +1043,72 @@ fn close_overlay(app: &AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_display_text, is_hallucination, nearest_font_size_preset, remove_overlap};
+    use super::{
+        build_display_text, is_hallucination, nearest_font_size_preset,
+        resolve_translate_or_proofread, remove_overlap,
+    };
+
+    #[test]
+    fn only_translation_enabled_with_different_source_language_translates() {
+        // add-live-caption-overlay spec: 「User watches foreign-language content
+        // with translation enabled」
+        let (translate, proofread) = resolve_translate_or_proofread(true, false, "translation", "en");
+        assert!(translate);
+        assert!(!proofread);
+    }
+
+    #[test]
+    fn only_proofread_enabled_with_chinese_source_proofreads() {
+        // spec: 「User enables proofreading for same-language content」
+        let (translate, proofread) = resolve_translate_or_proofread(false, true, "original", "zh");
+        assert!(!translate);
+        assert!(proofread);
+    }
+
+    #[test]
+    fn both_enabled_with_different_languages_only_translates() {
+        // spec: 「User enables both translation and proofreading with
+        // different languages」——校稿於跨語言情境 MUST NOT 生效
+        let (translate, proofread) = resolve_translate_or_proofread(true, true, "translation", "en");
+        assert!(translate);
+        assert!(!proofread);
+    }
+
+    #[test]
+    fn only_translation_enabled_with_chinese_source_skips_llm_call() {
+        // spec: 「System skips the LLM call when translation would be a
+        // no-op」——僅翻譯、來源為中文時兩者皆不執行
+        let (translate, proofread) = resolve_translate_or_proofread(true, false, "translation", "zh");
+        assert!(!translate);
+        assert!(!proofread);
+    }
+
+    #[test]
+    fn both_enabled_with_chinese_source_proofreads_not_skipped() {
+        // spec: 「Target language equals source language with both enabled」
+        // ——此情境校稿本身即為使用者要的處理，MUST NOT 被最佳化跳過
+        let (translate, proofread) = resolve_translate_or_proofread(true, true, "translation", "zh");
+        assert!(!translate);
+        assert!(proofread);
+    }
+
+    #[test]
+    fn auto_source_language_is_treated_as_translation_candidate() {
+        // 無法得知 auto 偵測到的實際語言，故一律視為需要翻譯（非中文）的情境；
+        // 校稿的「輸出等於輸入語言」前提在此不成立。
+        let (translate, proofread) = resolve_translate_or_proofread(true, true, "translation", "auto");
+        assert!(translate);
+        assert!(!proofread);
+    }
+
+    #[test]
+    fn translate_disabled_by_original_display_mode_does_not_block_proofread() {
+        // 迴歸測試：曾誤將翻譯的 display_mode != "original" 判斷套用到校稿，
+        // 會導致使用者的既有設定（display_mode = "original"）下校稿永遠不執行。
+        let (translate, proofread) = resolve_translate_or_proofread(true, true, "original", "zh");
+        assert!(!translate);
+        assert!(proofread);
+    }
 
     #[test]
     fn font_size_snaps_to_nearest_preset() {

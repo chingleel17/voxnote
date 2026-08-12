@@ -156,6 +156,7 @@ export interface AppConfig {
   live_caption_step_seconds: number;
   live_caption_silence_threshold: number;
   live_caption_translate: boolean;
+  live_caption_proofread: boolean; // 校稿與翻譯獨立開關，輸出語言等於來源語言
   live_caption_display_mode: 'translation' | 'original' | 'both';
   live_caption_font_size: number; // 僅接受 S/M/L/XL 四檔預設值，見 liveCaptionSettings.ts
   live_caption_clear_seconds: number;

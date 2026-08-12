@@ -1,24 +1,67 @@
+# 兩個 ASR 實例共用同一份 image（同一套 app.py），僅 ASR_MODEL 不同：
+#   asr-batch：中文會議逐字稿（Breeze-ASR-26）
+#   asr-live ：即時字幕（英文模型）
+# 兩者皆不對外開埠，一律經 gateway 於單一埠提供服務。
+#
+# 只需要單一實例時：docker compose up asr-batch gateway
+# （或沿用舊行為，將 asr-batch 的 ports 取消註解後直接使用）
+
+x-asr-common: &asr-common
+  build: .
+  environment: &asr-common-env
+    HF_HOME: /root/.cache/huggingface
+    HF_TOKEN_FILE: /run/secrets/hf_token
+    # 音訊前處理：設為 0 可停用，用於比對前處理對轉錄與語者分離的實際影響
+    AUDIO_PREPROCESS: ${AUDIO_PREPROCESS:-1}
+    # 高通濾波截止頻率（Hz），濾除冷氣與桌面震動等低頻噪音；設為 0 可單獨停用
+    AUDIO_HIGHPASS_HZ: ${AUDIO_HIGHPASS_HZ:-80}
+    # 響度標準化方式："loudnorm"（保持訊噪比，60 分鐘約 35 秒）、
+    # "dynaudnorm"（約 2.3 秒但會放大靜音段底噪）或 "none"（僅高通濾波）
+    AUDIO_NORMALIZER: ${AUDIO_NORMALIZER:-loudnorm}
+  gpus: all
+  restart: unless-stopped
+
 services:
-  local-asr:
-    build: .
-    ports:
-      - "${ASR_PORT:-8000}:8000"
+  # 批次逐字稿：中文會議，需語者分離
+  asr-batch:
+    <<: *asr-common
     environment:
+      <<: *asr-common-env
       # 容器內模型路徑；改用其他模型時一併調整此值與下方掛載來源
       ASR_MODEL: ${ASR_MODEL:-/models/asr-model}
-      HF_HOME: /root/.cache/huggingface
-      HF_TOKEN_FILE: /run/secrets/hf_token
-      # 音訊前處理：設為 0 可停用，用於比對前處理對轉錄與語者分離的實際影響
-      AUDIO_PREPROCESS: ${AUDIO_PREPROCESS:-1}
-      # 高通濾波截止頻率（Hz），濾除冷氣與桌面震動等低頻噪音；設為 0 可單獨停用
-      AUDIO_HIGHPASS_HZ: ${AUDIO_HIGHPASS_HZ:-80}
-      # 響度標準化方式："loudnorm"（保持訊噪比，60 分鐘約 35 秒）、
-      # "dynaudnorm"（約 2.3 秒但會放大靜音段底噪）或 "none"（僅高通濾波）
-      AUDIO_NORMALIZER: ${AUDIO_NORMALIZER:-loudnorm}
     volumes:
       # host 端模型目錄（預設放 Breeze-ASR-26；可用 .env 的 ASR_MODEL_PATH 覆寫）
       - ${ASR_MODEL_PATH:-./models/asr-model}:/models/asr-model:ro
       - ${HF_CACHE_DIR:-./cache/huggingface}:/root/.cache/huggingface
       - ${HF_TOKEN_FILE:-./secrets/hf_token}:/run/secrets/hf_token:ro
-    gpus: all
+
+  # 即時字幕：英文影片，不使用語者分離（故不會載入 pyannote，較批次實例省 VRAM）
+  asr-live:
+    <<: *asr-common
+    environment:
+      <<: *asr-common-env
+      # 預設 distil-large-v3：專為英文蒸餾，速度約 large-v3 的 6 倍而品質接近，
+      # 適合即時字幕每數秒一次的節奏。此為 WhisperX 內建代號，首次載入時自動
+      # 下載至掛載的 HF 快取，無須事先轉檔（不同於 Breeze 需 ct2 轉換）。
+      # 追求最佳品質可改 large-v3；VRAM 吃緊可改 medium.en。
+      ASR_MODEL: ${ASR_LIVE_MODEL:-distil-large-v3}
+      # 即時情境以延遲為先，預設較小的 batch size
+      ASR_BATCH_SIZE: ${ASR_LIVE_BATCH_SIZE:-4}
+    volumes:
+      # 僅在 ASR_LIVE_MODEL 指向本地目錄時才需要此掛載；使用內建代號時模型
+      # 存於下方的 HF 快取，此掛載不影響運作。
+      - ${ASR_LIVE_MODEL_PATH:-./models/asr-live-model}:/models/asr-live-model:ro
+      - ${HF_CACHE_DIR:-./cache/huggingface}:/root/.cache/huggingface
+      - ${HF_TOKEN_FILE:-./secrets/hf_token}:/run/secrets/hf_token:ro
+
+  # 對外唯一入口：/batch/ 與 /live/ 分流至上述兩個實例
+  gateway:
+    image: nginx:1.27-alpine
+    ports:
+      - "${ASR_PORT:-8000}:8000"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - asr-batch
+      - asr-live
     restart: unless-stopped

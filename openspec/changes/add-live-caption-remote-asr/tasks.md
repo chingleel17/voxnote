@@ -2,10 +2,11 @@
 
 - [x] 0.1 確認 `add-live-caption-overlay` 的未完成任務（1.5、1.6、2.6、8.5、10.x）已完成或明確決定不阻擋本變更
   - 1.5、1.6、2.6、8.5 已於工作區完成（見該變更 tasks.md）。10.x（設定調校）不阻擋本次「設定、背景穿透」範圍，將於本變更 7.x 實測階段一併處理。
-- [ ] 0.2 於 RTX 4090 主機部署適合英文低延遲轉錄的 ASR 服務實例（與既有 Breeze-ASR 實例並存），記錄其位址與所載入的模型
-  - 環境部署，非程式碼範圍，本次（設定／背景穿透功能）未執行。
-- [ ] 0.3 以 `curl` 對該端點發出一次 `/v1/audio/transcriptions` 請求，確認回應格式與既有自架服務相容
-  - 依賴 0.2，本次未執行。
+- [ ] 0.2 於 RTX 4090 主機啟動雙實例＋gateway（`docker compose up -d --build`），記錄實際載入的模型與首次載入耗時
+  - 部署設定已完成（`server/docker-compose.yml`、`server/nginx.conf`、README 的「雙實例部署」與步驟 3b）。英文模型預設 `distil-large-v3`（WhisperX 內建代號，首次請求時自動下載約 1.5 GB，無須事先準備或轉檔），故本任務僅需實際啟動並驗證。
+  - 注意：首次請求會觸發下載與模型載入，耗時可能達數十秒，屬正常現象；此即 `nginx.conf` 的即時路徑逾時設為 120 秒而非秒級的原因。
+- [ ] 0.3 驗證 gateway 分流：`curl` 確認 `/health`、`/batch/health`、`/live/health` 皆回 200，且 `/batch/v1/audio/transcriptions` 與 `/live/v1/audio/transcriptions` 回應格式一致
+- [ ] 0.4 於 app 設定填入含路徑前綴的位址（批次 `.../batch`、即時字幕 `.../live`），確認設定頁「測試連線」對兩者皆通過
 
 ## 1. 即時字幕獨立設定項
 
@@ -18,6 +19,10 @@
 - [x] 1.6 確認批次流程（`commands/asr_cmds.rs`）仍使用 `asr_language` 與 `local_asr_base_url`，未受影響（僅新增回退讀取，未修改批次呼叫路徑）
 
 ## 2. 即時專用的遠端轉錄路徑
+
+> **先決條件**：本節依賴 `add-async-transcription-queue` 的同步模式（見該變更任務 1.3.1）。
+> 4090 實例與批次實例為同一套 `server/app.py`，非同步化會一併改變本節所用的端點契約，
+> 故本節應於該變更完成後再實作。第 3、4 節不受此限，可先行。
 
 - [ ] 2.1 於 `src-tauri/src/asr/mod.rs` 新增 `transcribe_live_caption_remote()`，接受外部傳入的 `reqwest::Client`
 - [ ] 2.2 該函式使用秒級逾時常數（與 `LOCAL_ASR_TIMEOUT_SECS` 分離），逾時回傳可辨識的錯誤型別
@@ -39,10 +44,13 @@
 - [ ] 4.1 將 `live_caption/mod.rs` 的 `remove_overlap()`（前後綴精確比對）替換為相似度去重
 - [ ] 4.2 保留最近 N 筆已輸出結果（參考實作為 10 筆）供比對，取代目前僅比對前一筆的 `previous_text`
 - [ ] 4.3 實作子字串重疊度與字元相似度的雙重判定，並設定最短長度門檻避免短句誤判
-- [ ] 4.4 於設定新增視窗長度與步進的情境預設組合（低延遲／一般／長句完整），維持視窗重疊
-- [ ] 4.5 確認不導入 VAD 至即時路徑；伺服器端批次流程既有的 VAD 使用不受影響
+- [ ] 4.4 確認不導入 VAD 至即時路徑；伺服器端批次流程既有的 VAD 使用不受影響
+  - 視窗長度情境預設已移出本變更（見 proposal「不在本變更範圍」），由已歸檔的 `add-live-caption-overlay` 第 12 節提供。
 
-## 5. 字幕視窗滑鼠穿透
+## 5. 字幕視窗滑鼠穿透（已完成；需求歸屬已改列於 `add-live-caption-overlay` 基準）
+
+> 本節於實作期間完成，惟其對應需求已確認屬基準的「System allows interacting with content
+> beneath the caption window」，非本變更新增。proposal 已將此項移出範圍，本節保留作為實作紀錄。
 
 - [x] 5.1 於 `src-tauri/src/commands/live_caption_cmds.rs` 的 `set_live_caption_click_through` command 改為呼叫 `LiveCaptionManager::set_manual_click_through()`（該 command 前一變更已建立，本次改為手動切換語意）
   - 語意定為「鎖定」＝穿透模式：`LiveCaptionManager::set_lock()` 切換 session 級 `click_through_enabled` 旗標。鎖定開啟時 watcher 持續依游標位置動態切換（游標移到標題列／邊框仍可互動，供拖曳、調整大小、按下關閉鈕）；鎖定關閉時 watcher 強制維持可互動、不套用穿透。watcher 全程運作，不會被手動切換停用，避免「移到標題列卻點不到關閉鈕」的問題
@@ -59,6 +67,8 @@
 - [x] 6.1 於即時字幕的設定區塊新增來源語言、遠端端點位址、遠端模型、即時逾時等設定項
   - 前一變更任務 7.6 已將即時字幕設定自 `settings.ts` 移至 `src/components/liveCaptionSettings.ts`（即時字幕頁使用），故新欄位加於該檔案而非 `settings.ts`；滑鼠穿透維持既有的自動穿透開關（`live_caption_click_through`），手動穿透為 runtime 切換不落盤，故未在此新增欄位
 - [x] 6.2 明確標示即時字幕的語言與端點與批次逐字稿為獨立設定，避免使用者誤以為共用
+- [ ] 6.3 確認介面未使使用者誤以為翻譯的目標語言可設定（目標固定為繁體中文，見 spec delta 的 MODIFIED「System skips the LLM call when translation would be a no-op」）
+  - 規格措辭已修正：原文「目標顯示語言」隱含存在可設定的目標語言，實際上 `live_caption/mod.rs:615` 的翻譯 prompt 將繁體中文寫死，`resolve_translate_or_proofread` 亦以 `== "zh"` 判定。程式行為正確，僅需確認介面文案一致。
   - 兩側皆已加註：`liveCaptionSettings.ts` 的來源語言欄位旁提示「與設定頁批次逐字稿各自獨立」；`settings.ts` 批次轉錄語言欄位旁提示「即時字幕為獨立設定，請至即時字幕頁調整」
 
 ## 7. 實測與調校
@@ -68,10 +78,11 @@
 - [ ] 7.3 實測相似度去重與原前後綴比對的字幕品質差異（重複、漏字、誤刪短句），記錄結果
 - [ ] 7.4 實測背壓：以刻意降速或高負載情境確認字幕能追上當下聲音且記憶體維持在上限內
 - [ ] 7.5 實測遠端逾時路徑：中斷 4090 主機連線，確認單段失敗略過且 session 不中止
-- [ ] 7.6 依 7.1、7.3 的實測結果調校即時逾時、視窗情境預設組合與相似度門檻（含前一變更任務 10.3 的調校範圍）
-- [ ] 7.7 實測滑鼠穿透：於影片播放器上方疊放字幕視窗，確認點擊傳遞且可退出穿透狀態
+- [ ] 7.6 依 7.1、7.3 的實測結果調校即時逾時與相似度門檻（視窗情境預設已移出本變更範圍，見 proposal）
+- [ ] 7.7 迴歸確認滑鼠穿透：於影片播放器上方疊放字幕視窗，確認點擊傳遞且可退出穿透狀態（功能屬基準，此處僅確認本變更未造成回歸）
 
 ## 8. 文件
 
-- [ ] 8.1 於 README 說明即時字幕的來源語言與遠端端點為獨立設定，並說明適用情境（批次中文會議／即時英文影片）
-- [ ] 8.2 於 README 說明遠端 ASR 主機的部署需求與建議模型
+- [ ] 8.1 於專案 README 說明即時字幕的來源語言與遠端端點為獨立設定，並說明適用情境（批次中文會議／即時英文影片）
+- [x] 8.2 於 `server/README.md` 說明遠端 ASR 主機的部署需求與建議模型
+  - 已完成：新增「雙實例部署」章節（gateway 路徑分流、端點對照表、逾時設定、單實例退回方式），並更新「app 端設定」說明 base URL 需含 `/batch`、`/live` 前綴。

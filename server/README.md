@@ -44,6 +44,21 @@ API、Docker 與部署契約已完成；`app.py` 的 Breeze-ASR-26 載入、Whis
 
   若想改用其他模型，設定 `ASR_MODEL` 環境變數即可（詳見下方「選擇 ASR 模型」）；使用 WhisperX 內建代號（如 `large-v3`）時可略過本步驟，模型會自動下載，無須轉檔。
 
+- [ ] **3b. 即時字幕的英文模型（僅雙實例部署需要）**
+  **無須任何操作**。`asr-live` 預設使用 WhisperX 內建代號 `distil-large-v3`，首次收到請求時自動下載（約 1.5 GB）至掛載的 HF 快取，不需轉檔、不需事先放檔。
+
+  此處與步驟 3 的差異在於：Breeze 以 safetensors 發布故須自行轉為 CTranslate2；而 Whisper 系列（含 distil）由 WhisperX 直接處理。
+
+  模型選擇建議（詳見「雙實例部署 > 即時字幕的模型選擇」）：
+
+  | 代號 | 相對速度 | 英文品質 | 大小 |
+  | --- | --- | --- | --- |
+  | `distil-large-v3`（預設） | 約 6× | 接近 large-v3 | ~1.5 GB |
+  | `large-v3` | 1× | 最佳 | ~3 GB |
+  | `medium.en` | 約 2× | 尚可 | ~1.5 GB |
+
+  改用其他模型時設定 `ASR_LIVE_MODEL` 即可，例如 `ASR_LIVE_MODEL=large-v3 docker compose up -d`。
+
 - [ ] **4. 啟動服務**
   ```bash
   cd server
@@ -54,7 +69,7 @@ API、Docker 與部署契約已完成；`app.py` 的 Breeze-ASR-26 載入、Whis
   ```bash
   curl http://localhost:8000/health
   ```
-  應回傳 `status` 為 `ok` 的 JSON。
+  應回傳 `status` 為 `ok` 的 JSON（此為 gateway 自身的檢查）。後端各實例的檢查見下方「雙實例部署」。
 
 - [ ] **6. 驗證轉錄品質**
   以一段實際會議錄音呼叫轉錄端點，確認繁體中文台灣用語、語者標籤正確性，並記錄處理速度（RTF）與 VRAM 用量，作為調整 `ASR_COMPUTE_TYPE`、`ASR_BATCH_SIZE` 的依據。
@@ -83,10 +98,80 @@ torch 的 CUDA 版本請依 NVIDIA 官方索引安裝（對應主機 CUDA 版本
 
 注意：WhisperX 走 faster-whisper (CTranslate2) 後端，任何自訂 fine-tune 模型（如 Breeze）須先轉為 CTranslate2 格式才能載入；原版 Whisper 系列則由 WhisperX 自動處理。語者分離（pyannote）與所選 ASR 模型無關，兩者皆可搭配。
 
+## 雙實例部署（批次中文 ／ 即時英文）
+
+批次會議逐字稿與即時字幕的最佳模型並不相同：Breeze-ASR-26 是台灣中文與中英混用的 fine-tune，**不適合英文影片**；而同尺寸下其速度與原版 Whisper 相當，故若要降低即時延遲，應調整模型尺寸與 `ASR_COMPUTE_TYPE`，而非更換 fine-tune。
+
+`docker compose` 因此定義兩個 ASR 實例，**共用同一份 image 與同一套 `app.py`**，僅環境變數不同：
+
+| 服務 | 用途 | 模型變數 | 語者分離 |
+| --- | --- | --- | --- |
+| `asr-batch` | 中文會議逐字稿 | `ASR_MODEL` | 使用 |
+| `asr-live` | 英文即時字幕 | `ASR_LIVE_MODEL` | 不使用 |
+
+`asr-live` 不啟用語者分離，故不會載入 pyannote 模型，VRAM 用量低於 `asr-batch`（模型皆為惰性載入）。
+
+### 即時字幕的模型選擇
+
+即時字幕的瓶頸是**延遲**而非絕對準確度——每數秒的音訊視窗都要在下一個視窗到來前完成轉錄。故預設採 `distil-large-v3`：Whisper large-v3 的英文蒸餾版，速度約 6 倍而英文品質接近原版。
+
+| `ASR_LIVE_MODEL` | 相對速度 | 英文品質 | 下載大小 | 適用 |
+| --- | --- | --- | --- | --- |
+| `distil-large-v3`（預設） | 約 6× | 接近 large-v3 | ~1.5 GB | 一般情境；速度與品質平衡 |
+| `large-v3` | 1× | 最佳 | ~3 GB | GPU 充裕、可接受較高延遲 |
+| `medium.en` | 約 2× | 尚可 | ~1.5 GB | VRAM 吃緊 |
+
+三者皆為 WhisperX 內建代號，**首次載入時自動下載，無須事先準備或轉檔**。
+
+注意：`distil-large-v3` 與 `medium.en` 皆為**英文專用**，不適合中文或多語內容——即時字幕若要轉錄其他語言，應改用 `large-v3`。批次中文會議不受影響（走 `asr-batch` 的 Breeze-ASR-26）。
+
+延遲仍不足時，優先調整 `ASR_COMPUTE_TYPE`（`int8` 較快、`float16` 較準）而非再換更小的模型。
+
+### 為何用 gateway 而非各自開埠
+
+兩個實例皆**不對外開埠**，一律經 `gateway`（nginx）於單一埠分流：
+
+```
+http://<host>:8000/batch/...  ->  asr-batch:8000
+http://<host>:8000/live/...   ->  asr-live:8000
+```
+
+如此對外只佔用一個埠。兩者仍為獨立 process、各有各的序列化鎖，故長會議轉錄**不會**讓即時字幕排隊等待——但兩者同時執行時會爭用 GPU 算力，即時字幕的延遲仍會惡化，此為物理限制。
+
+若改以「單一 process 依請求參數切換模型」實作，會因 `app.py` 的 ASR 模型為單一欄位且無卸載路徑，退化為兩個模型同時常駐（VRAM 與雙實例相同），卻多背共用鎖導致的排隊問題，故不採用。
+
+### 端點對照
+
+| 用途 | URL |
+| --- | --- |
+| gateway 健康檢查 | `http://<host>:8000/health` |
+| 批次健康檢查 | `http://<host>:8000/batch/health` |
+| 批次轉錄 | `http://<host>:8000/batch/v1/audio/transcriptions` |
+| 即時健康檢查 | `http://<host>:8000/live/health` |
+| 即時轉錄 | `http://<host>:8000/live/v1/audio/transcriptions` |
+
+### 只想跑單一實例
+
+```bash
+docker compose up -d --build asr-batch gateway
+```
+
+此時 `/live/` 路徑會回 502，`/batch/` 正常。
+
+### 逾時設定
+
+`nginx.conf` 的 `proxy_read_timeout` 對批次設為 3600 秒，須與客戶端的 `LOCAL_ASR_TIMEOUT_SECS` 一致——否則長錄音會在 gateway 這層先被切斷，客戶端只看到連線中斷而非真正原因。即時路徑設為 120 秒，僅作為兜底（首次請求需惰性載入模型），實際的即時節奏把關由客戶端自身的秒級逾時負責。
+
+上傳大小上限為 2048 MB（`client_max_body_size`），長會議錄音可達數百 MB，預設的 1 MB 會被擋下。
+
 ## 環境變數
 
 | 變數 | 說明 | 預設 |
 | --- | --- | --- |
+| `ASR_LIVE_MODEL` | 即時字幕實例的模型；WhisperX 代號（自動下載）或容器內路徑 | `distil-large-v3` |
+| `ASR_LIVE_MODEL_PATH` | 即時字幕模型的 host 端目錄；僅在 `ASR_LIVE_MODEL` 指向本地目錄時需要 | `./models/asr-live-model` |
+| `ASR_LIVE_BATCH_SIZE` | 即時字幕實例的批次大小；以延遲為先故預設較小 | `4` |
+| `ASR_PORT` | gateway 對外埠 | `8000` |
 | `ASR_MODEL` | ASR 模型：CTranslate2 目錄、HF repo 名稱，或 WhisperX 內建代號（如 `large-v3`）。相容別名 `BREEZE_MODEL_DIR` | `MediaTek-Research/Breeze-ASR-26` |
 | `ASR_DEVICE` | 推論裝置 | `cuda` |
 | `ASR_COMPUTE_TYPE` | 運算精度；VRAM 較小建議 `int8`，較充裕可用 `float16` | `int8` |
@@ -116,7 +201,16 @@ torch 的 CUDA 版本請依 NVIDIA 官方索引安裝（對應主機 CUDA 版本
 
 ## app 端設定
 
-在 VoxNote 的「設定 > 語音轉錄」選擇「VoxNote 轉錄服務」，Base URL 填入服務位址（例如 `http://192.168.0.10:8000`）。設定頁的「測試連線」會呼叫 `/health`。本服務預設無驗證機制，請部署於受信任的網路環境。
+在 VoxNote 的「設定 > 語音轉錄」選擇「VoxNote 轉錄服務」，Base URL 填入**含路徑前綴**的位址。設定頁的「測試連線」會呼叫該位址下的 `/health`。本服務預設無驗證機制，請部署於受信任的網路環境。
+
+| 設定位置 | Base URL 範例 |
+| --- | --- |
+| 設定頁 > 批次逐字稿 | `http://192.168.0.10:8000/batch` |
+| 即時字幕頁 > 遠端端點 | `http://192.168.0.10:8000/live` |
+
+兩者為各自獨立的設定（即時字幕的來源語言與端點與批次流程分離）。即時字幕的端點若留空，會回退為批次所用的位址——單實例部署時可利用此行為，雙實例部署則應明確填入 `/live`。
+
+> 若沿用未經 gateway 的舊部署（單一容器直接開埠），Base URL 不帶路徑前綴即可，如 `http://192.168.0.10:8000`。
 
 `POST /v1/audio/transcriptions` 使用 multipart：`file` 為音訊檔；可選 `language`、`diarize`、`min_speakers` 與 `max_speakers`。回應的 `segments` 陣列含秒數 `start`、`end`、`text` 與啟用語者分離時的 `speaker`。
 

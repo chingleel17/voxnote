@@ -102,43 +102,27 @@
 - **WHEN** 兩段極短的文字字面相近但實為不同內容
 - **THEN** 系統 MUST NOT 將其誤判為重複，兩者 MUST 皆被輸出
 
-### Requirement: Caption window length is configurable for different speech rates
+## MODIFIED Requirements
 
-系統 MUST 允許使用者調整轉錄視窗長度與步進，以因應不同語速與情境對「語意完整度」與「首次出字延遲」的不同取捨。
+### Requirement: System skips the LLM call when translation would be a no-op
 
-系統 MUST 提供對應常見情境的預設組合，使使用者無須理解參數細節即可選用。
+僅啟用翻譯（未啟用校稿）時，若使用者已明確指定來源語言且該語言與翻譯的目標語言相同，系統 MUST NOT 呼叫翻譯模型，MUST 直接顯示轉錄原文。此為節省延遲與費用的最佳化，翻譯開關本身的其餘行為不受影響。
 
-相鄰視窗 MUST 維持重疊，以降低語句於視窗邊界被切斷的機率。
+即時字幕的翻譯目標語言 MUST 為繁體中文（台灣用語），為固定值而非使用者可設定項。本需求所稱「目標語言」即指此固定值；措辭上 MUST NOT 使人誤以為存在可設定的目標語言選項。
 
-#### Scenario: User watches fast-paced English content
+此最佳化 MUST 僅於來源語言為明確指定時適用。當來源語言設為自動偵測時，系統無法在呼叫轉錄後端之前得知實際語言，MUST NOT 嘗試判斷是否為同語言，MUST 依一般翻譯流程處理（不套用此最佳化）。
 
-- **WHEN** 使用者觀看語速較快的內容且字幕頻繁在語句中途切斷
-- **THEN** 使用者 MUST 能夠選用較長的視窗設定以改善語意完整度
+#### Scenario: Target language equals source language with only translation enabled
 
-#### Scenario: User prioritizes lowest latency
+- **WHEN** 使用者啟用翻譯、未啟用校稿，且已明確指定來源語言為繁體中文（即等同固定的翻譯目標語言）
+- **THEN** 系統 MUST 直接顯示轉錄原文，MUST NOT 對該段發出翻譯請求
 
-- **WHEN** 使用者希望字幕盡早出現而可接受語意較不完整
-- **THEN** 使用者 MUST 能夠選用較短的視窗設定
+#### Scenario: Target language equals source language with both enabled
 
-### Requirement: Caption window can be configured to ignore mouse events
+- **WHEN** 使用者同時啟用翻譯與校稿，且已明確指定來源語言為繁體中文
+- **THEN** 系統 MUST 執行校稿並顯示校正後的原語言字幕，此情境 MUST NOT 被本最佳化跳過（此時校稿本身即為使用者要的處理，見「Translation and proofreading are independent options」的同語言校稿情境）
 
-使用者 MUST 能夠將字幕浮動視窗設定為不攔截滑鼠事件，使點擊與捲動傳遞至其下方的應用程式。
+#### Scenario: Source language is set to automatic detection
 
-此設定 MUST 預設為關閉，以保留字幕視窗的拖曳與調整大小能力。
-
-當滑鼠穿透為開啟狀態時，關閉該設定的操作入口 MUST 仍可被使用者觸及，MUST NOT 使使用者無法退出該狀態。
-
-#### Scenario: User enables mouse pass-through while watching a video
-
-- **WHEN** 使用者開啟滑鼠穿透，並點擊字幕視窗覆蓋範圍內的影片播放器控制項
-- **THEN** 該點擊 MUST 傳遞至影片播放器，且字幕 MUST 持續顯示
-
-#### Scenario: Mouse pass-through is disabled
-
-- **WHEN** 滑鼠穿透為關閉狀態
-- **THEN** 使用者 MUST 能夠以滑鼠拖曳字幕視窗並調整其大小
-
-#### Scenario: User exits pass-through state
-
-- **WHEN** 滑鼠穿透為開啟狀態，使用者欲恢復對字幕視窗的操作
-- **THEN** 系統 MUST 提供仍可觸及的入口以關閉滑鼠穿透
+- **WHEN** 使用者將來源語言設為自動偵測，且啟用翻譯
+- **THEN** 系統 MUST NOT 嘗試判斷偵測結果是否與目標語言相同，MUST 依一般翻譯流程處理該段字幕
