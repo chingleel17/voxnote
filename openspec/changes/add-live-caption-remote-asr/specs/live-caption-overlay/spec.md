@@ -21,6 +21,43 @@
 - **WHEN** 使用者將即時字幕來源語言設為自動偵測
 - **THEN** 系統 MUST 交由轉錄後端自行判斷語言，且 MUST NOT 套用批次流程的語言設定
 
+### Requirement: System resolves the live caption endpoint at session start
+
+即時字幕的遠端服務位址未設定時，系統 MUST 於 session 啟動時自動判定所要使用的位址，MUST NOT 要求使用者理解服務端的路徑配置後才能正確填寫。
+
+判定 MUST 僅於 session 啟動時進行一次，MUST NOT 於每次轉錄請求前重複進行——即時字幕以數秒為單位呼叫轉錄，每次額外的往返皆會累積為延遲。
+
+使用者已明確填寫位址時，系統 MUST 直接採用該值，MUST NOT 以自動判定覆蓋。自動判定為未設定時的預設行為，而非對明確設定的修正。
+
+自動判定失敗時（無法連線、逾時或回應非成功），系統 MUST 回退至批次流程所使用的位址，MUST NOT 因判定失敗而拒絕啟動 session——實際採用的位址仍會經既有的健康檢查把關。
+
+判定結果 MUST NOT 寫回使用者的設定檔，避免將部署環境的推測值固化為使用者設定。
+
+#### Scenario: Endpoint is unset and the service provides a dedicated live path
+
+- **WHEN** 使用者未填寫即時字幕的遠端位址，而批次位址所指的服務提供專供即時字幕使用的子路徑
+- **THEN** 系統 MUST 於本次 session 採用該子路徑，使即時字幕使用適合其用途的模型實例
+
+#### Scenario: Endpoint is unset and the service has no dedicated live path
+
+- **WHEN** 使用者未填寫即時字幕的遠端位址，而批次位址所指的服務未提供該子路徑
+- **THEN** 系統 MUST 沿用批次位址並正常啟動 session
+
+#### Scenario: User has explicitly configured an endpoint
+
+- **WHEN** 使用者已明確填寫即時字幕的遠端位址
+- **THEN** 系統 MUST 直接採用該位址，MUST NOT 進行自動判定，MUST NOT 改用其他位址
+
+#### Scenario: Automatic detection cannot reach the service
+
+- **WHEN** 自動判定期間無法連線至服務或請求逾時
+- **THEN** 系統 MUST 回退至批次位址繼續啟動流程，MUST NOT 因判定失敗本身而中止啟動
+
+#### Scenario: Detection result is not persisted
+
+- **WHEN** 系統完成自動判定並以所得位址啟動 session
+- **THEN** 使用者設定檔中的即時字幕位址 MUST 維持原本的未設定狀態
+
 ### Requirement: Live captions use a remote ASR endpoint independent of batch transcription
 
 即時字幕使用遠端轉錄後端時，MUST 具備專屬的服務位址設定，與批次逐字稿所使用的自架 ASR 服務位址各自獨立，使兩者可指向載入不同模型的服務實例。

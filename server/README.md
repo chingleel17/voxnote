@@ -143,9 +143,11 @@ torch 的 CUDA 版本請依 NVIDIA 官方索引安裝（對應主機 CUDA 版本
 兩個實例皆**不對外開埠**，一律經 `gateway`（nginx）於單一埠分流：
 
 ```
-http://<host>:8000/batch/...  ->  asr-batch:8000
 http://<host>:8000/live/...   ->  asr-live:8000
+http://<host>:8000/...        ->  asr-batch:8000（預設路由）
 ```
+
+**批次為預設路由**：不帶路徑前綴的請求一律轉給批次實例，故既有設定（如 `http://host:8000`）升級 gateway 後無須修改。`/batch` 前綴仍可使用，供明確指定時用。只有即時字幕需填 `/live`。
 
 如此對外只佔用一個埠。兩者仍為獨立 process、各有各的序列化鎖，故長會議轉錄**不會**讓即時字幕排隊等待——但兩者同時執行時會爭用 GPU 算力，即時字幕的延遲仍會惡化，此為物理限制。
 
@@ -155,11 +157,14 @@ http://<host>:8000/live/...   ->  asr-live:8000
 
 | 用途 | URL |
 | --- | --- |
-| gateway 健康檢查 | `http://<host>:8000/health` |
-| 批次健康檢查 | `http://<host>:8000/batch/health` |
-| 批次轉錄 | `http://<host>:8000/batch/v1/audio/transcriptions` |
+| 批次健康檢查（預設路由） | `http://<host>:8000/health` |
+| 批次轉錄（預設路由） | `http://<host>:8000/v1/audio/transcriptions` |
+| 批次健康檢查（明確前綴） | `http://<host>:8000/batch/health` |
 | 即時健康檢查 | `http://<host>:8000/live/health` |
 | 即時轉錄 | `http://<host>:8000/live/v1/audio/transcriptions` |
+| gateway 自身存活檢查 | `http://<host>:8000/gateway-health` |
+
+> `/health` 轉發至批次後端而非由 gateway 自行回答。這是刻意的：若 gateway 自答 `/health`，未帶前綴的設定會在「測試連線」時假性通過，實際打轉錄端點才失敗。要確認 gateway 本身是否就緒請用 `/gateway-health`。
 
 ### 只想跑單一實例
 
@@ -216,12 +221,21 @@ docker compose up -d --build asr-batch gateway
 
 | 設定位置 | Base URL 範例 |
 | --- | --- |
-| 設定頁 > 批次逐字稿 | `http://192.168.0.10:8000/batch` |
-| 即時字幕頁 > 遠端端點 | `http://192.168.0.10:8000/live` |
+| 設定頁 > 批次逐字稿 | `http://192.168.0.10:8000`（不需前綴） |
+| 即時字幕頁 > 遠端端點 | 可留空（見下方自動偵測） |
 
-兩者為各自獨立的設定（即時字幕的來源語言與端點與批次流程分離）。即時字幕的端點若留空，會回退為批次所用的位址——單實例部署時可利用此行為，雙實例部署則應明確填入 `/live`。
+兩者為各自獨立的設定（即時字幕的來源語言與端點與批次流程分離）。
 
-> 若沿用未經 gateway 的舊部署（單一容器直接開埠），Base URL 不帶路徑前綴即可，如 `http://192.168.0.10:8000`。
+**即時字幕端點會自動偵測**：該欄位留空時，app 於**啟動 session 時探測一次** `{批次位址}/live/health`——
+
+- 回應成功（gateway 雙實例部署）→ 本次 session 採用 `{批次位址}/live`，即英文模型實例
+- 回應失敗（舊版單一容器部署，實測回 404）→ 沿用批次位址
+
+探測僅在啟動時進行一次，session 期間不重複，故不影響即時字幕每個音訊視窗的延遲。
+
+若欄位已填寫則**直接採用、不進行探測**——自動偵測是未設定時的預設行為，不覆蓋明確設定。需要指向其他主機或強制使用特定實例時填入完整位址即可。
+
+> 未經 gateway 的舊部署（單一容器直接開埠）同樣不需前綴，設定完全相容。
 
 `POST /v1/audio/transcriptions` 使用 multipart：`file` 為音訊檔；可選 `language`、`diarize`、`min_speakers` 與 `max_speakers`。回應的 `segments` 陣列含秒數 `start`、`end`、`text` 與啟用語者分離時的 `speaker`。
 

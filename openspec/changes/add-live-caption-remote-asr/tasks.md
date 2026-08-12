@@ -16,6 +16,9 @@
   - 未新增 `live_caption_ignore_cursor_events` 持久化欄位：與既有 `live_caption_click_through`（自動游標感應穿透）語意重複。手動穿透改實作為 session 級 runtime override（不落盤），詳見第 5 節。
 - [x] 1.4 於 `src/types/index.ts` 同步新增對應 TypeScript 型別欄位
 - [x] 1.5 將 `live_caption/mod.rs` 的 `&config.asr_language`（原 462、467 行，現約 493、497 行）改為 `live_caption_language`；同步將端點改為 `live_caption_remote_base_url`（空值回退 `local_asr_base_url`），並更新 `live_caption_cmds.rs` 的啟動健康檢查
+- [x] 1.7 端點未設定時於 session 啟動探測 `{批次位址}/live/health`，通則採用 `/live` 子路徑、不通則沿用批次位址；已填寫者不探測。探測僅啟動時一次，結果不寫回設定檔
+  - 實作於 `live_caption_cmds.rs` 的 `resolve_live_caption_endpoint()`，解析結果寫入傳遞給 `manager.start()` 的 config 副本（記憶體，不落盤），故 session 期間各視窗直接沿用。
+  - 探測逾時取 3 秒（`LIVE_ENDPOINT_PROBE_TIMEOUT_SECS`），失敗一律回退；已實測舊版單一容器對 `/live/health` 回 404，故「200 即視為存在」的判斷可靠。
 - [x] 1.6 確認批次流程（`commands/asr_cmds.rs`）仍使用 `asr_language` 與 `local_asr_base_url`，未受影響（僅新增回退讀取，未修改批次呼叫路徑）
 
 ## 2. 即時專用的遠端轉錄路徑

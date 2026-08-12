@@ -371,6 +371,10 @@ fn validate_audio_source(source: &str) -> Result<()> {
 
 /// 即時字幕的遠端端點未設定時，回退沿用批次流程的自架 ASR 位址，
 /// 避免既有使用者升級後即時字幕突然失去端點設定。
+///
+/// 注意：session 由 `start_live_caption` 啟動時，該欄位已被填入解析後的位址
+/// （含自動偵測到的 `/live` 子路徑），故此處通常直接回傳該值；本回退僅在
+/// 未經該路徑取得 config 時生效。
 pub fn live_caption_remote_base_url(config: &AppConfig) -> &str {
     let dedicated = config.live_caption_remote_base_url.trim();
     if dedicated.is_empty() {
