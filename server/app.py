@@ -421,7 +421,48 @@ class WhisperXTranscriber:
         return segments
 
 
+class IncrementalTranscriber:
+    """低延遲路徑：直接使用 faster-whisper，不做對齊或語者分離。"""
+
+    def __init__(self) -> None:
+        self._model: Any | None = None
+        self._model_dir = os.getenv("ASR_INCREMENTAL_MODEL") or os.getenv(
+            "ASR_MODEL", "MediaTek-Research/Breeze-ASR-26"
+        )
+        self._device = os.getenv("ASR_INCREMENTAL_DEVICE", os.getenv("ASR_DEVICE", "cuda"))
+        self._compute_type = os.getenv(
+            "ASR_INCREMENTAL_COMPUTE_TYPE", os.getenv("ASR_COMPUTE_TYPE", "int8")
+        )
+
+    def _ensure_model(self) -> Any:
+        if self._model is None:
+            try:
+                from faster_whisper import WhisperModel
+
+                self._model = WhisperModel(
+                    self._model_dir,
+                    device=self._device,
+                    compute_type=self._compute_type,
+                )
+            except Exception as error:
+                raise RuntimeError(f"低延遲 ASR 模型載入失敗：{error}") from error
+        return self._model
+
+    def transcribe(self, audio: np.ndarray, language: str | None) -> str:
+        model = self._ensure_model()
+        segments, _ = model.transcribe(
+            audio,
+            language=language,
+            beam_size=1,
+            vad_filter=False,
+            condition_on_previous_text=False,
+        )
+        # faster-whisper 的 segments 是惰性 generator，必須在此完整消費才會執行推論。
+        return opencc.convert("".join(segment.text for segment in segments)).strip()
+
+
 transcriber = WhisperXTranscriber()
+incremental_transcriber = IncrementalTranscriber()
 
 
 def read_hf_token() -> str | None:
@@ -518,6 +559,38 @@ async def create_transcription(
         await file.close()
         audio_path.unlink(missing_ok=True)
         raise
+
+
+@app.post("/v1/audio/transcriptions/incremental")
+async def create_incremental_transcription(
+    file: Annotated[UploadFile, File()],
+    language: Annotated[str | None, Form()] = None,
+) -> dict[str, object]:
+    """以 faster-whisper 直接轉錄短音訊視窗，不建立背景任務。"""
+    upload_dir = Path(os.getenv("UPLOAD_DIR", tempfile.gettempdir())) / "voxnote-asr"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(file.filename or "audio.wav").suffix or ".wav"
+    audio_path = upload_dir / f"{uuid.uuid4().hex}{suffix}"
+
+    try:
+        audio_path.write_bytes(await file.read())
+        await file.close()
+        audio = await run_in_threadpool(load_audio_preprocessed, audio_path)
+        text = await run_in_threadpool(
+            incremental_transcriber.transcribe,
+            audio,
+            language if language and language != "auto" else None,
+        )
+        return {"text": text, "language": language or "auto"}
+    except RuntimeError as error:
+        logger.error("低延遲轉錄前置條件不符：%s", error, exc_info=True)
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except Exception as error:
+        logger.exception("低延遲轉錄失敗")
+        raise HTTPException(status_code=500, detail=f"低延遲轉錄失敗：{error}") from error
+    finally:
+        await file.close()
+        audio_path.unlink(missing_ok=True)
 
 
 async def _transcribe_audio(

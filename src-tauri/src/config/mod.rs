@@ -26,6 +26,8 @@ pub struct AppConfig {
     pub live_caption_audio_source: String, // "microphone" | "system"
     pub live_caption_window_seconds: u32,
     pub live_caption_step_seconds: u32,
+    pub live_caption_incremental_enabled: bool,
+    pub live_caption_decode_interval_ms: u32,
     pub live_caption_silence_threshold: f32,
     pub live_caption_translate: bool,
     // 校稿與翻譯為獨立開關：翻譯輸出語言可能與來源不同，校稿則輸出語言等於來源，
@@ -99,6 +101,8 @@ impl Default for AppConfig {
             live_caption_audio_source: "system".into(),
             live_caption_window_seconds: 5,
             live_caption_step_seconds: 3,
+            live_caption_incremental_enabled: false,
+            live_caption_decode_interval_ms: 800,
             live_caption_silence_threshold: 0.01,
             live_caption_translate: true,
             live_caption_proofread: false,
@@ -214,8 +218,20 @@ live_caption_click_through = true
         assert_eq!(config.live_caption_remote_base_url, "");
         assert_eq!(config.live_caption_remote_model, "");
         assert_eq!(config.live_caption_remote_timeout_seconds, 8);
+        assert!(!config.live_caption_incremental_enabled);
+        assert_eq!(config.live_caption_decode_interval_ms, 800);
         // 既有欄位不應被預設值覆蓋
         assert_eq!(config.asr_language, "zh");
+    }
+
+    #[test]
+    fn live_caption_incremental_defaults_round_trip() {
+        let config = AppConfig::default();
+        let serialized = toml::to_string_pretty(&config).expect("應可序列化");
+        let reparsed: AppConfig = toml::from_str(&serialized).expect("應可重新解析");
+
+        assert!(!reparsed.live_caption_incremental_enabled);
+        assert_eq!(reparsed.live_caption_decode_interval_ms, 800);
     }
 
     #[test]

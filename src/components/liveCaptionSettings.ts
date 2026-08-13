@@ -275,6 +275,29 @@ export function buildLiveCaptionSettings(
   ));
 
   container.appendChild(toggleGroup(
+    '增量字幕模式',
+    config.live_caption_incremental_enabled === true,
+    (checked) => {
+      config = { ...config, live_caption_incremental_enabled: checked };
+      onChange(config);
+    },
+    '較早顯示字幕，但尚未確定的文字可能在後續解碼後被修正；不支援的後端會回退至視窗式輸出並提示。',
+  ));
+
+  container.appendChild(numberGroup(
+    '增量解碼間隔（毫秒）',
+    config.live_caption_decode_interval_ms || 800,
+    100,
+    30000,
+    100,
+    (value) => {
+      config = { ...config, live_caption_decode_interval_ms: value };
+      onChange(config);
+    },
+    '必須短於分析視窗長度；間隔越短延遲越低，但解碼負載越高。',
+  ));
+
+  container.appendChild(toggleGroup(
     '翻譯成繁體中文',
     config.live_caption_translate !== false,
     (checked) => {

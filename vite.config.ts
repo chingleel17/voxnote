@@ -23,8 +23,16 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // 3. HMR 僅需監看前端檔案；後端環境含數萬個檔案，會使 Windows watcher 失去回應。
+      ignored: [
+        "**/src-tauri/**",
+        "**/server/**",
+        "**/openspec/**",
+        "**/.claude/**",
+        "**/.github/**",
+        "**/.local/**",
+        "**/.opencode/**",
+      ],
     },
   },
   build: {

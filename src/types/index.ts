@@ -116,6 +116,9 @@ export interface LiveCaptionPayload {
   original: string;
   translation: string | null;
   display_text: string;
+  confirmed_text: string;
+  tentative_text: string;
+  is_tentative: boolean;
 }
 
 export interface LiveCaptionErrorPayload {
@@ -154,6 +157,8 @@ export interface AppConfig {
   live_caption_audio_source: 'microphone' | 'system';
   live_caption_window_seconds: number;
   live_caption_step_seconds: number;
+  live_caption_incremental_enabled: boolean;
+  live_caption_decode_interval_ms: number;
   live_caption_silence_threshold: number;
   live_caption_translate: boolean;
   live_caption_proofread: boolean; // 校稿與翻譯獨立開關，輸出語言等於來源語言

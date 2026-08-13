@@ -129,3 +129,9 @@ body {
   font-size: 14px;
   font-weight: 400;
 }
+
+.caption-tentative-text {
+  color: var(--caption-muted);
+  font-style: italic;
+  opacity: 0.78;
+}

@@ -123,3 +123,41 @@ class TestTranscriptionApi(unittest.TestCase):
 
         with patch.object(app.transcriber, "transcribe", serialized):
             self.run_async(scenario())
+
+    def test_incremental_endpoint_returns_plain_text_without_task(self):
+        def incremental(audio, language):
+            assert language == "en"
+            return "we are testing"
+
+        async def scenario():
+            async with client() as http:
+                response = await http.post(
+                    "/v1/audio/transcriptions/incremental",
+                    files={"file": ("test.wav", b"audio", "audio/wav")},
+                    data={"language": "en"},
+                )
+                assert response.status_code == 200
+                assert response.json() == {"text": "we are testing", "language": "en"}
+                assert app.tasks == {}
+
+        with patch.object(app, "load_audio_preprocessed", return_value=object()), patch.object(
+            app.incremental_transcriber, "transcribe", incremental
+        ):
+            self.run_async(scenario())
+
+    def test_incremental_endpoint_reports_unavailable_model(self):
+        async def scenario():
+            async with client() as http:
+                response = await http.post(
+                    "/v1/audio/transcriptions/incremental",
+                    files={"file": ("test.wav", b"audio", "audio/wav")},
+                )
+                assert response.status_code == 503
+                assert "模型" in response.json()["detail"]
+
+        with patch.object(app, "load_audio_preprocessed", return_value=object()), patch.object(
+            app.incremental_transcriber,
+            "transcribe",
+            side_effect=RuntimeError("模型未載入"),
+        ):
+            self.run_async(scenario())

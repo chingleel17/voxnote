@@ -294,7 +294,11 @@ pub async fn transcribe_live_caption_remote(
     if !response.status().is_success() {
         let status = response.status();
         let detail = response.text().await.unwrap_or_default();
-        return Err(anyhow!("即時字幕遠端伺服器回傳錯誤（{}）：{}", status, detail));
+        return Err(anyhow!(
+            "即時字幕遠端伺服器回傳錯誤（{}）：{}",
+            status,
+            detail
+        ));
     }
 
     let result: LocalServerTranscription = response
@@ -302,6 +306,58 @@ pub async fn transcribe_live_caption_remote(
         .await
         .map_err(|e| anyhow!("無法解析即時字幕遠端回應：{}", e))?;
     format_local_asr_result(result, false)
+}
+
+/// 呼叫低延遲增量端點。此端點只回傳純文字，不經批次的對齊與語者分離流程。
+pub async fn transcribe_live_caption_remote_incremental(
+    client: &reqwest::Client,
+    base_url: &str,
+    samples: &[f32],
+    language: &str,
+    timeout_seconds: u64,
+) -> Result<String> {
+    let base_url = normalize_local_asr_url(base_url)?;
+    let form = build_local_asr_form(
+        "live-caption.wav",
+        encode_pcm_wav(samples),
+        language,
+        false,
+        0,
+        false,
+    );
+    let url = format!("{}/v1/audio/transcriptions/incremental", base_url);
+    let response = client
+        .post(&url)
+        .timeout(tokio::time::Duration::from_secs(timeout_seconds))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                anyhow::Error::new(LiveCaptionTimeoutError)
+            } else {
+                anyhow!("即時字幕低延遲端點請求失敗：{}", error)
+            }
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "即時字幕低延遲端點不可用（{}）：{}",
+            status,
+            detail
+        ));
+    }
+
+    let result: Value = response
+        .json()
+        .await
+        .map_err(|error| anyhow!("無法解析即時字幕低延遲回應：{}", error))?;
+    result["text"]
+        .as_str()
+        .map(|text| text.trim().to_string())
+        .ok_or_else(|| anyhow!("即時字幕低延遲回應缺少 text 欄位"))
 }
 
 async fn transcribe_voxnote_asr_bytes(

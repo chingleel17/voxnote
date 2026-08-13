@@ -237,6 +237,25 @@ docker compose up -d --build asr-batch gateway
 
 > 未經 gateway 的舊部署（單一容器直接開埠）同樣不需前綴，設定完全相容。
 
+### 低延遲增量端點
+
+`POST /v1/audio/transcriptions/incremental` 是即時字幕專用端點，使用 multipart
+上傳 `file`，可選 `language`，並直接以 faster-whisper 模型轉錄後回傳：
+
+```json
+{"text":"...","language":"en"}
+```
+
+此端點不建立背景任務、不執行 WhisperX 詞級對齊或 pyannote 語者分離，適合 app
+以短於分析視窗的間隔重複送出重疊音訊。連續回應的 `text` 格式一致，LocalAgreement
+由 VoxNote app 呼叫端負責判定暫定與確定文字。模型載入失敗會回傳 HTTP 503 與明確
+錯誤，不會在服務內靜默改走批次端點。
+
+批次端點 `POST /v1/audio/transcriptions` 與 `sync=true` 契約不變，仍使用 WhisperX
+對齊與可選的語者分離。兩條路徑目前各自持有 faster-whisper/WhisperX 模型實例，
+避免批次後處理阻塞低延遲請求；代價是需要較多 VRAM，部署時應依 GPU 餘裕調整模型
+與 `ASR_INCREMENTAL_COMPUTE_TYPE`。
+
 ### 轉錄 API
 
 `POST /v1/audio/transcriptions` 使用 multipart：`file` 為音訊檔；可選 `language`、`diarize`、`min_speakers` 與 `max_speakers`。預設為非同步模式，服務會立即回傳：

@@ -24,6 +24,9 @@ use crate::{
     config::AppConfig,
 };
 
+mod agreement;
+use agreement::LocalAgreement;
+
 pub const LIVE_CAPTION_EVENT: &str = "live-caption";
 pub const LIVE_CAPTION_ERROR_EVENT: &str = "live-caption-error";
 pub const LIVE_CAPTION_STATUS_EVENT: &str = "live-caption-status";
@@ -82,6 +85,9 @@ pub struct LiveCaptionPayload {
     pub original: String,
     pub translation: Option<String>,
     pub display_text: String,
+    pub confirmed_text: String,
+    pub tentative_text: String,
+    pub is_tentative: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -399,6 +405,17 @@ fn validate_caption_window(config: &AppConfig) -> Result<()> {
     {
         return Err(anyhow!("即時字幕步進必須介於 1 秒與視窗長度之間"));
     }
+    if config.live_caption_incremental_enabled
+        && (config.live_caption_decode_interval_ms == 0
+            || config.live_caption_decode_interval_ms
+                >= config.live_caption_window_seconds.saturating_mul(1000))
+    {
+        return Err(anyhow!(
+            "增量字幕解碼間隔必須小於分析視窗長度（目前為 {} ms，視窗為 {} 秒）",
+            config.live_caption_decode_interval_ms,
+            config.live_caption_window_seconds
+        ));
+    }
     if !(0.0..=1.0).contains(&config.live_caption_silence_threshold) {
         return Err(anyhow!("即時字幕靜音門檻必須介於 0 與 1 之間"));
     }
@@ -529,6 +546,12 @@ fn process_caption_windows(
     let max_pending_samples = MAX_PENDING_AUDIO_SECONDS * SAMPLE_RATE as usize;
     let mut samples = VecDeque::new();
     let mut recent_results: VecDeque<String> = VecDeque::new();
+    let mut agreement = LocalAgreement::default();
+    let mut incremental = config.live_caption_incremental_enabled;
+    let decode_interval = Duration::from_millis(config.live_caption_decode_interval_ms as u64);
+    let mut last_decode_at: Option<Instant> = None;
+    let mut incremental_fallback_reported = false;
+    let mut incremental_sequence: Option<u64> = None;
     let translation_failure_reported = Arc::new(AtomicBool::new(false));
     let mut sequence = 0u64;
     let mut last_drop_notice: Option<Instant> = None;
@@ -552,10 +575,16 @@ fn process_caption_windows(
                 .unwrap_or(true);
             if should_notify {
                 last_drop_notice = Some(Instant::now());
-                emit_error(app, "轉錄速度跟不上聲音，已捨棄部分較舊音訊以追上進度".into());
+                emit_error(
+                    app,
+                    "轉錄速度跟不上聲音，已捨棄部分較舊音訊以追上進度".into(),
+                );
             }
         }
-        if samples.len() < window_samples {
+        let interval_elapsed = last_decode_at
+            .map(|started| started.elapsed() >= decode_interval)
+            .unwrap_or(true);
+        if (!incremental && samples.len() < window_samples) || (incremental && !interval_elapsed) {
             thread::sleep(CAPTURE_POLL_INTERVAL);
             continue;
         }
@@ -567,12 +596,17 @@ fn process_caption_windows(
             available_samples as f64 / SAMPLE_RATE as f64,
             MAX_PENDING_AUDIO_SECONDS
         );
+        let current_window_samples = available_samples.min(window_samples);
         let window: Vec<f32> = samples
             .iter()
-            .skip(available_samples - window_samples)
+            .skip(available_samples - current_window_samples)
             .copied()
             .collect();
-        let keep_samples = window_samples.saturating_sub(step_samples);
+        let keep_samples = if incremental {
+            window_samples
+        } else {
+            window_samples.saturating_sub(step_samples)
+        };
         let drop_samples = available_samples.saturating_sub(keep_samples);
         for _ in 0..drop_samples {
             let _ = samples.pop_front();
@@ -584,6 +618,10 @@ fn process_caption_windows(
         let peak = window
             .iter()
             .fold(0.0f32, |max, sample| max.max(sample.abs()));
+        if incremental {
+            // 靜音視窗也要消耗本次解碼節奏，避免在同一個視窗上每 25ms 空轉檢查。
+            last_decode_at = Some(Instant::now());
+        }
         if peak < config.live_caption_silence_threshold {
             continue;
         }
@@ -595,15 +633,34 @@ fn process_caption_windows(
                 &window,
                 &config.live_caption_language,
             ),
-            "voxnote_asr" => tauri::async_runtime::block_on(transcribe_live_caption_remote(
-                remote_client.ok_or_else(|| anyhow!("即時字幕遠端連線未初始化"))?,
-                live_caption_remote_base_url(config),
-                &window,
-                &config.live_caption_language,
-                config.live_caption_remote_timeout_seconds as u64,
-            )),
+            "voxnote_asr" => {
+                if incremental {
+                    tauri::async_runtime::block_on(
+                        crate::asr::transcribe_live_caption_remote_incremental(
+                            remote_client.ok_or_else(|| anyhow!("即時字幕遠端連線未初始化"))?,
+                            live_caption_remote_base_url(config),
+                            &window,
+                            &config.live_caption_language,
+                            config.live_caption_remote_timeout_seconds as u64,
+                        ),
+                    )
+                } else {
+                    tauri::async_runtime::block_on(transcribe_live_caption_remote(
+                        remote_client.ok_or_else(|| anyhow!("即時字幕遠端連線未初始化"))?,
+                        live_caption_remote_base_url(config),
+                        &window,
+                        &config.live_caption_language,
+                        config.live_caption_remote_timeout_seconds as u64,
+                    ))
+                }
+            }
             _ => Err(anyhow!("不支援的即時字幕轉錄後端：{}", backend)),
         };
+        if incremental {
+            // 以解碼完成時間作為節奏基準；若單次解碼已超過間隔，下一輪會等待
+            // 下一個間隔而不是立即補跑，避免待處理工作無限累積。
+            last_decode_at = Some(Instant::now());
+        }
         println!(
             "[live-caption][timing] 後端={} 轉錄耗時={:.2}秒",
             backend,
@@ -625,30 +682,72 @@ fn process_caption_windows(
             }
             Err(error) => {
                 println!("[live-caption] 後端={} 轉錄失敗：{}", backend, error);
-                emit_error(app, format!("單段即時字幕轉錄失敗，將繼續處理：{}", error));
+                if incremental && backend == "voxnote_asr" && !incremental_fallback_reported {
+                    incremental_fallback_reported = true;
+                    incremental = false;
+                    emit_error(
+                        app,
+                        format!("低延遲增量端點不可用，已回退至視窗式字幕輸出：{}", error),
+                    );
+                    // 增量端點不支援時，不中止 session；後續請求改走既有批次同步契約。
+                    // 此處以局部旗標控制本次 session，不修改使用者設定。
+                    // `incremental` 為不可變設定快照，故透過回退旗標判斷後續路徑。
+                } else if !incremental_fallback_reported {
+                    emit_error(app, format!("單段即時字幕轉錄失敗，將繼續處理：{}", error));
+                }
                 continue;
             }
         };
-        if is_duplicate(&recent_results, &transcription) {
+        if !incremental && is_duplicate(&recent_results, &transcription) {
             println!("[live-caption] 與近期輸出高度相似，判定為重疊，略過");
             continue;
         }
         let text = transcription.clone();
-        push_recent_result(&mut recent_results, transcription);
+        if !incremental {
+            push_recent_result(&mut recent_results, transcription);
+        }
 
-        sequence += 1;
+        let event_sequence = if incremental {
+            *incremental_sequence.get_or_insert_with(|| {
+                sequence += 1;
+                sequence
+            })
+        } else {
+            sequence += 1;
+            sequence
+        };
         println!(
             "[live-caption][timing] 視窗結束到字幕顯示的延遲={:.2}秒",
             window_ready_at.elapsed().as_secs_f64()
         );
-        let display_text = build_display_text(&text, None, &config.live_caption_display_mode);
+        let (confirmed_text, tentative_text, is_tentative) = if incremental {
+            let update = agreement.update(&text);
+            let is_tentative = !update.tentative.is_empty();
+            (
+                update.confirmed,
+                update.tentative,
+                is_tentative,
+            )
+        } else {
+            (text.clone(), String::new(), false)
+        };
+        let emitted_text = if incremental {
+            format!("{}{}", confirmed_text, tentative_text)
+        } else {
+            text.clone()
+        };
+        let display_text =
+            build_display_text(&emitted_text, None, &config.live_caption_display_mode);
         let _ = app.emit(
             LIVE_CAPTION_EVENT,
             LiveCaptionPayload {
-                sequence,
-                original: text.clone(),
+                sequence: event_sequence,
+                original: emitted_text.clone(),
                 translation: None,
                 display_text,
+                confirmed_text: confirmed_text.clone(),
+                tentative_text: tentative_text.clone(),
+                is_tentative,
             },
         );
 
@@ -659,11 +758,11 @@ fn process_caption_windows(
             &config.live_caption_language,
         );
 
-        if should_translate {
+        if should_translate && (!incremental || tentative_text.is_empty()) {
             let translation_app = app.clone();
             let translation_config = config.clone();
-            let translation_text = text.clone();
-            let translation_sequence = sequence;
+            let translation_text = emitted_text.clone();
+            let translation_sequence = event_sequence;
             let translation_mode = config.live_caption_display_mode.clone();
             let translation_failure_reported = translation_failure_reported.clone();
             // 翻譯不得阻塞下一段 ASR；完成後用相同 sequence 更新已顯示的字幕。
@@ -687,6 +786,9 @@ fn process_caption_windows(
                                     &translation_mode,
                                 ),
                                 translation: Some(value),
+                                confirmed_text: translation_text.clone(),
+                                tentative_text: String::new(),
+                                is_tentative: false,
                             },
                         );
                     }
@@ -701,11 +803,11 @@ fn process_caption_windows(
                     }
                 }
             });
-        } else if should_proofread {
+        } else if should_proofread && (!incremental || tentative_text.is_empty()) {
             let proofread_app = app.clone();
             let proofread_config = config.clone();
-            let proofread_text = text.clone();
-            let proofread_sequence = sequence;
+            let proofread_text = emitted_text.clone();
+            let proofread_sequence = event_sequence;
             let proofread_failure_reported = translation_failure_reported.clone();
             // 校稿是「修正原文」而非另一種呈現，故以校正後文字取代 original／
             // display_text，translation 欄位維持 None——與翻譯的語意區分開來。
@@ -729,6 +831,9 @@ fn process_caption_windows(
                                 // build_display_text 的行為時，此處被意外連動改變。
                                 display_text: value.clone(),
                                 translation: None,
+                                confirmed_text: value.clone(),
+                                tentative_text: String::new(),
+                                is_tentative: false,
                             },
                         );
                     }
@@ -744,6 +849,27 @@ fn process_caption_windows(
                 }
             });
         }
+    }
+
+    if incremental && agreement.has_text() {
+        let update = agreement.finish();
+        let event_sequence = incremental_sequence.unwrap_or_else(|| {
+            sequence += 1;
+            sequence
+        });
+        let text = update.confirmed;
+        let _ = app.emit(
+            LIVE_CAPTION_EVENT,
+            LiveCaptionPayload {
+                sequence: event_sequence,
+                original: text.clone(),
+                translation: None,
+                display_text: build_display_text(&text, None, &config.live_caption_display_mode),
+                confirmed_text: text,
+                tentative_text: String::new(),
+                is_tentative: false,
+            },
+        );
     }
 
     Ok(())
@@ -799,11 +925,7 @@ fn transcribe_with_whisper(
             println!("[live-caption] 段落 {} 非語音機率超過門檻，略過該段", index);
             continue;
         }
-        text.push_str(
-            &segment
-                .to_str()
-                .context("無法讀取 Whisper 轉錄文字")?,
-        );
+        text.push_str(&segment.to_str().context("無法讀取 Whisper 轉錄文字")?);
     }
     Ok(text.trim().to_string())
 }
@@ -1119,10 +1241,8 @@ fn spawn_click_through_watcher(
                 let right = left + size.width as f64;
                 let bottom = top + size.height as f64;
 
-                let inside = cursor.x >= left
-                    && cursor.x <= right
-                    && cursor.y >= top
-                    && cursor.y <= bottom;
+                let inside =
+                    cursor.x >= left && cursor.x <= right && cursor.y >= top && cursor.y <= bottom;
                 // 標題列與四邊感應區需要互動；字幕文字區維持穿透。
                 inside
                     && (cursor.y <= top + header
@@ -1164,7 +1284,8 @@ mod tests {
     fn only_translation_enabled_with_different_source_language_translates() {
         // add-live-caption-overlay spec: 「User watches foreign-language content
         // with translation enabled」
-        let (translate, proofread) = resolve_translate_or_proofread(true, false, "translation", "en");
+        let (translate, proofread) =
+            resolve_translate_or_proofread(true, false, "translation", "en");
         assert!(translate);
         assert!(!proofread);
     }
@@ -1181,7 +1302,8 @@ mod tests {
     fn both_enabled_with_different_languages_only_translates() {
         // spec: 「User enables both translation and proofreading with
         // different languages」——校稿於跨語言情境 MUST NOT 生效
-        let (translate, proofread) = resolve_translate_or_proofread(true, true, "translation", "en");
+        let (translate, proofread) =
+            resolve_translate_or_proofread(true, true, "translation", "en");
         assert!(translate);
         assert!(!proofread);
     }
@@ -1190,7 +1312,8 @@ mod tests {
     fn only_translation_enabled_with_chinese_source_skips_llm_call() {
         // spec: 「System skips the LLM call when translation would be a
         // no-op」——僅翻譯、來源為中文時兩者皆不執行
-        let (translate, proofread) = resolve_translate_or_proofread(true, false, "translation", "zh");
+        let (translate, proofread) =
+            resolve_translate_or_proofread(true, false, "translation", "zh");
         assert!(!translate);
         assert!(!proofread);
     }
@@ -1199,7 +1322,8 @@ mod tests {
     fn both_enabled_with_chinese_source_proofreads_not_skipped() {
         // spec: 「Target language equals source language with both enabled」
         // ——此情境校稿本身即為使用者要的處理，MUST NOT 被最佳化跳過
-        let (translate, proofread) = resolve_translate_or_proofread(true, true, "translation", "zh");
+        let (translate, proofread) =
+            resolve_translate_or_proofread(true, true, "translation", "zh");
         assert!(!translate);
         assert!(proofread);
     }
@@ -1208,7 +1332,8 @@ mod tests {
     fn auto_source_language_is_treated_as_translation_candidate() {
         // 無法得知 auto 偵測到的實際語言，故一律視為需要翻譯（非中文）的情境；
         // 校稿的「輸出等於輸入語言」前提在此不成立。
-        let (translate, proofread) = resolve_translate_or_proofread(true, true, "translation", "auto");
+        let (translate, proofread) =
+            resolve_translate_or_proofread(true, true, "translation", "auto");
         assert!(translate);
         assert!(!proofread);
     }
@@ -1236,10 +1361,7 @@ mod tests {
         // 同一段語音在重疊滑動視窗中被辨識兩次，結果未必逐字相同。
         let mut recent = VecDeque::new();
         push_recent_result(&mut recent, "今天我們要討論系統架構的設計".into());
-        assert!(is_duplicate(
-            &recent,
-            "我們要討論系統架構的設計方向"
-        ));
+        assert!(is_duplicate(&recent, "我們要討論系統架構的設計方向"));
     }
 
     #[test]
@@ -1312,6 +1434,8 @@ mod tests {
         assert!(!is_hallucination(
             "The client will subscribe to the events topic."
         ));
-        assert!(!is_hallucination("I was watching the memory usage closely."));
+        assert!(!is_hallucination(
+            "I was watching the memory usage closely."
+        ));
     }
 }

@@ -379,10 +379,13 @@ src/（TypeScript 前端）
 | 指標 | 目標 |
 |------|------|
 | 應用啟動時間 | < 2 秒 |
+| 開發模式 Vite 暖機回應 | `@vite/client` < 1 秒；超過 5 秒視為 watcher 退化 |
 | 安裝包大小 | < 100MB |
 | 記憶體占用（idle）| < 150MB |
 | 逐字稿載入（1小時會議）| < 1 秒 |
 | 本地 ASR（1小時，medium 模型）| < 10 分鐘 |
+
+開發模式的 Vite watcher 僅可監看前端 HMR 所需檔案，必須排除 Rust 建置產物、Python 虛擬環境、ASR 模型／快取、OpenSpec artifacts 與代理工具設定目錄。詳細需求與診斷基準見 `development-environment-performance` capability。
 
 ### 5.2 安全性需求
 - API Key 存儲：使用系統 Keychain（`tauri-plugin-stronghold` 或 OS Keychain）

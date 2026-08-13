@@ -62,8 +62,18 @@ function renderCaptions(): void {
   // 見 liveCaptionOverlay.css 對 #caption-list 的說明，此處不需額外的頂高元素。
   for (const caption of captions.slice(-RETAINED_CAPTIONS)) {
     const line = document.createElement('p');
-    line.className = 'caption-line';
-    line.textContent = caption.display_text;
+    line.className = `caption-line${caption.is_tentative ? ' caption-tentative' : ''}`;
+    if (caption.confirmed_text || caption.tentative_text) {
+      const confirmed = document.createElement('span');
+      confirmed.className = 'caption-confirmed';
+      confirmed.textContent = caption.confirmed_text;
+      const tentative = document.createElement('span');
+      tentative.className = 'caption-tentative-text';
+      tentative.textContent = caption.tentative_text;
+      line.append(confirmed, tentative);
+    } else {
+      line.textContent = caption.display_text;
+    }
     captionList.appendChild(line);
   }
 }
