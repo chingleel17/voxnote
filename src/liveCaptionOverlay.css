@@ -98,13 +98,7 @@ body {
   display: flex;
   flex: 1;
   flex-direction: column;
-  /* 貼齊底部＋裁切頂部溢出，是規格要求的行為（固定保留 2 段，視窗放不下時
-     裁切較舊一段而非減少段數）。justify-content: flex-end 搭配 flex-shrink: 0
-     的子項目：子項目不可被壓縮，故內容確實會超出容器頂部而非被壓扁，
-     overflow: hidden 再裁去超出的部分。若子項目被壓縮（預設 flex-shrink: 1），
-     疊上其本身的 overflow: hidden 會關閉瀏覽器的自動最小尺寸下限，
-     內容會被壓扁至趨近 0 高度而非裁切——曾踩過這個坑，故 .caption-line
-     明確標註 flex-shrink: 0。 */
+   /* 貼齊底部並裁切最舊歷史段；前端會依實際高度決定保留幾段。 */
   justify-content: flex-end;
   gap: 5px;
   min-height: 0;
@@ -122,6 +116,11 @@ body {
   text-align: center;
   text-shadow: 0 2px 5px rgba(0, 0, 0, 0.85);
   white-space: pre-wrap;
+}
+
+.caption-history {
+  color: var(--caption-muted);
+  font-weight: 500;
 }
 
 .caption-line.caption-empty {

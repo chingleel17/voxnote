@@ -42,6 +42,8 @@ const OVERLAY_EDGE_ZONE_LOGICAL: f64 = 10.0;
 const OVERLAY_HEADER_HEIGHT_LOGICAL: f64 = 34.0;
 const SAMPLE_RATE: u32 = 16_000;
 const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// 增量字幕的顯示段落週期；與 ASR 解碼間隔刻意分離。
+const DISPLAY_SEGMENT_DURATION: Duration = Duration::from_secs(4);
 /// 逐段的非語音機率上限，超過即視為模型在近乎無語音的片段上硬吐文字。
 /// 取 0.6 而非更嚴的值，是因為即時字幕的短視窗本就容易讓此機率偏高。
 /// 注意：實測顯示幻覺片段的此機率為 0.000，故此項對該類幻覺無攔截效果。
@@ -112,6 +114,40 @@ pub struct LiveCaptionSettingsPayload {
 #[derive(Debug, Clone, Serialize)]
 pub struct LiveCaptionBuildInfo {
     pub cuda_enabled: bool,
+}
+
+#[derive(Debug, Default)]
+struct IncrementalSegmentState {
+    sequence: Option<u64>,
+    started_at: Option<Instant>,
+    text: String,
+    committed_sample_offset: usize,
+}
+
+impl IncrementalSegmentState {
+    fn is_expired(&self) -> bool {
+        self.started_at
+            .is_some_and(|started| started.elapsed() >= DISPLAY_SEGMENT_DURATION)
+    }
+
+    #[cfg(test)]
+    fn is_expired_at(&self, now: Instant) -> bool {
+        self.started_at
+            .is_some_and(|started| now.duration_since(started) >= DISPLAY_SEGMENT_DURATION)
+    }
+
+    fn start(&mut self, sequence: u64) {
+        self.sequence = Some(sequence);
+        self.started_at = Some(Instant::now());
+    }
+
+    fn complete(&mut self, captured_sample_offset: usize) -> Option<(u64, String)> {
+        let sequence = self.sequence.take()?;
+        let text = std::mem::take(&mut self.text);
+        self.started_at = None;
+        self.committed_sample_offset = captured_sample_offset;
+        Some((sequence, text))
+    }
 }
 
 #[derive(Default)]
@@ -229,6 +265,13 @@ impl LiveCaptionManager {
                     let _ = stop_tx.send(());
                     let _ = handle.join();
                     return Err(anyhow!("無法開啟即時字幕浮動視窗：{error}"));
+                }
+                if let Err(error) = overlay.set_always_on_top(true) {
+                    running.store(false, Ordering::SeqCst);
+                    let _ = stop_tx.send(());
+                    let _ = handle.join();
+                    let _ = overlay.hide();
+                    return Err(anyhow!("無法將即時字幕視窗設為最上層：{error}"));
                 }
                 // 每次啟動皆套用預設大小與位置：目前無位置持久化機制，
                 // 沿用既有行為（每次開啟皆回到固定初始狀態）。失敗僅記錄，
@@ -551,7 +594,8 @@ fn process_caption_windows(
     let decode_interval = Duration::from_millis(config.live_caption_decode_interval_ms as u64);
     let mut last_decode_at: Option<Instant> = None;
     let mut incremental_fallback_reported = false;
-    let mut incremental_sequence: Option<u64> = None;
+    let mut incremental_segment = IncrementalSegmentState::default();
+    let mut captured_sample_offset = 0usize;
     let translation_failure_reported = Arc::new(AtomicBool::new(false));
     let mut sequence = 0u64;
     let mut last_drop_notice: Option<Instant> = None;
@@ -564,7 +608,7 @@ fn process_caption_windows(
             return Err(error);
         }
 
-        drain_queue(queue, &mut samples);
+        captured_sample_offset += drain_queue(queue, &mut samples);
         if samples.len() > max_pending_samples {
             let overflow = samples.len() - max_pending_samples;
             for _ in 0..overflow {
@@ -580,6 +624,18 @@ fn process_caption_windows(
                     "轉錄速度跟不上聲音，已捨棄部分較舊音訊以追上進度".into(),
                 );
             }
+        }
+
+        if incremental && incremental_segment.is_expired() {
+            complete_incremental_segment(
+                app,
+                config,
+                &mut agreement,
+                &mut incremental_segment,
+                &mut samples,
+                captured_sample_offset,
+                &translation_failure_reported,
+            );
         }
         let interval_elapsed = last_decode_at
             .map(|started| started.elapsed() >= decode_interval)
@@ -707,15 +763,6 @@ fn process_caption_windows(
             push_recent_result(&mut recent_results, transcription);
         }
 
-        let event_sequence = if incremental {
-            *incremental_sequence.get_or_insert_with(|| {
-                sequence += 1;
-                sequence
-            })
-        } else {
-            sequence += 1;
-            sequence
-        };
         println!(
             "[live-caption][timing] 視窗結束到字幕顯示的延遲={:.2}秒",
             window_ready_at.elapsed().as_secs_f64()
@@ -723,19 +770,37 @@ fn process_caption_windows(
         let (confirmed_text, tentative_text, is_tentative) = if incremental {
             let update = agreement.update(&text);
             let is_tentative = !update.tentative.is_empty();
-            (
-                update.confirmed,
-                update.tentative,
-                is_tentative,
-            )
+            (update.confirmed, update.tentative, is_tentative)
         } else {
             (text.clone(), String::new(), false)
+        };
+        let event_sequence = if incremental {
+            if incremental_segment.sequence.is_none() {
+                sequence += 1;
+                incremental_segment.start(sequence);
+            }
+            match incremental_segment.sequence {
+                Some(value) => value,
+                None => continue,
+            }
+        } else {
+            sequence += 1;
+            sequence
         };
         let emitted_text = if incremental {
             format!("{}{}", confirmed_text, tentative_text)
         } else {
             text.clone()
         };
+        if incremental {
+            incremental_segment.text = emitted_text.clone();
+            let segment_samples =
+                captured_sample_offset.saturating_sub(incremental_segment.committed_sample_offset);
+            println!(
+                "[live-caption] 當前字幕段已提交游標={}，段內擷取樣本={}",
+                incremental_segment.committed_sample_offset, segment_samples
+            );
+        }
         let display_text =
             build_display_text(&emitted_text, None, &config.live_caption_display_mode);
         let _ = app.emit(
@@ -758,7 +823,7 @@ fn process_caption_windows(
             &config.live_caption_language,
         );
 
-        if should_translate && (!incremental || tentative_text.is_empty()) {
+        if should_translate && !incremental {
             let translation_app = app.clone();
             let translation_config = config.clone();
             let translation_text = emitted_text.clone();
@@ -803,7 +868,7 @@ fn process_caption_windows(
                     }
                 }
             });
-        } else if should_proofread && (!incremental || tentative_text.is_empty()) {
+        } else if should_proofread && !incremental {
             let proofread_app = app.clone();
             let proofread_config = config.clone();
             let proofread_text = emitted_text.clone();
@@ -851,24 +916,15 @@ fn process_caption_windows(
         }
     }
 
-    if incremental && agreement.has_text() {
-        let update = agreement.finish();
-        let event_sequence = incremental_sequence.unwrap_or_else(|| {
-            sequence += 1;
-            sequence
-        });
-        let text = update.confirmed;
-        let _ = app.emit(
-            LIVE_CAPTION_EVENT,
-            LiveCaptionPayload {
-                sequence: event_sequence,
-                original: text.clone(),
-                translation: None,
-                display_text: build_display_text(&text, None, &config.live_caption_display_mode),
-                confirmed_text: text,
-                tentative_text: String::new(),
-                is_tentative: false,
-            },
+    if incremental && (agreement.has_text() || incremental_segment.sequence.is_some()) {
+        complete_incremental_segment(
+            app,
+            config,
+            &mut agreement,
+            &mut incremental_segment,
+            &mut samples,
+            captured_sample_offset,
+            &translation_failure_reported,
         );
     }
 
@@ -1003,10 +1059,133 @@ fn is_hallucination(text: &str) -> bool {
     false
 }
 
-fn drain_queue(queue: &SharedQueue, target: &mut VecDeque<f32>) {
+fn drain_queue(queue: &SharedQueue, target: &mut VecDeque<f32>) -> usize {
+    let mut drained = 0;
     if let Ok(mut source) = queue.lock() {
+        drained = source.len();
         target.extend(source.drain(..));
     }
+    drained
+}
+
+/// 完成目前的顯示段。此生命週期只由固定顯示週期或 session 結束觸發，
+/// 不依賴標點、agreement 或模型是否仍重送舊前綴。
+fn complete_incremental_segment(
+    app: &AppHandle,
+    config: &AppConfig,
+    agreement: &mut LocalAgreement,
+    segment: &mut IncrementalSegmentState,
+    samples: &mut VecDeque<f32>,
+    captured_sample_offset: usize,
+    translation_failure_reported: &Arc<AtomicBool>,
+) {
+    let final_text = if agreement.has_text() {
+        agreement.finish().confirmed
+    } else {
+        segment.text.trim().to_string()
+    };
+    let completed = segment.complete(captured_sample_offset);
+    if let Some((event_sequence, _)) = completed {
+        if !final_text.is_empty() {
+            let _ = app.emit(
+                LIVE_CAPTION_EVENT,
+                LiveCaptionPayload {
+                    sequence: event_sequence,
+                    original: final_text.clone(),
+                    translation: None,
+                    display_text: build_display_text(
+                        &final_text,
+                        None,
+                        &config.live_caption_display_mode,
+                    ),
+                    confirmed_text: final_text.clone(),
+                    tentative_text: String::new(),
+                    is_tentative: false,
+                },
+            );
+            spawn_caption_postprocessing(
+                app,
+                config,
+                event_sequence,
+                final_text,
+                translation_failure_reported,
+            );
+        }
+    }
+    *agreement = LocalAgreement::default();
+    samples.clear();
+}
+
+fn spawn_caption_postprocessing(
+    app: &AppHandle,
+    config: &AppConfig,
+    sequence: u64,
+    text: String,
+    failure_reported: &Arc<AtomicBool>,
+) {
+    let (should_translate, should_proofread) = resolve_translate_or_proofread(
+        config.live_caption_translate,
+        config.live_caption_proofread,
+        &config.live_caption_display_mode,
+        &config.live_caption_language,
+    );
+    if !should_translate && !should_proofread {
+        return;
+    }
+
+    let app = app.clone();
+    let config = config.clone();
+    let mode = config.live_caption_display_mode.clone();
+    let failure_reported = failure_reported.clone();
+    thread::spawn(move || {
+        let result = if should_translate {
+            tauri::async_runtime::block_on(call_llm(
+                &config,
+                "你是即時字幕翻譯員。請將輸入內容翻譯成自然、簡潔的繁體中文台灣用語。只輸出譯文，不要加註解、前綴或引號。",
+                &text,
+            ))
+        } else {
+            tauri::async_runtime::block_on(call_llm(&config, PROOFREAD_CORE_SYSTEM, &text))
+        };
+
+        match result {
+            Ok(value) if !value.trim().is_empty() => {
+                let value = value.trim().to_string();
+                failure_reported.store(false, Ordering::SeqCst);
+                let payload = if should_translate {
+                    LiveCaptionPayload {
+                        sequence,
+                        original: text.clone(),
+                        display_text: build_display_text(&text, Some(&value), &mode),
+                        translation: Some(value),
+                        confirmed_text: text.clone(),
+                        tentative_text: String::new(),
+                        is_tentative: false,
+                    }
+                } else {
+                    LiveCaptionPayload {
+                        sequence,
+                        original: value.clone(),
+                        display_text: value.clone(),
+                        translation: None,
+                        confirmed_text: value,
+                        tentative_text: String::new(),
+                        is_tentative: false,
+                    }
+                };
+                let _ = app.emit(LIVE_CAPTION_EVENT, payload);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                if !failure_reported.swap(true, Ordering::SeqCst) {
+                    emit_error(
+                        &app,
+                        format!("字幕後處理暫時不可用，將維持顯示原文：{}", error),
+                    );
+                }
+            }
+        }
+    });
 }
 
 fn take_error(error_state: &SharedError) -> Option<anyhow::Error> {
@@ -1276,9 +1455,10 @@ fn close_overlay(app: &AppHandle) {
 mod tests {
     use super::{
         build_display_text, is_duplicate, is_hallucination, nearest_font_size_preset,
-        push_recent_result, resolve_translate_or_proofread,
+        push_recent_result, resolve_translate_or_proofread, IncrementalSegmentState,
     };
     use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn only_translation_enabled_with_different_source_language_translates() {
@@ -1437,5 +1617,49 @@ mod tests {
         assert!(!is_hallucination(
             "I was watching the memory usage closely."
         ));
+    }
+
+    #[test]
+    fn incremental_segment_completion_advances_sample_cursor() {
+        let mut segment = IncrementalSegmentState::default();
+        segment.start(1);
+        segment.text = "沒有標點的持續語音".into();
+
+        let completed = segment.complete(64_000);
+
+        assert_eq!(completed, Some((1, "沒有標點的持續語音".into())));
+        assert_eq!(segment.committed_sample_offset, 64_000);
+        assert!(segment.sequence.is_none());
+        assert!(segment.started_at.is_none());
+    }
+
+    #[test]
+    fn incremental_segment_state_allocates_ordered_sequences_for_long_speech() {
+        let mut segment = IncrementalSegmentState::default();
+        let mut completed = Vec::new();
+
+        for sequence in 1..=3 {
+            segment.start(sequence);
+            segment.text = format!("segment {sequence}");
+            completed.push(segment.complete(sequence as usize * 64_000));
+        }
+
+        assert_eq!(
+            completed,
+            vec![
+                Some((1, "segment 1".into())),
+                Some((2, "segment 2".into())),
+                Some((3, "segment 3".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn incremental_segment_rotates_after_four_seconds_without_punctuation() {
+        let mut segment = IncrementalSegmentState::default();
+        segment.start(1);
+        segment.text = "持續語音沒有標點".into();
+
+        assert!(segment.is_expired_at(Instant::now() + Duration::from_secs(4)));
     }
 }

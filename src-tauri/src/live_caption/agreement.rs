@@ -6,7 +6,7 @@ pub struct AgreementUpdate {
     pub newly_confirmed: String,
     /// 目前尚未達成一致、仍可被後續解碼修正的文字。
     pub tentative: String,
-    /// session 目前累積且不可撤回的確定文字。
+    /// 目前字幕段落中累積且不可撤回的確定文字。
     pub confirmed: String,
 }
 
@@ -25,13 +25,15 @@ impl LocalAgreement {
         let confirmed_len = self.confirmed.chars().count();
         let common_chars: Vec<char> = common.chars().collect();
 
-        let newly_confirmed: String = common_chars.iter().skip(confirmed_len).collect();
-        if common_chars.len() > confirmed_len {
+        let newly_confirmed = if common_chars.len() > confirmed_len {
+            let value: String = common_chars.iter().skip(confirmed_len).collect();
             self.confirmed = common;
-        }
+            value
+        } else {
+            String::new()
+        };
 
-        let confirmed_prefix_matches = result.starts_with(&self.confirmed);
-        self.tentative = if confirmed_prefix_matches {
+        self.tentative = if result.starts_with(&self.confirmed) {
             result
                 .chars()
                 .skip(self.confirmed.chars().count())
@@ -39,9 +41,6 @@ impl LocalAgreement {
         } else {
             result.to_string()
         };
-        if result.chars().any(|character| character.is_ascii_alphabetic()) {
-            self.tentative = self.tentative.trim_start().to_string();
-        }
         self.previous_result = Some(result.to_string());
 
         AgreementUpdate {
@@ -138,7 +137,7 @@ mod tests {
     }
 
     #[test]
-    fn disagreement_after_confirmed_prefix_keeps_new_result_tentative() {
+    fn changed_result_does_not_clear_confirmed_text() {
         let mut agreement = LocalAgreement::default();
         agreement.update("今天討論系統");
         agreement.update("今天討論資料庫");
@@ -163,6 +162,6 @@ mod tests {
         agreement.update("we are testing");
         let update = agreement.update("we are deploying");
         assert_eq!(update.newly_confirmed, "we are");
-        assert_eq!(update.tentative, "deploying");
+        assert_eq!(update.tentative, " deploying");
     }
 }

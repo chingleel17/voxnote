@@ -22,19 +22,8 @@ const dragHandle = document.getElementById('caption-drag-handle');
 const closeButton = document.getElementById('caption-close');
 const lockButton = document.getElementById('caption-lock');
 
-/**
- * 保留段數為固定值，不依視窗高度動態增減，不開放使用者調整（規格要求，見
- * add-live-caption-overlay 的「System displays captions in an always-on-top
- * floating window」）。
- *
- * 曾嘗試過「依視窗高度量測、放不下就捨去最舊一段」的做法，但這會讓換句時
- * 前一段立即消失（只要視窗放不下 2 段就砍成 1 段），使用者來不及讀完就被
- * 蓋掉，體驗類似「一次只顯示一句」而非 YouTube 字幕那種「新句出現時前一句
- * 仍短暫並存」。故改為固定段數：視窗太小時允許內容延伸超出可視範圍（被
- * 標題列或邊界遮蔽一部分），由使用者自行放大視窗或縮小字級來配合，
- * 而不是犧牲保留段數。
- */
-const RETAINED_CAPTIONS = 2;
+/** 前端保留的歷史上限；實際顯示數量由字幕內容區高度決定。 */
+const MAX_RETAINED_CAPTIONS = 20;
 
 let captions: LiveCaptionPayload[] = [];
 let clearSeconds = 8;
@@ -49,21 +38,20 @@ function renderLockButton(): void {
 
 function renderCaptions(): void {
   if (!captionList) return;
-  captionList.innerHTML = '';
-  if (captions.length === 0) {
-    const empty = document.createElement('p');
-    empty.className = 'caption-line caption-empty';
-    empty.textContent = '等待語音…';
-    captionList.appendChild(empty);
-    return;
-  }
+  const renderLines = (visibleCaptions: LiveCaptionPayload[]): void => {
+    captionList.innerHTML = '';
+    if (visibleCaptions.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'caption-line caption-empty';
+      empty.textContent = '等待語音…';
+      captionList.appendChild(empty);
+      return;
+    }
 
-  // 貼底與裁切由 CSS 的 justify-content: flex-end + overflow: hidden 處理，
-  // 見 liveCaptionOverlay.css 對 #caption-list 的說明，此處不需額外的頂高元素。
-  for (const caption of captions.slice(-RETAINED_CAPTIONS)) {
+    for (const [index, caption] of visibleCaptions.entries()) {
     const line = document.createElement('p');
-    line.className = `caption-line${caption.is_tentative ? ' caption-tentative' : ''}`;
-    if (caption.confirmed_text || caption.tentative_text) {
+    line.className = `caption-line ${index === visibleCaptions.length - 1 ? 'caption-current' : 'caption-history'}${caption.is_tentative ? ' caption-tentative' : ''}`;
+    if (caption.tentative_text) {
       const confirmed = document.createElement('span');
       confirmed.className = 'caption-confirmed';
       confirmed.textContent = caption.confirmed_text;
@@ -75,7 +63,25 @@ function renderCaptions(): void {
       line.textContent = caption.display_text;
     }
     captionList.appendChild(line);
+    }
+  };
+
+  const retained = captions.slice(-MAX_RETAINED_CAPTIONS);
+  renderLines(retained);
+  if (retained.length <= 1 || captionList.clientHeight <= 0) return;
+
+  const gap = Number.parseFloat(getComputedStyle(captionList).rowGap) || 0;
+  const availableHeight = captionList.clientHeight;
+  const lines = Array.from(captionList.children) as HTMLElement[];
+  let height = 0;
+  let visibleCount = 0;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const nextHeight = height + lines[index].offsetHeight + (visibleCount > 0 ? gap : 0);
+    if (visibleCount >= 2 && nextHeight > availableHeight) break;
+    height = nextHeight;
+    visibleCount += 1;
   }
+  renderLines(retained.slice(-Math.max(2, visibleCount)));
 }
 
 void listenLiveCaption((payload) => {
@@ -84,16 +90,20 @@ void listenLiveCaption((payload) => {
     captions[existingIndex] = payload;
   } else {
     const latestSequence = captions[captions.length - 1]?.sequence ?? 0;
-    if (payload.translation !== null && payload.sequence < latestSequence) return;
-    captions = [...captions, payload].slice(-RETAINED_CAPTIONS);
+    if (payload.sequence < latestSequence) return;
+    captions = [...captions, payload].slice(-MAX_RETAINED_CAPTIONS);
   }
   lastCaptionAt = Date.now();
   renderCaptions();
 });
 
+const resizeObserver = new ResizeObserver(() => renderCaptions());
+if (captionList) resizeObserver.observe(captionList);
+
 void listenLiveCaptionSettings((settings) => {
   clearSeconds = Math.max(0, settings.clear_seconds);
   document.documentElement.style.setProperty('--caption-font-size', `${settings.font_size}px`);
+  renderCaptions();
   // 未啟用穿透時整窗恆為可互動狀態，直接套用視覺提示。
   overlayRoot?.classList.toggle('is-interactive', !settings.click_through);
   // session 啟動時的鎖定狀態沿用設定檔，之後僅由使用者點擊鎖定鈕改變。

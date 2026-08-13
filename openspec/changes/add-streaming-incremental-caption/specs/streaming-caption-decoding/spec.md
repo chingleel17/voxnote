@@ -28,6 +28,8 @@
 
 文字一旦進入確定狀態，系統 MUST NOT 因後續解碼結果不同而修改或撤回該文字。
 
+確定／暫定是「目前顯示段內文字是否仍可修正」的狀態，MUST NOT 作為字幕段落是否換段、前一段是否繼續顯示或何時配置新 `sequence` 的條件。段落生命週期 MUST 依獨立的顯示週期處理。
+
 #### Scenario: Newly decoded text has not yet been confirmed
 
 - **WHEN** 某段文字剛由解碼產生但尚未通過一致性確認
@@ -42,6 +44,11 @@
 
 - **WHEN** 某段文字已進入確定狀態，而後續解碼對該段語音產生不同結果
 - **THEN** 系統 MUST 保留原確定文字不變，MUST NOT 修改或撤回已確定的內容
+
+#### Scenario: Confirmed text does not block caption rotation
+
+- **WHEN** 當前顯示段已有確定文字，但後續仍持續產生語音與暫定文字
+- **THEN** 系統 MUST 依顯示段落週期完成目前段並開始下一段，MUST NOT 因確定文字仍出現在重疊解碼結果中而持續更新同一個 `sequence`
 
 ### Requirement: System confirms text by agreement across consecutive decodes
 
@@ -91,3 +98,33 @@
 
 - **WHEN** 解碼持續慢於解碼間隔達一段時間
 - **THEN** 字幕 MUST 持續跟隨當下語音而非逐漸落後，且系統 MUST NOT 因累積的解碼工作而耗盡記憶體
+
+### Requirement: Display segment lifecycle is independent from decoding agreement
+
+系統 MUST 以獨立於解碼間隔與 LocalAgreement 的固定 4 秒顯示週期管理字幕段落。當目前段第一次出現非空文字時，系統 MUST 啟動該段的 4 秒期限；期限到達時 MUST 以當下可用的最佳文字完成該段，並 MUST 為後續文字配置新的遞增 `sequence`。
+
+段落到期時若仍有暫定文字，系統 MUST 將該暫定文字視為該段的最終可用內容，MUST NOT 因等待第二次一致結果而延後換段或丟棄文字。
+
+系統 MUST NOT 以標點、確定字數、共同前綴是否仍存在、舊文字是否已滑出分析視窗，或精確字串前綴是否可扣除，作為到期換段的必要條件。
+
+系統 MUST 以音訊 sample offset 維護已提交游標。每次顯示段完成時，系統 MUST 將游標推進至當下已擷取音訊的末端；下一段 MUST 僅使用游標之後擷取的樣本建立分析 buffer，MUST NOT 再把游標之前的音訊送入解碼。系統 MUST NOT 以精確字串前綴、相似文字或標點推測已完成範圍。即使模型稍微改寫舊文字，也 MUST NOT 將已完成段落重新放入新的當前段。
+
+#### Scenario: Continuous speech rotates captions every four seconds
+
+- **WHEN** 使用者持續說話超過 12 秒且 ASR 持續產生非空結果
+- **THEN** 系統 MUST 至少依序完成 3 個顯示段並配置遞增的 `sequence`，MUST NOT 在整段期間只更新同一個字幕列
+
+#### Scenario: Recognition output contains no punctuation
+
+- **WHEN** 連續解碼結果長時間沒有任何標點
+- **THEN** 系統 MUST 仍每 4 秒完成目前段並開始下一段，MUST NOT 等待句尾或文字長度門檻
+
+#### Scenario: Old context remains in the sliding window
+
+- **WHEN** 新一次解碼仍包含已完成段落的舊語音，且模型對舊文字有細微改寫
+- **THEN** 系統 MUST 在完成段落時推進已提交 sample offset，後續解碼 MUST 僅接收該 offset 之後的樣本，MUST NOT 重新顯示或重新確定已完成段落
+
+#### Scenario: Display segment expires with tentative text
+
+- **WHEN** 目前段的 4 秒期限到達且仍含暫定文字
+- **THEN** 系統 MUST 以當下最佳文字完成該段並開始下一段，MUST NOT 延後期限等待 agreement
