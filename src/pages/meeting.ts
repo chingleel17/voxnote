@@ -1,10 +1,10 @@
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { MeetingWithDetails, Transcript, Summary, Recording, SavedParticipant, CreateTemplateRequest, Tag, SpeakerMapping, Category, ExportTextFile } from '../types';
+import type { MeetingWithDetails, Transcript, Summary, Recording, SavedParticipant, CreateTemplateRequest, Tag, SpeakerMapping, Category, ExportTextFile, PendingRecordingUpload } from '../types';
 import { getMeeting, getCategories, updateMeeting, archiveMeeting, unarchiveMeeting } from '../api/meetings';
 import { exportTextFileToPath, getTranscript, saveTranscriptManual, saveTranscriptProofread, switchTranscriptVersion } from '../api/transcripts';
 import { getSummary } from '../api/summaries';
-import { getRecordings, deleteRecording, setNoBreakBefore, reorderRecordings, remergeSegments } from '../api/recordings';
+import { getRecordings, deleteRecording, setNoBreakBefore, reorderRecordings, remergeSegments, importRecordingFiles } from '../api/recordings';
 import { startTranscription, proofreadRecordingSegment, proofreadTranscript, generateSummary } from '../api/settings';
 import { getSavedParticipants, upsertSavedParticipant } from '../api/participants';
 import { deleteSpeakerMapping, getSpeakerMappings, upsertSpeakerMapping } from '../api/speakerMappings';
@@ -1625,6 +1625,10 @@ function buildRecordingSection(
   onReordered: (recordingId: string, direction: -1 | 1) => Promise<void>,
   onSegmentProofread: (recordingId: string) => Promise<{ warning: string | null }>,
   onBreakChanged: () => void,
+  pendingUploads: PendingRecordingUpload[],
+  isSavingUpload: boolean,
+  onPendingUploadsChanged: (saving?: boolean) => void,
+  onUploadCompleted: () => Promise<void>,
   // 逐字稿的校稿狀態。前端的處理中狀態存於記憶體，離開頁面即消失，
   // 故重新進入時需改以資料庫狀態判斷背景工作是否仍在進行。
   proofreadStatus?: string,
@@ -1637,6 +1641,35 @@ function buildRecordingSection(
   const heading = document.createElement('h3');
   heading.textContent = '錄音';
   header.appendChild(heading);
+
+  const uploadBtn = document.createElement('button');
+  uploadBtn.className = 'btn btn-secondary btn-sm recording-upload-btn';
+  uploadBtn.textContent = '上傳音訊';
+  uploadBtn.disabled = isSavingUpload;
+  uploadBtn.addEventListener('click', async () => {
+    if (isSavingUpload) return;
+    const selected = await openDialog({
+      multiple: true,
+      filters: [{ name: '音訊檔案', extensions: ['wav', 'mp3', 'm4a', 'aac', 'flac', 'ogg', 'wma'] }],
+    });
+    if (!selected) return;
+    const selectedPaths = Array.isArray(selected) ? selected : [selected];
+    const existingPaths = new Set(pendingUploads.map((item) => normalizeUploadPath(item.sourcePath)));
+    let added = false;
+    for (const sourcePath of selectedPaths) {
+      const normalizedPath = normalizeUploadPath(sourcePath);
+      if (existingPaths.has(normalizedPath)) continue;
+      existingPaths.add(normalizedPath);
+      pendingUploads.push({
+        sourcePath,
+        originalFileName: getUploadFileName(sourcePath),
+        error: null,
+      });
+      added = true;
+    }
+    if (added) onPendingUploadsChanged();
+  });
+  header.appendChild(uploadBtn);
   section.appendChild(header);
 
   const validRecordings = recordings.filter((r) => r.file_path);
@@ -1654,284 +1687,394 @@ function buildRecordingSection(
       window.location.hash = `#record/${meetingId}`;
     });
     section.appendChild(goBtn);
-    return section;
-  }
+  } else {
+    // 收折功能（2段以上才顯示）
+    let collapsed = validRecordings.length >= 2 ? isCollapsed : false;
+    const recordingList = document.createElement('div');
+    recordingList.className = 'recording-list';
+    recordingList.classList.toggle('hidden', collapsed);
 
-  // 收折功能（2段以上才顯示）
-  let collapsed = validRecordings.length >= 2 ? isCollapsed : false;
-  const recordingList = document.createElement('div');
-  recordingList.className = 'recording-list';
-  recordingList.classList.toggle('hidden', collapsed);
-
-  if (validRecordings.length >= 2) {
-    const toggleBtn = document.createElement('button');
-    toggleBtn.className = 'btn btn-ghost btn-sm recording-collapse-btn';
-    toggleBtn.textContent = getRecordingToggleLabel(validRecordings.length, collapsed);
-    toggleBtn.addEventListener('click', () => {
-      collapsed = !collapsed;
-      recordingList.classList.toggle('hidden', collapsed);
+    if (validRecordings.length >= 2) {
+      const toggleBtn = document.createElement('button');
+      toggleBtn.className = 'btn btn-ghost btn-sm recording-collapse-btn';
       toggleBtn.textContent = getRecordingToggleLabel(validRecordings.length, collapsed);
-      onCollapseChanged(collapsed);
-    });
-    header.appendChild(toggleBtn);
-  }
-
-  for (let i = 0; i < validRecordings.length; i++) {
-    const rec = validRecordings[i]!;
-    const segIndex = i + 1;
-    const transcribeKey = `transcribe:${rec.id}`;
-    const segmentProofreadKey = `proofread-segment:${rec.id}`;
-
-    const segWrap = document.createElement('div');
-    segWrap.className = 'recording-segment';
-
-    // 段落標題列
-    const segHeader = document.createElement('div');
-    segHeader.className = 'recording-segment-header';
-
-    const segTitle = document.createElement('span');
-    segTitle.className = 'recording-segment-title';
-    segTitle.textContent = validRecordings.length > 1 ? `段落 ${segIndex}` : '錄音檔';
-    segHeader.appendChild(segTitle);
-
-    if (rec.duration_seconds !== null) {
-      const dur = document.createElement('span');
-      dur.className = 'recording-segment-duration';
-      const m = Math.floor(rec.duration_seconds / 60);
-      const s = rec.duration_seconds % 60;
-      dur.textContent = `${m}:${String(s).padStart(2, '0')}`;
-      segHeader.appendChild(dur);
+      toggleBtn.addEventListener('click', () => {
+        collapsed = !collapsed;
+        recordingList.classList.toggle('hidden', collapsed);
+        toggleBtn.textContent = getRecordingToggleLabel(validRecordings.length, collapsed);
+        onCollapseChanged(collapsed);
+      });
+      header.appendChild(toggleBtn);
     }
 
-    // 轉譯狀態標籤。除了前端記憶體中的處理狀態，另需反映資料庫記錄的背景校稿，
-    // 否則離開頁面再進入時，仍在校稿的段落會被誤標為「轉譯中」。
-    const statusBadge = document.createElement('span');
-    const isTranscribing = isProcessing(transcribeKey);
-    const isBackgroundProofreading = proofreadStatus === 'running' && Boolean(rec.segment_transcript);
-    const inProgress = isTranscribing || isBackgroundProofreading;
-    statusBadge.className = `recording-segment-status ${inProgress ? 'processing' : rec.segment_transcript ? 'transcribed' : 'pending'}`;
-    statusBadge.textContent = isTranscribing
-      ? '轉譯中'
-      : isBackgroundProofreading
-        ? 'AI 校稿中'
-        : rec.segment_transcript
-          ? '已轉譯'
-          : '未轉譯';
-    segHeader.appendChild(statusBadge);
+    for (let i = 0; i < validRecordings.length; i++) {
+      const rec = validRecordings[i]!;
+      const segIndex = i + 1;
+      const transcribeKey = `transcribe:${rec.id}`;
+      const segmentProofreadKey = `proofread-segment:${rec.id}`;
 
-    segWrap.appendChild(segHeader);
+      const segWrap = document.createElement('div');
+      segWrap.className = 'recording-segment';
 
-    if (rec.original_file_name) {
-      const originalFileName = document.createElement('div');
-      originalFileName.className = 'form-hint';
-      originalFileName.textContent = `原始檔名：${rec.original_file_name}`;
-      segWrap.appendChild(originalFileName);
-    }
+      // 段落標題列
+      const segHeader = document.createElement('div');
+      segHeader.className = 'recording-segment-header';
 
-    // 播放器
-    const audioEl = document.createElement('audio');
-    audioEl.preload = 'metadata';
-    audioEl.style.display = 'none';
-    audioEl.dataset.recordingId = rec.id;
-    void resolveRecordingSource(rec.file_path!).then((src) => {
-      if (audioEl.dataset.recordingId === rec.id) {
-        // crossOrigin 必須早於 src 設定才會生效。asset 協定與本頁不同源，
-        // 未以 CORS 模式載入時播放增益會因規範限制而被消音。
-        applyMediaCrossOrigin(audioEl, src);
-        audioEl.src = src;
+      const segTitle = document.createElement('span');
+      segTitle.className = 'recording-segment-title';
+      segTitle.textContent = validRecordings.length > 1 ? `段落 ${segIndex}` : '錄音檔';
+      segHeader.appendChild(segTitle);
+
+      if (rec.duration_seconds !== null) {
+        const dur = document.createElement('span');
+        dur.className = 'recording-segment-duration';
+        const m = Math.floor(rec.duration_seconds / 60);
+        const s = rec.duration_seconds % 60;
+        dur.textContent = `${m}:${String(s).padStart(2, '0')}`;
+        segHeader.appendChild(dur);
       }
-    }).catch((err) => {
-      showToast(`載入錄音失敗：${String(err)}`, 'error');
-    });
-    const playerEl = createWaveformPlayer(audioEl);
-    segWrap.appendChild(audioEl);
-    segWrap.appendChild(playerEl);
 
-    // 操作列
-    const segActions = document.createElement('div');
-    segActions.className = 'recording-segment-actions';
+      // 轉譯狀態標籤。除了前端記憶體中的處理狀態，另需反映資料庫記錄的背景校稿，
+      // 否則離開頁面再進入時，仍在校稿的段落會被誤標為「轉譯中」。
+      const statusBadge = document.createElement('span');
+      const isTranscribing = isProcessing(transcribeKey);
+      const isBackgroundProofreading = proofreadStatus === 'running' && Boolean(rec.segment_transcript);
+      const inProgress = isTranscribing || isBackgroundProofreading;
+      statusBadge.className = `recording-segment-status ${inProgress ? 'processing' : rec.segment_transcript ? 'transcribed' : 'pending'}`;
+      statusBadge.textContent = isTranscribing
+        ? '轉譯中'
+        : isBackgroundProofreading
+          ? 'AI 校稿中'
+          : rec.segment_transcript
+            ? '已轉譯'
+            : '未轉譯';
+      segHeader.appendChild(statusBadge);
 
-    if (validRecordings.length > 1) {
-      const moveUpBtn = document.createElement('button');
-      moveUpBtn.className = 'btn btn-ghost btn-sm';
-      moveUpBtn.textContent = '↑ 上移';
-      moveUpBtn.disabled = i === 0;
-      moveUpBtn.addEventListener('click', async () => {
-        try {
-          await onReordered(rec.id, -1);
-          showToast(`已將段落 ${segIndex} 往前移動`, 'success');
-        } catch (err) {
-          showToast(`調整順序失敗：${String(err)}`, 'error');
+      segWrap.appendChild(segHeader);
+
+      if (rec.original_file_name) {
+        const originalFileName = document.createElement('div');
+        originalFileName.className = 'form-hint';
+        originalFileName.textContent = `原始檔名：${rec.original_file_name}`;
+        segWrap.appendChild(originalFileName);
+      }
+
+      // 播放器
+      const audioEl = document.createElement('audio');
+      audioEl.preload = 'metadata';
+      audioEl.style.display = 'none';
+      audioEl.dataset.recordingId = rec.id;
+      void resolveRecordingSource(rec.file_path!).then((src) => {
+        if (audioEl.dataset.recordingId === rec.id) {
+          // crossOrigin 必須早於 src 設定才會生效。asset 協定與本頁不同源，
+          // 未以 CORS 模式載入時播放增益會因規範限制而被消音。
+          applyMediaCrossOrigin(audioEl, src);
+          audioEl.src = src;
         }
+      }).catch((err) => {
+        showToast(`載入錄音失敗：${String(err)}`, 'error');
       });
-      segActions.appendChild(moveUpBtn);
+      const playerEl = createWaveformPlayer(audioEl);
+      segWrap.appendChild(audioEl);
+      segWrap.appendChild(playerEl);
 
-      const moveDownBtn = document.createElement('button');
-      moveDownBtn.className = 'btn btn-ghost btn-sm';
-      moveDownBtn.textContent = '↓ 下移';
-      moveDownBtn.disabled = i === validRecordings.length - 1;
-      moveDownBtn.addEventListener('click', async () => {
-        try {
-          await onReordered(rec.id, 1);
-          showToast(`已將段落 ${segIndex} 往後移動`, 'success');
-        } catch (err) {
-          showToast(`調整順序失敗：${String(err)}`, 'error');
-        }
-      });
-      segActions.appendChild(moveDownBtn);
-    }
+      // 操作列
+      const segActions = document.createElement('div');
+      segActions.className = 'recording-segment-actions';
 
-    const transcribeBtn = document.createElement('button');
-    transcribeBtn.className = 'btn btn-primary btn-sm';
-    if (isTranscribing) {
-      transcribeBtn.textContent = '轉譯中…';
-      transcribeBtn.disabled = true;
-    } else if (isBackgroundProofreading) {
-      // 背景校稿期間不可重新轉譯，否則會與進行中的校稿競寫同一份逐字稿
-      transcribeBtn.textContent = 'AI 校稿中…';
-      transcribeBtn.disabled = true;
-    } else {
-      transcribeBtn.textContent = rec.segment_transcript ? '重新轉譯' : '產生逐字稿';
-    }
-    transcribeBtn.addEventListener('click', async () => {
-      const key = `transcribe:${rec.id}`;
-      if (isProcessing(key)) return;
-      startProcessing(key, buildProcessingLabel(meetingTitle, '轉譯中', segIndex));
-      transcribeBtn.disabled = true;
-      transcribeBtn.textContent = '轉譯中…';
-      statusBadge.className = 'recording-segment-status processing';
-      statusBadge.textContent = '轉譯中';
-      showToast(`段落 ${segIndex} 轉譯中，請稍候…`, 'info');
+      if (validRecordings.length > 1) {
+        const moveUpBtn = document.createElement('button');
+        moveUpBtn.className = 'btn btn-ghost btn-sm';
+        moveUpBtn.textContent = '↑ 上移';
+        moveUpBtn.disabled = i === 0;
+        moveUpBtn.addEventListener('click', async () => {
+          try {
+            await onReordered(rec.id, -1);
+            showToast(`已將段落 ${segIndex} 往前移動`, 'success');
+          } catch (err) {
+            showToast(`調整順序失敗：${String(err)}`, 'error');
+          }
+        });
+        segActions.appendChild(moveUpBtn);
 
-      // 後端會在轉錄、AI 校稿等階段發出進度事件。長錄音的校稿需分段送交 LLM，
-      // 耗時可能遠超轉錄本身，若不顯示階段訊息會讓人誤以為程式卡住。
-      const unlistenProgress = await listen<{ meetingId: string; message: string }>(
-        'asr_progress',
-        (event) => {
-          if (event.payload.meetingId !== meetingId) return;
-          statusBadge.textContent = event.payload.message;
-          transcribeBtn.textContent = event.payload.message;
-        },
-      );
+        const moveDownBtn = document.createElement('button');
+        moveDownBtn.className = 'btn btn-ghost btn-sm';
+        moveDownBtn.textContent = '↓ 下移';
+        moveDownBtn.disabled = i === validRecordings.length - 1;
+        moveDownBtn.addEventListener('click', async () => {
+          try {
+            await onReordered(rec.id, 1);
+            showToast(`已將段落 ${segIndex} 往後移動`, 'success');
+          } catch (err) {
+            showToast(`調整順序失敗：${String(err)}`, 'error');
+          }
+        });
+        segActions.appendChild(moveDownBtn);
+      }
 
-      try {
-        await startTranscription(meetingId, rec.id, rec.file_path!);
-        showToast(
-          validRecordings.length > 1
-            ? `段落 ${segIndex} 轉譯完成，逐字稿已更新（含中場休息分隔）`
-            : '逐字稿已生成',
-          'success'
-        );
-        notifyTranscriptionCompleted(meetingTitle, segIndex, validRecordings.length > 1);
-        finishProcessing(key);
-        onTranscribed(rec.id);
-      } catch (err) {
-        showToast(`轉譯失敗：${String(err)}`, 'error');
-        finishProcessing(key, false);
-        transcribeBtn.disabled = false;
+      const transcribeBtn = document.createElement('button');
+      transcribeBtn.className = 'btn btn-primary btn-sm';
+      if (isTranscribing) {
+        transcribeBtn.textContent = '轉譯中…';
+        transcribeBtn.disabled = true;
+      } else if (isBackgroundProofreading) {
+        // 背景校稿期間不可重新轉譯，否則會與進行中的校稿競寫同一份逐字稿
+        transcribeBtn.textContent = 'AI 校稿中…';
+        transcribeBtn.disabled = true;
+      } else {
         transcribeBtn.textContent = rec.segment_transcript ? '重新轉譯' : '產生逐字稿';
-        statusBadge.className = `recording-segment-status ${rec.segment_transcript ? 'transcribed' : 'pending'}`;
-        statusBadge.textContent = rec.segment_transcript ? '已轉譯' : '未轉譯';
-      } finally {
-        unlistenProgress();
       }
-    });
-    segActions.appendChild(transcribeBtn);
+      transcribeBtn.addEventListener('click', async () => {
+        const key = `transcribe:${rec.id}`;
+        if (isProcessing(key)) return;
+        startProcessing(key, buildProcessingLabel(meetingTitle, '轉譯中', segIndex));
+        transcribeBtn.disabled = true;
+        transcribeBtn.textContent = '轉譯中…';
+        statusBadge.className = 'recording-segment-status processing';
+        statusBadge.textContent = '轉譯中';
+        showToast(`段落 ${segIndex} 轉譯中，請稍候…`, 'info');
 
-    if (rec.segment_transcript) {
-      const segmentProofreadBtn = document.createElement('button');
-      segmentProofreadBtn.className = 'btn btn-secondary btn-sm';
-      const isSegmentProofreading = isProcessing(segmentProofreadKey);
-      segmentProofreadBtn.textContent = isSegmentProofreading
-        ? '校稿此段中…'
-        : (rec.segment_proofread ? '重新校稿此段' : '校稿此段');
-      segmentProofreadBtn.disabled = isSegmentProofreading;
-      segmentProofreadBtn.addEventListener('click', async () => {
-        if (isProcessing(segmentProofreadKey)) return;
-        startProcessing(segmentProofreadKey, buildProcessingLabel(meetingTitle, 'AI校稿中', segIndex));
-        segmentProofreadBtn.disabled = true;
-        segmentProofreadBtn.textContent = '校稿此段中…';
-        showToast(`段落 ${segIndex} 校稿中，請稍候…`, 'info');
+        // 後端會在轉錄、AI 校稿等階段發出進度事件。長錄音的校稿需分段送交 LLM，
+        // 耗時可能遠超轉錄本身，若不顯示階段訊息會讓人誤以為程式卡住。
+        const unlistenProgress = await listen<{ meetingId: string; message: string }>(
+          'asr_progress',
+          (event) => {
+            if (event.payload.meetingId !== meetingId) return;
+            statusBadge.textContent = event.payload.message;
+            transcribeBtn.textContent = event.payload.message;
+          },
+        );
+
         try {
-          const result = await onSegmentProofread(rec.id);
+          await startTranscription(meetingId, rec.id, rec.file_path!);
           showToast(
-            result.warning
-              ? `段落 ${segIndex} 校稿已儲存，但結果可能不完整：${normalizeWarningMessage(result.warning)}`
-              : `段落 ${segIndex} 校稿完成，已更新校稿版逐字稿`,
-            result.warning ? 'warning' : 'success',
+            validRecordings.length > 1
+              ? `段落 ${segIndex} 轉譯完成，逐字稿已更新（含中場休息分隔）`
+              : '逐字稿已生成',
+            'success'
           );
-          notifySegmentProofreadCompleted(meetingTitle, segIndex, result.warning);
+          notifyTranscriptionCompleted(meetingTitle, segIndex, validRecordings.length > 1);
+          finishProcessing(key);
+          onTranscribed(rec.id);
         } catch (err) {
-          showToast(`段落校稿失敗：${String(err)}`, 'error');
+          showToast(`轉譯失敗：${String(err)}`, 'error');
+          finishProcessing(key, false);
+          transcribeBtn.disabled = false;
+          transcribeBtn.textContent = rec.segment_transcript ? '重新轉譯' : '產生逐字稿';
+          statusBadge.className = `recording-segment-status ${rec.segment_transcript ? 'transcribed' : 'pending'}`;
+          statusBadge.textContent = rec.segment_transcript ? '已轉譯' : '未轉譯';
+        } finally {
+          unlistenProgress();
         }
       });
-      segActions.appendChild(segmentProofreadBtn);
-    }
+      segActions.appendChild(transcribeBtn);
 
-    const deleteBtn = document.createElement('button');
-    deleteBtn.className = 'btn btn-danger btn-sm';
-    deleteBtn.textContent = '刪除';
-    deleteBtn.addEventListener('click', async () => {
-      if (!confirm(`確定要刪除段落 ${segIndex} 的錄音嗎？`)) return;
-      try {
-        await deleteRecording(rec.id);
-        showToast('錄音段落已刪除', 'success');
-        await onDeleted(rec.id);
-      } catch (err) {
-        showToast(`刪除失敗：${String(err)}`, 'error');
+      if (rec.segment_transcript) {
+        const segmentProofreadBtn = document.createElement('button');
+        segmentProofreadBtn.className = 'btn btn-secondary btn-sm';
+        const isSegmentProofreading = isProcessing(segmentProofreadKey);
+        segmentProofreadBtn.textContent = isSegmentProofreading
+          ? '校稿此段中…'
+          : (rec.segment_proofread ? '重新校稿此段' : '校稿此段');
+        segmentProofreadBtn.disabled = isSegmentProofreading;
+        segmentProofreadBtn.addEventListener('click', async () => {
+          if (isProcessing(segmentProofreadKey)) return;
+          startProcessing(segmentProofreadKey, buildProcessingLabel(meetingTitle, 'AI校稿中', segIndex));
+          segmentProofreadBtn.disabled = true;
+          segmentProofreadBtn.textContent = '校稿此段中…';
+          showToast(`段落 ${segIndex} 校稿中，請稍候…`, 'info');
+          try {
+            const result = await onSegmentProofread(rec.id);
+            showToast(
+              result.warning
+                ? `段落 ${segIndex} 校稿已儲存，但結果可能不完整：${normalizeWarningMessage(result.warning)}`
+                : `段落 ${segIndex} 校稿完成，已更新校稿版逐字稿`,
+              result.warning ? 'warning' : 'success',
+            );
+            notifySegmentProofreadCompleted(meetingTitle, segIndex, result.warning);
+          } catch (err) {
+            showToast(`段落校稿失敗：${String(err)}`, 'error');
+          }
+        });
+        segActions.appendChild(segmentProofreadBtn);
       }
-    });
-    segActions.appendChild(deleteBtn);
 
-    segWrap.appendChild(segActions);
-    recordingList.appendChild(segWrap);
-
-    // 段落間的中場休息分隔符（可刪除）
-    if (i < validRecordings.length - 1) {
-      const nextRec = validRecordings[i + 1]!;
-      const breakEl = document.createElement('div');
-      breakEl.className = `recording-break-divider${nextRec.no_break_before ? ' removed' : ''}`;
-
-      const breakLabel = document.createElement('span');
-      breakLabel.textContent = nextRec.no_break_before ? '（已移除中場休息）' : '☕ 中場休息';
-      breakEl.appendChild(breakLabel);
-
-      const breakToggleBtn = document.createElement('button');
-      breakToggleBtn.className = 'btn btn-ghost btn-xs break-toggle-btn';
-      breakToggleBtn.textContent = nextRec.no_break_before ? '✚ 還原' : '✕ 移除';
-      breakToggleBtn.addEventListener('click', async () => {
-        const newVal = !nextRec.no_break_before;
+      const deleteBtn = document.createElement('button');
+      deleteBtn.className = 'btn btn-danger btn-sm';
+      deleteBtn.textContent = '刪除';
+      deleteBtn.addEventListener('click', async () => {
+        if (!confirm(`確定要刪除段落 ${segIndex} 的錄音嗎？`)) return;
         try {
-          await setNoBreakBefore(nextRec.id, newVal);
-          nextRec.no_break_before = newVal ? 1 : 0;
-          breakEl.className = `recording-break-divider${newVal ? ' removed' : ''}`;
-          breakLabel.textContent = newVal ? '（已移除中場休息）' : '☕ 中場休息';
-          breakToggleBtn.textContent = newVal ? '✚ 還原' : '✕ 移除';
-          // 重新合併逐字稿
-          await remergeSegments(meetingId);
-          showToast(newVal ? '已移除中場休息分隔' : '已還原中場休息分隔', 'success');
-          onBreakChanged();
+          await deleteRecording(rec.id);
+          showToast('錄音段落已刪除', 'success');
+          await onDeleted(rec.id);
         } catch (err) {
-          showToast(`操作失敗：${String(err)}`, 'error');
+          showToast(`刪除失敗：${String(err)}`, 'error');
         }
       });
-      breakEl.appendChild(breakToggleBtn);
-      recordingList.appendChild(breakEl);
+      segActions.appendChild(deleteBtn);
+
+      segWrap.appendChild(segActions);
+      recordingList.appendChild(segWrap);
+
+      // 段落間的中場休息分隔符（可刪除）
+      if (i < validRecordings.length - 1) {
+        const nextRec = validRecordings[i + 1]!;
+        const breakEl = document.createElement('div');
+        breakEl.className = `recording-break-divider${nextRec.no_break_before ? ' removed' : ''}`;
+
+        const breakLabel = document.createElement('span');
+        breakLabel.textContent = nextRec.no_break_before ? '（已移除中場休息）' : '☕ 中場休息';
+        breakEl.appendChild(breakLabel);
+
+        const breakToggleBtn = document.createElement('button');
+        breakToggleBtn.className = 'btn btn-ghost btn-xs break-toggle-btn';
+        breakToggleBtn.textContent = nextRec.no_break_before ? '✚ 還原' : '✕ 移除';
+        breakToggleBtn.addEventListener('click', async () => {
+          const newVal = !nextRec.no_break_before;
+          try {
+            await setNoBreakBefore(nextRec.id, newVal);
+            nextRec.no_break_before = newVal ? 1 : 0;
+            breakEl.className = `recording-break-divider${newVal ? ' removed' : ''}`;
+            breakLabel.textContent = newVal ? '（已移除中場休息）' : '☕ 中場休息';
+            breakToggleBtn.textContent = newVal ? '✚ 還原' : '✕ 移除';
+            // 重新合併逐字稿
+            await remergeSegments(meetingId);
+            showToast(newVal ? '已移除中場休息分隔' : '已還原中場休息分隔', 'success');
+            onBreakChanged();
+          } catch (err) {
+            showToast(`操作失敗：${String(err)}`, 'error');
+          }
+        });
+        breakEl.appendChild(breakToggleBtn);
+        recordingList.appendChild(breakEl);
+      }
     }
+
+    section.appendChild(recordingList);
+
+    // 前往錄音頁新增段落
+    const addBtn = document.createElement('button');
+    addBtn.className = 'btn btn-secondary btn-sm recording-add-btn';
+    addBtn.textContent = '+ 新增錄音段落';
+    addBtn.addEventListener('click', () => {
+      window.location.hash = `#record/${meetingId}`;
+    });
+    section.appendChild(addBtn);
   }
 
-  section.appendChild(recordingList);
+  if (pendingUploads.length > 0) {
+    const panel = document.createElement('div');
+    panel.className = 'pending-recording-upload';
 
-  // 前往錄音頁新增段落
-  const addBtn = document.createElement('button');
-  addBtn.className = 'btn btn-secondary btn-sm recording-add-btn';
-  addBtn.textContent = '+ 新增錄音段落';
-  addBtn.addEventListener('click', () => {
-    window.location.hash = `#record/${meetingId}`;
-  });
-  section.appendChild(addBtn);
+    const panelTitle = document.createElement('div');
+    panelTitle.className = 'pending-recording-upload-title';
+    panelTitle.textContent = `待上傳檔案（${pendingUploads.length}）`;
+    panel.appendChild(panelTitle);
+
+    const list = document.createElement('div');
+    list.className = 'pending-recording-upload-list';
+    pendingUploads.forEach((item, index) => {
+      const row = document.createElement('div');
+      row.className = `pending-recording-upload-row${item.error ? ' has-error' : ''}`;
+      const name = document.createElement('span');
+      name.className = 'pending-recording-upload-name';
+      name.textContent = item.originalFileName;
+      name.title = item.sourcePath;
+      row.appendChild(name);
+      if (item.error) {
+        const error = document.createElement('span');
+        error.className = 'pending-recording-upload-error';
+        error.textContent = item.error;
+        row.appendChild(error);
+      }
+      const removeBtn = document.createElement('button');
+      removeBtn.className = 'btn btn-ghost btn-sm';
+      removeBtn.textContent = '移除';
+      removeBtn.disabled = isSavingUpload;
+      removeBtn.addEventListener('click', () => {
+        if (isSavingUpload) return;
+        pendingUploads.splice(index, 1);
+        onPendingUploadsChanged();
+      });
+      row.appendChild(removeBtn);
+      list.appendChild(row);
+    });
+    panel.appendChild(list);
+
+    const actions = document.createElement('div');
+    actions.className = 'pending-recording-upload-actions';
+    const addMoreBtn = document.createElement('button');
+    addMoreBtn.className = 'btn btn-secondary btn-sm';
+    addMoreBtn.textContent = '加入更多檔案';
+    addMoreBtn.disabled = isSavingUpload;
+    addMoreBtn.addEventListener('click', () => uploadBtn.click());
+    actions.appendChild(addMoreBtn);
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn btn-ghost btn-sm';
+    cancelBtn.textContent = '取消全部';
+    cancelBtn.disabled = isSavingUpload;
+    cancelBtn.addEventListener('click', () => {
+      if (isSavingUpload) return;
+      pendingUploads.splice(0, pendingUploads.length);
+      onPendingUploadsChanged();
+    });
+    actions.appendChild(cancelBtn);
+
+    const saveUploadBtn = document.createElement('button');
+    saveUploadBtn.className = 'btn btn-primary btn-sm';
+    saveUploadBtn.textContent = isSavingUpload ? '儲存中…' : '儲存錄音';
+    saveUploadBtn.disabled = isSavingUpload || pendingUploads.length === 0;
+    saveUploadBtn.addEventListener('click', async () => {
+      if (isSavingUpload || pendingUploads.length === 0) return;
+      onPendingUploadsChanged(true);
+      try {
+        const result = await importRecordingFiles(meetingId, pendingUploads.map((item) => ({
+          sourcePath: item.sourcePath,
+          originalFileName: item.originalFileName,
+        })));
+        const failedByPath = new Map(
+          result.results
+            .filter((item) => item.error)
+            .map((item) => [normalizeUploadPath(item.sourcePath), item.error!]),
+        );
+        for (let i = pendingUploads.length - 1; i >= 0; i--) {
+          const item = pendingUploads[i]!;
+          const error = failedByPath.get(normalizeUploadPath(item.sourcePath));
+          if (error) item.error = error;
+          else pendingUploads.splice(i, 1);
+        }
+        if (result.successCount > 0) await onUploadCompleted();
+        showToast(
+          result.failureCount === 0
+            ? `已成功儲存 ${result.successCount} 個錄音`
+            : result.successCount > 0
+              ? `已儲存 ${result.successCount} 個錄音，${result.failureCount} 個失敗`
+              : `${result.failureCount} 個錄音皆儲存失敗`,
+          result.failureCount === 0 ? 'success' : result.successCount > 0 ? 'warning' : 'error',
+        );
+      } catch (err) {
+        for (const item of pendingUploads) item.error = `批次匯入失敗：${String(err)}`;
+        showToast(`儲存錄音失敗：${String(err)}`, 'error');
+      } finally {
+        onPendingUploadsChanged(false);
+      }
+    });
+    actions.appendChild(saveUploadBtn);
+    panel.appendChild(actions);
+    section.appendChild(panel);
+  }
 
   return section;
+}
+
+function normalizeUploadPath(sourcePath: string): string {
+  return sourcePath.replace(/\\/g, '/').toLowerCase();
+}
+
+function getUploadFileName(sourcePath: string): string {
+  return sourcePath.split(/[/\\]/).pop() ?? sourcePath;
 }
 
 export async function renderMeetingPage(container: HTMLElement, meetingId: string): Promise<void> {
@@ -1946,6 +2089,8 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
   let allTags: Tag[] = [];
   let speakerMappings: SpeakerMapping[] = [];
   let isRecordingListCollapsed = false;
+  let pendingUploads: PendingRecordingUpload[] = [];
+  let isSavingUpload = false;
   let currentTranscriptSection: TranscriptSectionResult | null = null;
 
   try {
@@ -2195,6 +2340,22 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
         if (window.location.hash !== `#meeting/${meetingId}`) return;
         try {
           transcript = await getTranscript(meetingId);
+        } catch { /* ignore */ }
+        build();
+      },
+      pendingUploads,
+      isSavingUpload,
+      (saving) => {
+        if (typeof saving === 'boolean') isSavingUpload = saving;
+        build();
+      },
+      async () => {
+        if (window.location.hash !== `#meeting/${meetingId}`) return;
+        try {
+          [transcript, recordings] = await Promise.all([
+            getTranscript(meetingId),
+            getRecordings(meetingId),
+          ]);
         } catch { /* ignore */ }
         build();
       },

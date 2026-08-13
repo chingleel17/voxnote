@@ -79,6 +79,30 @@ pub struct Recording {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingImportItem {
+    pub source_path: String,
+    pub original_file_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingImportItemResult {
+    pub source_path: String,
+    pub original_file_name: Option<String>,
+    pub recording: Option<Recording>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingImportBatchResult {
+    pub results: Vec<RecordingImportItemResult>,
+    pub success_count: usize,
+    pub failure_count: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct SavedParticipant {
     pub id: String,

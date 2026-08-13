@@ -3,6 +3,8 @@ import type {
   Recording,
   RecordingDeviceList,
   RecordingPreview,
+  RecordingImportBatchResult,
+  RecordingImportItem,
   RecordingSourceMode,
 } from '../types';
 
@@ -65,3 +67,6 @@ export const importRecordingFile = (
     originalFileName,
     durationSeconds,
   });
+
+export const importRecordingFiles = (meetingId: string, items: RecordingImportItem[]) =>
+  invoke<RecordingImportBatchResult>('import_recording_files', { meetingId, items });

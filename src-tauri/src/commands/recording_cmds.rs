@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Manager, State};
@@ -8,7 +8,12 @@ use crate::audio_recording::{
 };
 use crate::backup::DataOperationLock;
 use crate::config::load_config;
-use crate::db::{models::Recording, recording, transcript};
+use crate::db::{
+    models::{
+        Recording, RecordingImportBatchResult, RecordingImportItem, RecordingImportItemResult,
+    },
+    recording, transcript,
+};
 use crate::live_caption::LiveCaptionManager;
 
 #[tauri::command]
@@ -67,33 +72,173 @@ pub async fn import_recording_file(
     data_lock: State<'_, DataOperationLock>,
 ) -> Result<Recording, String> {
     let _guard = data_lock.try_begin_write()?;
-    let recordings_dir = resolve_recordings_dir(&app_handle).map_err(|e| e.to_string())?;
-    let source = PathBuf::from(&source_path);
-    if !source.exists() {
-        return Err("來源音訊檔不存在".into());
-    }
-
-    let file_path = recordings_dir.join(&file_name);
-    let file_path = tauri::async_runtime::spawn_blocking(move || -> Result<PathBuf, String> {
-        std::fs::create_dir_all(&recordings_dir).map_err(|e| e.to_string())?;
-        std::fs::copy(&source, &file_path).map_err(|e| e.to_string())?;
-        Ok(file_path)
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-
-    let file_path_str = file_path.to_string_lossy().to_string();
-
-    recording::create_recording(
+    import_recording_file_inner(
+        &app_handle,
         &pool,
         &meeting_id,
-        Some(&file_path_str),
+        &source_path,
+        Some(file_name.as_str()),
         original_file_name.as_deref(),
+        duration_seconds,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn import_recording_files(
+    meeting_id: String,
+    items: Vec<RecordingImportItem>,
+    app_handle: AppHandle,
+    pool: State<'_, SqlitePool>,
+    data_lock: State<'_, DataOperationLock>,
+) -> Result<RecordingImportBatchResult, String> {
+    let _guard = data_lock.try_begin_write()?;
+    let mut results = Vec::with_capacity(items.len());
+
+    for item in items {
+        let original_file_name = item.original_file_name.clone();
+        let result = import_recording_file_inner(
+            &app_handle,
+            &pool,
+            &meeting_id,
+            &item.source_path,
+            original_file_name.as_deref(),
+            original_file_name.as_deref(),
+            None,
+        )
+        .await;
+        results.push(match result {
+            Ok(recording) => RecordingImportItemResult {
+                source_path: item.source_path,
+                original_file_name,
+                recording: Some(recording),
+                error: None,
+            },
+            Err(error) => RecordingImportItemResult {
+                source_path: item.source_path,
+                original_file_name,
+                recording: None,
+                error: Some(error),
+            },
+        });
+    }
+
+    let success_count = results
+        .iter()
+        .filter(|result| result.recording.is_some())
+        .count();
+    Ok(RecordingImportBatchResult {
+        failure_count: results.len() - success_count,
+        success_count,
+        results,
+    })
+}
+
+async fn import_recording_file_inner(
+    app_handle: &AppHandle,
+    pool: &SqlitePool,
+    meeting_id: &str,
+    source_path: &str,
+    extension_name: Option<&str>,
+    original_file_name: Option<&str>,
+    duration_seconds: Option<i64>,
+) -> Result<Recording, String> {
+    let source = PathBuf::from(source_path);
+    validate_source_file(&source)?;
+    let recordings_dir =
+        resolve_recordings_dir(app_handle).map_err(|e| format!("無法取得錄音目錄：{e}"))?;
+    let destination = recordings_dir.join(generate_recording_file_name(meeting_id, extension_name));
+    let destination_for_copy = destination.clone();
+    let source_for_copy = source.clone();
+
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        std::fs::create_dir_all(&recordings_dir).map_err(|e| format!("無法建立錄音目錄：{e}"))?;
+        std::fs::copy(&source_for_copy, &destination_for_copy)
+            .map_err(|e| format!("複製音訊檔失敗：{e}"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("複製音訊檔工作失敗：{e}"))??;
+
+    let file_path = destination.to_string_lossy().to_string();
+    match recording::create_recording(
+        pool,
+        meeting_id,
+        Some(&file_path),
+        original_file_name,
         duration_seconds,
         None,
     )
     .await
-    .map_err(|e| e.to_string())
+    {
+        Ok(recording) => Ok(recording),
+        Err(error) => {
+            let cleanup_error = tauri::async_runtime::spawn_blocking({
+                let destination = destination.clone();
+                move || std::fs::remove_file(destination)
+            })
+            .await
+            .map_err(|join_error| format!("資料庫建立錄音失敗，且清理目的檔工作失敗：{join_error}"))
+            .and_then(|result| {
+                result.map_err(|cleanup_error| {
+                    format!("資料庫建立錄音失敗，且清理目的檔失敗：{cleanup_error}")
+                })
+            });
+            match cleanup_error {
+                Ok(()) => Err(format!("建立錄音資料失敗：{error}")),
+                Err(cleanup_error) => Err(cleanup_error),
+            }
+        }
+    }
+}
+
+fn validate_source_file(source: &Path) -> Result<(), String> {
+    if !source.exists() {
+        return Err("來源音訊檔不存在".into());
+    }
+    if !source.is_file() {
+        return Err("來源音訊路徑不是一般檔案".into());
+    }
+    Ok(())
+}
+
+fn generate_recording_file_name(meeting_id: &str, extension_name: Option<&str>) -> String {
+    let extension = extension_name
+        .and_then(|name| Path::new(name).extension())
+        .map(|value| value.to_string_lossy().to_string());
+    match extension {
+        Some(extension) if !extension.is_empty() => {
+            format!("{meeting_id}_{}.{}", uuid::Uuid::new_v4(), extension)
+        }
+        _ => format!("{meeting_id}_{}", uuid::Uuid::new_v4()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{generate_recording_file_name, validate_source_file};
+    use std::path::Path;
+
+    #[test]
+    fn purpose_file_names_are_unique_and_preserve_extension_case() {
+        let first = generate_recording_file_name("meeting", Some("audio.MP3"));
+        let second = generate_recording_file_name("meeting", Some("audio.MP3"));
+        assert_ne!(first, second);
+        assert!(first.ends_with(".MP3"));
+        assert!(second.ends_with(".MP3"));
+    }
+
+    #[test]
+    fn purpose_file_names_support_missing_extension() {
+        assert!(!generate_recording_file_name("meeting", None).contains('.'));
+        assert!(!generate_recording_file_name("meeting", Some("audio")).contains('.'));
+    }
+
+    #[test]
+    fn missing_source_is_rejected() {
+        let result = validate_source_file(Path::new("missing-recording-file.wav"));
+        assert_eq!(result, Err("來源音訊檔不存在".to_string()));
+    }
 }
 
 #[tauri::command]

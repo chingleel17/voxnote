@@ -84,6 +84,30 @@ export interface Recording {
   created_at: string;
 }
 
+export interface RecordingImportItem {
+  sourcePath: string;
+  originalFileName: string | null;
+}
+
+export interface RecordingImportItemResult {
+  sourcePath: string;
+  originalFileName: string | null;
+  recording: Recording | null;
+  error: string | null;
+}
+
+export interface RecordingImportBatchResult {
+  results: RecordingImportItemResult[];
+  successCount: number;
+  failureCount: number;
+}
+
+export interface PendingRecordingUpload {
+  sourcePath: string;
+  originalFileName: string;
+  error: string | null;
+}
+
 export type RecordingSourceMode = 'microphone' | 'system' | 'mix';
 
 export interface RecordingDevice {

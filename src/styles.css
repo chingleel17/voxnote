@@ -608,7 +608,12 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
   margin-bottom: 16px;
 }
 
-.section-header { margin-bottom: 14px; }
+.section-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+}
 
 .section-header h3 {
   font-size: 15px;
@@ -976,6 +981,69 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
 .recording-add-btn {
   margin-top: 10px;
   width: 100%;
+}
+.recording-collapse-btn {
+  order: 1;
+  margin-left: 0;
+}
+.recording-upload-btn {
+  order: 2;
+  margin-left: auto;
+}
+.pending-recording-upload {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-bg-tertiary);
+}
+.pending-recording-upload-title {
+  margin-bottom: 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+.pending-recording-upload-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.pending-recording-upload-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+}
+.pending-recording-upload-row.has-error {
+  border-color: var(--color-error);
+}
+.pending-recording-upload-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+.pending-recording-upload-error {
+  flex: 1;
+  min-width: 0;
+  color: var(--color-error);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.pending-recording-upload-row .btn {
+  flex-shrink: 0;
+  margin-left: auto;
+}
+.pending-recording-upload-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
 }
 .btn-danger {
   background: #ef4444;

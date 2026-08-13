@@ -104,6 +104,7 @@ pub fn run() {
             get_recordings,
             save_recording,
             import_recording_file,
+            import_recording_files,
             list_recording_devices,
             start_desktop_recording,
             stop_desktop_recording,
