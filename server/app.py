@@ -521,13 +521,16 @@ async def create_transcription(
         if sync:
             try:
                 # 同步模式刻意不使用任務表或 BackgroundTasks，供即時字幕使用。
-                return await _transcribe_audio(
-                    audio_path,
-                    language,
-                    diarize,
-                    min_speakers,
-                    max_speakers,
-                )
+                # WhisperX pipeline 會在轉錄期間修改共用的 tokenizer；同步請求也
+                # 必須與背景任務共用序列化鎖，否則多個檔案同時送入會發生 tokenizer=None。
+                async with transcription_lock:
+                    return await _transcribe_audio(
+                        audio_path,
+                        language,
+                        diarize,
+                        min_speakers,
+                        max_speakers,
+                    )
             except RuntimeError as error:
                 logger.error("轉錄前置條件不符：%s", error, exc_info=True)
                 raise HTTPException(status_code=503, detail=str(error)) from error

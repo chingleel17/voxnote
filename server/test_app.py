@@ -1,4 +1,5 @@
 import asyncio
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -116,6 +117,38 @@ class TestTranscriptionApi(unittest.TestCase):
                     http.post(
                         "/v1/audio/transcriptions",
                         files={"file": ("two.wav", b"audio", "audio/wav")},
+                    ),
+                )
+                assert first.status_code == second.status_code == 200
+                assert maximum == 1
+
+        with patch.object(app.transcriber, "transcribe", serialized):
+            self.run_async(scenario())
+
+    def test_sync_requests_are_processed_serially(self):
+        active = 0
+        maximum = 0
+
+        def serialized(*args, **kwargs):
+            nonlocal active, maximum
+            active += 1
+            maximum = max(maximum, active)
+            time.sleep(0.02)
+            active -= 1
+            return [app.TranscriptSegment(0.0, 1.0, "完成")]
+
+        async def scenario():
+            async with client() as http:
+                first, second = await asyncio.gather(
+                    http.post(
+                        "/v1/audio/transcriptions",
+                        files={"file": ("one.wav", b"audio", "audio/wav")},
+                        data={"sync": "true"},
+                    ),
+                    http.post(
+                        "/v1/audio/transcriptions",
+                        files={"file": ("two.wav", b"audio", "audio/wav")},
+                        data={"sync": "true"},
                     ),
                 )
                 assert first.status_code == second.status_code == 200
