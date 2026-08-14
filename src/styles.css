@@ -703,6 +703,9 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
 }
 .transcript-row:last-child { border-bottom: none; }
 .transcript-segment-badge {
+  position: sticky;
+  top: 4px;
+  z-index: 4;
   display: inline-flex;
   margin: 12px 0 4px;
   padding: 3px 8px;
@@ -712,6 +715,7 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
   color: var(--color-text-secondary);
   font-size: 11px;
   font-weight: 600;
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--color-bg) 30%, transparent);
 }
 .transcript-time {
   flex-shrink: 0;
@@ -816,6 +820,17 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
 
 .speaker-mapping-row .transcript-speaker:hover {
   text-decoration: underline;
+}
+
+.speaker-mapping-row.speaker-mapping-unused {
+  opacity: 0.42;
+  filter: saturate(0.35);
+}
+
+.speaker-mapping-row.speaker-mapping-unused:hover,
+.speaker-mapping-row.speaker-mapping-unused:focus-within {
+  opacity: 0.72;
+  filter: saturate(0.7);
 }
 
 .speaker-mapping-select {
@@ -1026,7 +1041,7 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
 
 .structured-editor-row {
   display: grid;
-  grid-template-columns: 68px minmax(150px, 210px) minmax(180px, 1fr) auto;
+  grid-template-columns: 68px minmax(150px, 210px) minmax(180px, 1fr) auto auto;
   align-items: start;
   gap: 8px;
   padding: 10px 0 10px 8px;
@@ -1051,6 +1066,7 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
 .structured-editor-text { resize: vertical; line-height: 1.5; }
 .structured-editor-controls { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .structured-editor-split { align-self: center; }
+.structured-editor-delete { align-self: center; color: var(--color-danger); }
 .structured-editor-row-hint { grid-column: 3 / -1; color: var(--color-warning); font-size: 12px; }
 
 button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
@@ -2521,6 +2537,7 @@ html, body { letter-spacing: 0.005em; }
   .structured-editor-controls,
   .structured-editor-text,
   .structured-editor-split,
+  .structured-editor-delete,
   .structured-editor-row-hint { grid-column: 1 / -1; }
 }
 

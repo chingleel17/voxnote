@@ -684,16 +684,20 @@ function renderGeneratedTranscriptInto(
 
   const mappingBySpeaker = buildSpeakerMappingLookup(speakerMappings);
   const segments = getGeneratedTranscriptSegments(recordings, version);
+  const showSegmentLabels = segments.length > 1;
 
   for (const [index, { recording, text }] of segments.entries()) {
-    const segmentBadge = document.createElement('div');
-    segmentBadge.className = 'transcript-segment-badge';
-    segmentBadge.dataset.recordingId = recording.id;
-    segmentBadge.dataset.segmentIndex = String(recordings.findIndex((item) => item.id === recording.id) + 1);
-    segmentBadge.textContent = recordings.length > 1
-      ? `段落 ${recordings.findIndex((item) => item.id === recording.id) + 1}`
-      : '錄音內容';
-    container.appendChild(segmentBadge);
+    if (showSegmentLabels) {
+      const segmentBadge = document.createElement('div');
+      segmentBadge.className = 'transcript-segment-badge';
+      segmentBadge.dataset.recordingId = recording.id;
+      segmentBadge.dataset.segmentIndex = String(recordings.findIndex((item) => item.id === recording.id) + 1);
+      const segmentIndex = recordings.findIndex((item) => item.id === recording.id) + 1;
+      segmentBadge.textContent = recording.original_file_name
+        ? `段落 ${segmentIndex}（${recording.original_file_name}）`
+        : `段落 ${segmentIndex}`;
+      container.appendChild(segmentBadge);
+    }
 
     if (index > 0 && !recording.no_break_before) {
       const divider = document.createElement('div');
@@ -722,6 +726,7 @@ function renderDraftRowsInto(
 ): void {
   container.innerHTML = '';
   const mappingBySpeaker = buildSpeakerMappingLookup(speakerMappings);
+  const showSegmentLabels = new Set(rows.map((row) => row.recordingId)).size > 1;
   let previousRecordingId = '';
 
   for (const rowData of rows) {
@@ -732,12 +737,17 @@ function renderDraftRowsInto(
         divider.textContent = '☕ 中場休息';
         container.appendChild(divider);
       }
-      const badge = document.createElement('div');
-      badge.className = 'transcript-segment-badge';
-      badge.dataset.recordingId = rowData.recordingId;
-      badge.dataset.segmentIndex = String(rowData.segmentIndex);
-      badge.textContent = recordings.length > 1 ? `段落 ${rowData.segmentIndex}` : '錄音內容';
-      container.appendChild(badge);
+      if (showSegmentLabels) {
+        const badge = document.createElement('div');
+        badge.className = 'transcript-segment-badge';
+        badge.dataset.recordingId = rowData.recordingId;
+        badge.dataset.segmentIndex = String(rowData.segmentIndex);
+        const recording = recordings.find((item) => item.id === rowData.recordingId);
+        badge.textContent = recording?.original_file_name
+          ? `段落 ${rowData.segmentIndex}（${recording.original_file_name}）`
+          : `段落 ${rowData.segmentIndex}`;
+        container.appendChild(badge);
+      }
       previousRecordingId = rowData.recordingId;
     }
 
@@ -1044,13 +1054,52 @@ function buildTranscriptSection(
     const escapedRecordingId = CSS.escape(recordingId);
     const selector = speakerLabel
       ? `.transcript-row[data-recording-id="${escapedRecordingId}"][data-speaker-label="${CSS.escape(speakerLabel)}"], .structured-editor-row[data-recording-id="${escapedRecordingId}"][data-speaker-label="${CSS.escape(speakerLabel)}"]`
-      : `.transcript-segment-badge[data-recording-id="${escapedRecordingId}"], .structured-editor-segment[data-recording-id="${escapedRecordingId}"]`;
+      : `.transcript-segment-badge[data-recording-id="${escapedRecordingId}"], .structured-editor-segment[data-recording-id="${escapedRecordingId}"], .transcript-row[data-recording-id="${escapedRecordingId}"], .structured-editor-row[data-recording-id="${escapedRecordingId}"]`;
     const target = root.querySelector<HTMLElement>(selector);
     if (!target) {
       showToast('目前逐字稿版本沒有可定位的錄音段落資訊', 'info');
       return;
     }
     target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+
+  const mappingRowElements = new Map<string, Set<HTMLElement>>();
+  const getActiveSpeakerLabels = (version: TranscriptVersion): Map<string, Set<string>> | null => {
+    const active = new Map<string, Set<string>>();
+    if (version === 'manual') {
+      const parsed = getManualDraftParse();
+      if (parsed.reason) return null;
+      for (const row of parsed.rows) {
+        if (!isSpeakerLabel(row.speakerLabel)) continue;
+        const labels = active.get(row.recordingId) ?? new Set<string>();
+        labels.add(row.speakerLabel);
+        active.set(row.recordingId, labels);
+      }
+      return active;
+    }
+
+    for (const recording of recordings) {
+      const labels = extractSpeakerLabels(getRecordingTranscriptText(recording, version));
+      active.set(recording.id, new Set(labels));
+    }
+    return active;
+  };
+
+  const refreshMappingActivity = (): void => {
+    const active = getActiveSpeakerLabels(currentVersion);
+    if (!active) return;
+    for (const [key, elements] of mappingRowElements) {
+      const separatorIndex = key.indexOf('::');
+      const recordingId = key.slice(0, separatorIndex);
+      const speakerLabel = key.slice(separatorIndex + 2);
+      const isActive = active.get(recordingId)?.has(speakerLabel) ?? false;
+      for (const element of elements) {
+        element.classList.toggle('speaker-mapping-unused', !isActive);
+        element.title = isActive
+          ? ''
+          : '目前版本未使用此講者，但仍保留對應供其他版本使用';
+      }
+    }
   };
 
   const buildSpeakerMappingPanel = (
@@ -1089,8 +1138,12 @@ function buildTranscriptSection(
         mappingList.className = 'speaker-mapping-list';
 
         for (const speakerLabel of speakerLabels) {
-          const row = document.createElement('label');
-          row.className = 'speaker-mapping-row';
+           const row = document.createElement('label');
+           row.className = 'speaker-mapping-row';
+           const rowKey = getSpeakerMappingKey(recording.id, speakerLabel);
+           const rowsForSpeaker = mappingRowElements.get(rowKey) ?? new Set<HTMLElement>();
+           rowsForSpeaker.add(row);
+           mappingRowElements.set(rowKey, rowsForSpeaker);
 
           const label = document.createElement('span');
            label.className = `transcript-speaker ${getSpeakerScopeClassName(recordings, recording.id, speakerLabel, speakerLabels)}`;
@@ -1164,6 +1217,7 @@ function buildTranscriptSection(
     scrollTranscriptTo(recordingId, speakerLabel),
   );
   if (mappingPanel) section.appendChild(mappingPanel);
+  refreshMappingActivity();
 
   const getTimeClickHandler = (recordingId: string): (timeInSeconds: number) => void => {
     return (timeInSeconds: number) => {
@@ -1217,6 +1271,7 @@ function buildTranscriptSection(
     for (const [tabVersion, button] of tabButtons) {
       button.classList.toggle('active', tabVersion === version);
     }
+    refreshMappingActivity();
   }
 
   async function ensureManualVersion(
@@ -1495,6 +1550,25 @@ function buildTranscriptSection(
           focusRowText(newRow.id);
         });
         rowEl.appendChild(splitBtn);
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'btn btn-ghost btn-xs structured-editor-delete';
+        deleteBtn.type = 'button';
+        deleteBtn.textContent = '刪除此列';
+        deleteBtn.title = '刪除目前時間戳與文字列';
+        deleteBtn.addEventListener('click', () => {
+          const rowIndex = draftRows!.findIndex((item) => item.id === row.id);
+          const segmentRowCount = draftRows!.filter((item) => item.recordingId === row.recordingId).length;
+          if (segmentRowCount <= 1) {
+            showToast('每個錄音段落至少保留一列；可先將內容合併到其他列', 'warning');
+            return;
+          }
+          const focusRow = draftRows![rowIndex + 1] ?? draftRows![rowIndex - 1];
+          draftRows!.splice(rowIndex, 1);
+          renderFullscreen();
+          if (focusRow) focusRowText(focusRow.id);
+        });
+        rowEl.appendChild(deleteBtn);
         if (row.timeHint) {
           const hint = document.createElement('span');
           hint.className = 'structured-editor-row-hint';
@@ -1586,6 +1660,7 @@ function buildTranscriptSection(
         if (editorMappingPanel) {
           editorMappingPanel.classList.add('transcript-editor-mapping-panel');
           body.appendChild(editorMappingPanel);
+          refreshMappingActivity();
         }
         if (editMode === 'structured') {
           renderStructuredEditor(editorShell);
