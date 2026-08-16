@@ -193,6 +193,7 @@ docker compose up -d --build asr-batch gateway
 | `ASR_COMPUTE_TYPE` | 運算精度；VRAM 較小建議 `int8`，較充裕可用 `float16` | `int8` |
 | `ASR_BATCH_SIZE` | 批次大小；VRAM 較小時調降 | `8` |
 | `DIARIZATION_MODEL` | 語者分離模型（明確指定，不依賴 WhisperX 會變動的預設值） | `pyannote-community/speaker-diarization-community-1` |
+| `DIARIZATION_CLUSTERING_THRESHOLD` | pyannote AHC 分群門檻（cosine 距離，範圍 0–2）；設為空字串則採模型預設值（`0.6`） | `1.0`（實測值） |
 | `HF_TOKEN` / `HF_TOKEN_FILE` | Hugging Face token（語者分離所需），可直接給值或指向檔案 | 無 |
 | `UPLOAD_DIR` | 上傳音訊暫存目錄 | 系統暫存目錄 |
 | `AUDIO_PREPROCESS` | 音訊前處理總開關；設為 `0` 可停用以比對效果 | `1` |
@@ -214,6 +215,40 @@ docker compose up -d --build asr-batch gateway
 `dynaudnorm` 雖快得多，但逐段調整增益會在語音停頓處把底噪一併放大，實測損失約 6.5 dB SNR，與提升語者分離的目標相反。因此預設採 `loudnorm`；若長錄音無法接受其耗時，再改用 `dynaudnorm`。
 
 比對前處理是否有效的方式：對同一段實際會議錄音，分別以 `AUDIO_PREPROCESS=0` 與 `1` 轉錄，比較語者標籤的正確性。
+
+### 分群門檻
+
+pyannote 以 AHC（凝聚式階層分群）依聲紋 embedding 的 cosine 距離決定講者身分。同一人在音量、語氣、麥克風距離變化，或長時間間隔後再發言時，embedding 距離可能超過分群門檻而未被合併，導致一人被判為多個講者；反之門檻太高則可能把不同人合併為同一講者。
+
+`DIARIZATION_CLUSTERING_THRESHOLD` 可覆寫此門檻，範圍為 cosine 距離 0–2：
+
+- **調低**：分群更嚴格，傾向將講者拆得更細（可能加劇「一人被拆成多人」）。
+- **調高**：分群更寬鬆，傾向合併相近的聲紋（可能導致「不同人被合併」）。
+
+`docker-compose.yml` 預設帶入 `1.0`（實測值，理由見下）。要改回模型預設值 `0.6`，於 `server/.env` 寫入空值即可：
+
+```dotenv
+DIARIZATION_CLUSTERING_THRESHOLD=
+```
+
+（compose 使用 `${VAR-1.0}` 單破折號語法，故 `.env` 中的空字串會照實傳入而不被預設值取代。）
+
+取用底層 pyannote pipeline 參數失敗時（版本升級可能變動未公開介面），服務會記錄 log 並安全降級為模型預設值，不中斷轉錄。
+
+#### 實測結果與建議值
+
+以一段 43 分鐘、實際三人（主要為兩人對談）的中文會議錄音實測（`pyannote-community/speaker-diarization-community-1`，模型預設門檻為 `0.6`）：
+
+| 門檻 | 分段數 | 講者分佈 | 判讀 |
+| --- | --- | --- | --- |
+| `0.6`（模型預設） | 522 | A:231、B:240、C:50 | 出現第三位講者 C，實為 A/B 被誤拆 |
+| `0.8` | 514 | A:229、B:240、C:44 | 幾乎無改善，C 仍在 |
+| **`1.0`（建議）** | 525 | A:260、B:264 | **C 消失，收斂為正確的兩人** |
+| `1.2` | 91 | A:91 | 過度合併，全部併為同一人（等同未分離） |
+
+**建議值為 `1.0`**：可有效消除「同一人被判為多個講者」，且尚未反向造成不同人被合併（`1.2` 才發生過度合併）。此為單一錄音的實測結果，不同錄音環境（麥克風距離、人數、環境噪音）的最佳值可能不同，建議以自身錄音比對後再定案。
+
+需注意：**調高門檻只能解決分群階段的誤拆，無法消除字級切分本身的碎片化**。上表中 `0.6` 與 `1.0` 的分段數同為 5 百多段，因為分段數主要由字級講者標籤的跳動決定，而非講者總數；門檻影響的是「這些分段被歸給幾個講者」。
 
 ## app 端設定
 

@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 import unittest
 from pathlib import Path
@@ -194,3 +195,237 @@ class TestTranscriptionApi(unittest.TestCase):
             side_effect=RuntimeError("模型未載入"),
         ):
             self.run_async(scenario())
+
+
+class TestToSegments(unittest.TestCase):
+    """`_to_segments` 的字級講者切分行為（tasks.md 第 2 節）。"""
+
+    def test_word_reconstruction_does_not_insert_spaces_between_chinese_characters(self):
+        raw = {
+            "start": 0.0,
+            "end": 0.6,
+            "text": "大家好",
+            "words": [
+                {"word": "大", "start": 0.0, "end": 0.2, "speaker": "SPEAKER_00"},
+                {"word": "家", "start": 0.2, "end": 0.4, "speaker": "SPEAKER_01"},
+                {"word": "好", "start": 0.4, "end": 0.6, "speaker": "SPEAKER_01"},
+            ],
+        }
+        segments = app.WhisperXTranscriber._to_segments([raw])
+        assert [s.text for s in segments] == ["大", "家好"]
+
+    def test_word_reconstruction_does_not_space_out_english_acronyms(self):
+        # WhisperX 在中文語境下常將英文縮寫拆成單一字母的字詞（如 D、E、B、U、G）
+        raw = {
+            "start": 0.0,
+            "end": 1.0,
+            "text": "他們在測DEBUG的",
+            "words": [
+                {"word": "他", "start": 0.0, "end": 0.1, "speaker": "SPEAKER_00"},
+                {"word": "們", "start": 0.1, "end": 0.2, "speaker": "SPEAKER_00"},
+                {"word": "在", "start": 0.2, "end": 0.3, "speaker": "SPEAKER_00"},
+                {"word": "測", "start": 0.3, "end": 0.4, "speaker": "SPEAKER_00"},
+                {"word": "D", "start": 0.4, "end": 0.5, "speaker": "SPEAKER_00"},
+                {"word": "E", "start": 0.5, "end": 0.6, "speaker": "SPEAKER_00"},
+                {"word": "B", "start": 0.6, "end": 0.7, "speaker": "SPEAKER_00"},
+                {"word": "U", "start": 0.7, "end": 0.8, "speaker": "SPEAKER_00"},
+                {"word": "G", "start": 0.8, "end": 0.9, "speaker": "SPEAKER_00"},
+                {"word": "的", "start": 0.9, "end": 1.0, "speaker": "SPEAKER_00"},
+            ],
+        }
+        segments = app.WhisperXTranscriber._to_segments([raw])
+        assert len(segments) == 1
+        assert segments[0].text == "他們在測DEBUG的"
+
+    def test_word_reconstruction_spaces_separate_english_words(self):
+        raw = {
+            "start": 0.0,
+            "end": 1.0,
+            "text": "hello world",
+            "words": [
+                {"word": "hello", "start": 0.0, "end": 0.4, "speaker": "SPEAKER_00"},
+                {"word": "world", "start": 0.4, "end": 0.8, "speaker": "SPEAKER_00"},
+            ],
+        }
+        segments = app.WhisperXTranscriber._to_segments([raw])
+        assert len(segments) == 1
+        assert segments[0].text == "hello world"
+
+    def test_speaker_change_within_segment_splits_into_multiple_segments(self):
+        raw = {
+            "start": 0.0,
+            "end": 1.2,
+            "text": "你好嗎我很好",
+            "speaker": "SPEAKER_00",
+            "words": [
+                {"word": "你", "start": 0.0, "end": 0.2, "speaker": "SPEAKER_00"},
+                {"word": "好", "start": 0.2, "end": 0.4, "speaker": "SPEAKER_00"},
+                {"word": "嗎", "start": 0.4, "end": 0.6, "speaker": "SPEAKER_00"},
+                {"word": "我", "start": 0.6, "end": 0.8, "speaker": "SPEAKER_01"},
+                {"word": "很", "start": 0.8, "end": 1.0, "speaker": "SPEAKER_01"},
+                {"word": "好", "start": 1.0, "end": 1.2, "speaker": "SPEAKER_01"},
+            ],
+        }
+        segments = app.WhisperXTranscriber._to_segments([raw])
+        assert len(segments) == 2
+        assert segments[0].speaker == "A"
+        assert segments[1].speaker == "B"
+
+    def test_consistent_speaker_does_not_split(self):
+        raw = {
+            "start": 0.0,
+            "end": 0.6,
+            "text": "大家好",
+            "speaker": "SPEAKER_00",
+            "words": [
+                {"word": "大", "start": 0.0, "end": 0.2, "speaker": "SPEAKER_00"},
+                {"word": "家", "start": 0.2, "end": 0.4, "speaker": "SPEAKER_00"},
+                {"word": "好", "start": 0.4, "end": 0.6, "speaker": "SPEAKER_00"},
+            ],
+        }
+        segments = app.WhisperXTranscriber._to_segments([raw])
+        assert len(segments) == 1
+        assert segments[0].text == "大家好"
+        assert segments[0].speaker == "A"
+
+    def test_split_segments_use_word_level_timestamps(self):
+        raw = {
+            "start": 0.0,
+            "end": 1.2,
+            "text": "你好嗎我很好",
+            "words": [
+                {"word": "你", "start": 0.0, "end": 0.2, "speaker": "SPEAKER_00"},
+                {"word": "好", "start": 0.2, "end": 0.4, "speaker": "SPEAKER_00"},
+                {"word": "嗎", "start": 0.4, "end": 0.6, "speaker": "SPEAKER_00"},
+                {"word": "我", "start": 0.6, "end": 0.8, "speaker": "SPEAKER_01"},
+                {"word": "很", "start": 0.8, "end": 1.0, "speaker": "SPEAKER_01"},
+                {"word": "好", "start": 1.0, "end": 1.2, "speaker": "SPEAKER_01"},
+            ],
+        }
+        segments = app.WhisperXTranscriber._to_segments([raw])
+        assert segments[0].start == 0.0
+        assert segments[0].end == 0.6
+        assert segments[1].start == 0.6
+        assert segments[1].end == 1.2
+
+    def test_missing_mid_word_speaker_carries_previous_label(self):
+        raw = {
+            "start": 0.0,
+            "end": 0.6,
+            "text": "ABC",
+            "words": [
+                {"word": "A", "start": 0.0, "end": 0.2, "speaker": "SPEAKER_00"},
+                {"word": "B", "start": 0.2, "end": 0.4},
+                {"word": "C", "start": 0.4, "end": 0.6, "speaker": "SPEAKER_00"},
+            ],
+        }
+        segments = app.WhisperXTranscriber._to_segments([raw])
+        assert len(segments) == 1
+        assert segments[0].speaker == "A"
+        assert segments[0].text == "ABC"
+
+    def test_missing_first_word_speaker_does_not_break(self):
+        raw = {
+            "start": 0.0,
+            "end": 0.4,
+            "text": "AB",
+            "words": [
+                {"word": "A", "start": 0.0, "end": 0.2},
+                {"word": "B", "start": 0.2, "end": 0.4, "speaker": "SPEAKER_00"},
+            ],
+        }
+        segments = app.WhisperXTranscriber._to_segments([raw])
+        assert len(segments) == 1
+        assert segments[0].speaker == "A"
+
+    def test_missing_words_falls_back_to_segment_level_speaker(self):
+        raw = {"start": 0.0, "end": 1.0, "text": "hello", "speaker": "SPEAKER_00"}
+        segments = app.WhisperXTranscriber._to_segments([raw])
+        assert len(segments) == 1
+        assert segments[0].speaker == "A"
+        assert segments[0].text == "hello"
+
+    def test_diarization_disabled_yields_no_speaker(self):
+        raw = {"start": 0.0, "end": 1.0, "text": "hello"}
+        segments = app.WhisperXTranscriber._to_segments([raw])
+        assert len(segments) == 1
+        assert segments[0].speaker is None
+
+    def test_split_is_deterministic(self):
+        raw = {
+            "start": 0.0,
+            "end": 1.2,
+            "text": "你好嗎我很好",
+            "words": [
+                {"word": "你", "start": 0.0, "end": 0.2, "speaker": "SPEAKER_00"},
+                {"word": "好", "start": 0.2, "end": 0.4, "speaker": "SPEAKER_00"},
+                {"word": "嗎", "start": 0.4, "end": 0.6, "speaker": "SPEAKER_00"},
+                {"word": "我", "start": 0.6, "end": 0.8, "speaker": "SPEAKER_01"},
+                {"word": "很", "start": 0.8, "end": 1.0, "speaker": "SPEAKER_01"},
+                {"word": "好", "start": 1.0, "end": 1.2, "speaker": "SPEAKER_01"},
+            ],
+        }
+        first = app.WhisperXTranscriber._to_segments([raw])
+        second = app.WhisperXTranscriber._to_segments([raw])
+        assert first == second
+
+
+class StubPyannotePipeline:
+    """模擬 pyannote pipeline 的 `parameters`/`instantiate` 契約，供不依賴 whisperx 的測試。"""
+
+    def __init__(self, params):
+        self._params = params
+        self.instantiated_with = None
+
+    def parameters(self, instantiated=True):
+        return self._params
+
+    def instantiate(self, params):
+        self.instantiated_with = params
+
+
+class TestClusteringThreshold(unittest.TestCase):
+    """分群門檻可設定與參數保留行為（tasks.md 第 4 節）。"""
+
+    def test_unset_threshold_keeps_model_default(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DIARIZATION_CLUSTERING_THRESHOLD", None)
+            transcriber = app.WhisperXTranscriber()
+        assert transcriber._clustering_threshold is None
+
+    def test_env_var_threshold_is_parsed_into_transcriber(self):
+        with patch.dict(os.environ, {"DIARIZATION_CLUSTERING_THRESHOLD": "0.65"}):
+            transcriber = app.WhisperXTranscriber()
+        assert transcriber._clustering_threshold == 0.65
+
+    def test_configured_threshold_is_applied(self):
+        pipeline = StubPyannotePipeline(
+            {"clustering": {"threshold": 0.7, "method": "centroid"}}
+        )
+        applied = app._apply_clustering_threshold(pipeline, 0.9)
+        assert applied is True
+        assert pipeline.instantiated_with["clustering"]["threshold"] == 0.9
+
+    def test_override_preserves_other_existing_parameters(self):
+        pipeline = StubPyannotePipeline(
+            {
+                "clustering": {"threshold": 0.7, "method": "centroid"},
+                "segmentation": {"min_duration_off": 0.5},
+            }
+        )
+        app._apply_clustering_threshold(pipeline, 0.9)
+        assert pipeline.instantiated_with["clustering"]["method"] == "centroid"
+        assert pipeline.instantiated_with["segmentation"]["min_duration_off"] == 0.5
+
+    def test_internal_structure_access_failure_degrades_safely(self):
+        class BrokenPipeline:
+            def parameters(self, instantiated=True):
+                raise AttributeError("self.model 不存在")
+
+        applied = app._apply_clustering_threshold(BrokenPipeline(), 0.9)
+        assert applied is False
+
+    def test_missing_clustering_key_degrades_safely(self):
+        pipeline = StubPyannotePipeline({"segmentation": {"min_duration_off": 0.5}})
+        applied = app._apply_clustering_threshold(pipeline, 0.9)
+        assert applied is False

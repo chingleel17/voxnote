@@ -230,6 +230,97 @@ def load_audio_preprocessed(audio_path: Path) -> np.ndarray:
     return np.frombuffer(result.stdout, np.int16).astype(np.float32) / INT16_MAX_ABS
 
 
+def _needs_space_boundary(left: str, right: str) -> bool:
+    """判斷兩個相鄰字詞之間是否需要插入空白。
+
+    WhisperX 中文斷詞為單一漢字，重組時不應插入空白；英文縮寫（如 NAS、DEBUG）在
+    中文語境下也常被拆成單一字母的字詞（如 'D'、'E'、'B'...），故長度為 1 的字詞
+    一律視為緊鄰、不加空白，無論其為漢字或單一英數字元。只有兩側皆為長度大於 1
+    的英數字詞（真正的獨立英文單字，如 "OPS" 與 "電源" 之間、或兩個英文單字之間）
+    才需要空白分隔，否則會黏成一串無法閱讀。
+    """
+    if not left or not right:
+        return False
+    if len(left) == 1 or len(right) == 1:
+        return False
+    return left[-1].isascii() and left[-1].isalnum() and right[0].isascii() and right[0].isalnum()
+
+
+def _join_words(words: list[dict[str, Any]]) -> str:
+    """將字級 `word` 欄位重組為分段文字，依相鄰字詞的語言特性決定是否插入空白。"""
+    tokens = [str(word.get("word", "")).strip() for word in words]
+    tokens = [token for token in tokens if token]
+    if not tokens:
+        return ""
+    parts = [tokens[0]]
+    for previous, current in zip(tokens, tokens[1:]):
+        if _needs_space_boundary(previous, current):
+            parts.append(" ")
+        parts.append(current)
+    return "".join(parts).strip()
+
+
+def _first_word_time(words: list[dict[str, Any]], key: str) -> float | None:
+    """取字級清單中第一個含有效時間戳之字的值；forced alignment 可能遺漏個別字的時間戳。"""
+    for word in words:
+        value = word.get(key)
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _last_word_time(words: list[dict[str, Any]], key: str) -> float | None:
+    """取字級清單中最後一個含有效時間戳之字的值，用途同 `_first_word_time`。"""
+    for word in reversed(words):
+        value = word.get(key)
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _apply_clustering_threshold(pyannote_pipeline: Any, threshold: float) -> bool:
+    """覆寫 pyannote pipeline 的分群門檻，保留其餘既有參數，回傳是否成功套用。
+
+    WhisperX 的 `DiarizationPipeline` 不暴露分群超參數（上游 issue #1579 已標記
+    wontfix），門檻位於其包裝的底層 pyannote pipeline（`self.model`）。
+    pyannote 的 `instantiate()` 需要完整參數字典，僅傳入 `{"clustering":
+    {"threshold": x}}` 會使 `min_cluster_size`、segmentation 相關參數等其餘既有
+    設定遺失，故 MUST 先以 `parameters(instantiated=True)` 取得完整參數，覆寫
+    `clustering.threshold` 後整份傳回 `instantiate()`。
+
+    存取此內部結構或找不到預期的 `clustering.threshold` 鍵時視為失敗並回傳
+    False，呼叫端須降級為模型預設值、記錄 log，不得中斷轉錄。
+    """
+    try:
+        parameters = pyannote_pipeline.parameters(instantiated=True)
+    except Exception:
+        logger.warning("無法取得 pyannote pipeline 參數，分群門檻將採模型預設值", exc_info=True)
+        return False
+
+    clustering = parameters.get("clustering") if isinstance(parameters, dict) else None
+    if not isinstance(clustering, dict) or "threshold" not in clustering:
+        logger.warning(
+            "pyannote pipeline 參數不含 clustering.threshold（可用鍵：%s），"
+            "分群門檻將採模型預設值",
+            list(parameters.keys()) if isinstance(parameters, dict) else type(parameters),
+        )
+        return False
+
+    clustering["threshold"] = threshold
+    try:
+        pyannote_pipeline.instantiate(parameters)
+    except Exception:
+        logger.warning("套用分群門檻失敗，將採模型預設值", exc_info=True)
+        return False
+    return True
+
+
 def _speaker_code(index: int) -> str:
     """將語者序號轉為講者代號：0->A、25->Z、26->AA，超過 26 位仍可正確標示。"""
     code = ""
@@ -277,6 +368,19 @@ class WhisperXTranscriber:
         self._compute_type = os.getenv("ASR_COMPUTE_TYPE", "int8")
         self._batch_size = int(os.getenv("ASR_BATCH_SIZE", "8"))
 
+        # pyannote AHC 分群門檻（cosine 距離，範圍 0-2）。未設定時採模型預設值，
+        # 行為與本變更前一致；調低傾向拆細、調高傾向合併（見 server/README.md）。
+        self._clustering_threshold: float | None = None
+        threshold_raw = os.getenv("DIARIZATION_CLUSTERING_THRESHOLD", "").strip()
+        if threshold_raw:
+            try:
+                self._clustering_threshold = float(threshold_raw)
+            except ValueError:
+                logger.warning(
+                    "DIARIZATION_CLUSTERING_THRESHOLD 非合法數值：%s，將採模型預設值",
+                    threshold_raw,
+                )
+
     def _ensure_asr_model(self) -> Any:
         """惰性載入 ASR 轉錄模型（依 ASR_MODEL 設定）。"""
         if self._asr_model is None:
@@ -318,6 +422,12 @@ class WhisperXTranscriber:
                 token=hf_token,
                 device=self._device,
             )
+            if self._clustering_threshold is not None:
+                # DiarizationPipeline 包裝底層 pyannote pipeline 於 self.model；
+                # 此為未公開介面，版本升級可能變動（詳見 _apply_clustering_threshold）
+                _apply_clustering_threshold(
+                    self._diarize_pipeline.model, self._clustering_threshold
+                )
         return self._diarize_pipeline
 
     def transcribe(
@@ -396,29 +506,125 @@ class WhisperXTranscriber:
 
     @staticmethod
     def _to_segments(raw_segments: list[dict[str, Any]]) -> list[TranscriptSegment]:
-        """將 WhisperX segments 轉為 TranscriptSegment，語者標籤正規化為講者 A、B、C。"""
+        """將 WhisperX segments 轉為 TranscriptSegment，語者標籤正規化為講者 A、B、C。
+
+        `assign_word_speakers` 已產生字級講者標籤（`words[i]["speaker"]`），故以此
+        切分：相鄰字講者不同時切開為獨立分段，時間戳取自該分段涵蓋的字級區間。
+        `words` 缺失或不含任何講者標籤時（未啟用語者分離、或對齊失敗），退回既有的
+        segment 層級行為。
+        """
         speaker_map: dict[str, str] = {}
+
+        def resolve_label(raw_speaker: str | None) -> str | None:
+            if not raw_speaker:
+                return None
+            # pyannote 輸出如 SPEAKER_00，正規化為由 A 起算的講者代號
+            if raw_speaker not in speaker_map:
+                speaker_map[raw_speaker] = _speaker_code(len(speaker_map))
+            return speaker_map[raw_speaker]
+
         segments: list[TranscriptSegment] = []
         for raw in raw_segments:
+            words = raw.get("words")
+            has_word_speakers = bool(words) and any(
+                isinstance(word, dict) and word.get("speaker") for word in words
+            )
+            if not has_word_speakers:
+                text = str(raw.get("text", "")).strip()
+                if not text:
+                    continue
+                segments.append(
+                    TranscriptSegment(
+                        start=float(raw.get("start", 0.0)),
+                        end=float(raw.get("end", 0.0)),
+                        text=text,
+                        speaker=resolve_label(raw.get("speaker")),
+                    )
+                )
+                continue
+
+            segments.extend(WhisperXTranscriber._split_segment_by_word_speaker(raw, words, resolve_label))
+        return segments
+
+    @staticmethod
+    def _split_segment_by_word_speaker(
+        raw: dict[str, Any],
+        words: list[Any],
+        resolve_label: Callable[[str | None], str | None],
+    ) -> list[TranscriptSegment]:
+        """依字級講者標籤將單一 segment 切分為多個分段。
+
+        缺漏標籤的字沿用前一字的標籤（whisperX issue #1072：`assign_word_speakers`
+        會間歇性遺漏部分字的 speaker 鍵，缺值代表資訊未知而非講者變更）。段落首字
+        即缺漏時，沿用該 segment 內第一個有標籤之字的標籤；全數缺漏時視為單一講者
+        （等同未分離）。
+        """
+        segment_start = float(raw.get("start", 0.0))
+        segment_end = float(raw.get("end", 0.0))
+
+        # 段落首字缺漏標籤時，以第一個有標籤的字回填，避免整段落入 None 講者
+        carry_speaker: str | None = None
+        for word in words:
+            if isinstance(word, dict) and word.get("speaker"):
+                carry_speaker = str(word["speaker"])
+                break
+
+        runs: list[tuple[str | None, list[dict[str, Any]]]] = []
+        for word in words:
+            if not isinstance(word, dict):
+                continue
+            raw_speaker = word.get("speaker")
+            if raw_speaker:
+                carry_speaker = str(raw_speaker)
+            if runs and runs[-1][0] == carry_speaker:
+                runs[-1][1].append(word)
+            else:
+                runs.append((carry_speaker, [word]))
+
+        if not runs:
             text = str(raw.get("text", "")).strip()
             if not text:
-                continue
-            speaker_label: str | None = None
-            raw_speaker = raw.get("speaker")
-            if raw_speaker:
-                # pyannote 輸出如 SPEAKER_00，正規化為由 A 起算的講者代號
-                if raw_speaker not in speaker_map:
-                    speaker_map[raw_speaker] = _speaker_code(len(speaker_map))
-                speaker_label = speaker_map[raw_speaker]
-            segments.append(
+                return []
+            return [
                 TranscriptSegment(
-                    start=float(raw.get("start", 0.0)),
-                    end=float(raw.get("end", 0.0)),
+                    start=segment_start,
+                    end=segment_end,
                     text=text,
-                    speaker=speaker_label,
+                    speaker=resolve_label(raw.get("speaker")),
+                )
+            ]
+
+        if len(runs) == 1:
+            # 講者一致：不切分，維持原 segment 文字與時間戳（逐字重組可能因語言
+            # 相依的分隔規則與原文不同，故直接沿用原文避免無謂差異）
+            text = str(raw.get("text", "")).strip()
+            if not text:
+                return []
+            return [
+                TranscriptSegment(
+                    start=segment_start,
+                    end=segment_end,
+                    text=text,
+                    speaker=resolve_label(runs[0][0]),
+                )
+            ]
+
+        result: list[TranscriptSegment] = []
+        for run_speaker, run_words in runs:
+            text = _join_words(run_words)
+            if not text:
+                continue
+            start = _first_word_time(run_words, "start")
+            end = _last_word_time(run_words, "end")
+            result.append(
+                TranscriptSegment(
+                    start=start if start is not None else segment_start,
+                    end=end if end is not None else segment_end,
+                    text=text,
+                    speaker=resolve_label(run_speaker),
                 )
             )
-        return segments
+        return result
 
 
 class IncrementalTranscriber:
