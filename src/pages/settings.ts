@@ -159,6 +159,7 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
       asr_language: updated.asr_language,
       speaker_detection: updated.speaker_detection,
       auto_proofread_after_transcription: updated.auto_proofread_after_transcription,
+      voiceprint_similarity_threshold: updated.voiceprint_similarity_threshold,
     };
     setCurrentConfig(config);
     scheduleAutoSave();
@@ -388,6 +389,32 @@ function buildAsrSection(
   endpointRow.append(endpointInput, testServerBtn);
   endpointGroup.append(endpointLabel, endpointRow);
   localServerSection.appendChild(endpointGroup);
+
+  // 講者聲紋比對相似度門檻：僅本地 ASR 供應商可用（AssemblyAI 為黑箱 API，
+  // 不暴露嵌入向量），故置於 localServerSection 內，隨供應商切換一併顯示/隱藏。
+  const voiceprintThresholdGroup = document.createElement('div');
+  voiceprintThresholdGroup.className = 'form-group';
+  const voiceprintThresholdLabel = document.createElement('label');
+  voiceprintThresholdLabel.textContent = '聲紋比對相似度門檻';
+  const voiceprintThresholdInput = document.createElement('input');
+  voiceprintThresholdInput.type = 'number';
+  voiceprintThresholdInput.className = 'form-control';
+  voiceprintThresholdInput.min = '0';
+  voiceprintThresholdInput.max = '2';
+  voiceprintThresholdInput.step = '0.05';
+  voiceprintThresholdInput.value = String(config.voiceprint_similarity_threshold ?? 0.25);
+  voiceprintThresholdInput.addEventListener('input', () => {
+    const parsed = Number(voiceprintThresholdInput.value);
+    if (Number.isNaN(parsed)) return;
+    config = { ...config, voiceprint_similarity_threshold: parsed };
+    onChange(config);
+  });
+  const voiceprintThresholdHint = document.createElement('small');
+  voiceprintThresholdHint.className = 'form-hint';
+  voiceprintThresholdHint.textContent =
+    '僅本地 ASR 供應商適用。數值為 cosine 距離（0–2，愈小代表愈相似），低於此門檻才會提議合併講者代號或跨會議候選人名；預設 0.25 為保守值，可依實際錄音調整。';
+  voiceprintThresholdGroup.append(voiceprintThresholdLabel, voiceprintThresholdInput, voiceprintThresholdHint);
+  localServerSection.appendChild(voiceprintThresholdGroup);
 
   advancedBody.appendChild(localServerSection);
 

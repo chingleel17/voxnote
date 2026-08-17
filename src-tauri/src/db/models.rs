@@ -153,6 +153,32 @@ pub struct UpdateMeetingRequest {
     pub meeting_date: Option<String>,
 }
 
+/// 繫結至 `saved_participants` 的聲紋記錄，經使用者確認講者對應時寫入。
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct Voiceprint {
+    pub id: String,
+    pub participant_id: String,
+    pub model: String,
+    /// f32 向量的 JSON 陣列序列化（見 `db::voiceprint` 模組註解）
+    pub vector: String,
+    pub created_at: String,
+}
+
+/// 錄音段落層級的講者嵌入向量暫存，供使用者確認講者對應前的段落內合併與
+/// 會議內串接比對使用。
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingSpeakerEmbedding {
+    pub id: String,
+    pub meeting_id: String,
+    pub recording_id: String,
+    pub speaker_label: String,
+    pub model: String,
+    pub vector: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Tag {
     pub id: String,

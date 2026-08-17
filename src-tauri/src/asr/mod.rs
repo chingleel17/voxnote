@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::time::Instant;
 
 // 整體請求逾時。長會議錄音的處理時間可觀：實測 158 分鐘的錄音，僅音訊前處理即需
@@ -22,6 +23,22 @@ struct LocalServerTranscription {
     text: String,
     #[serde(default)]
     segments: Vec<LocalServerSegment>,
+    // 講者嵌入向量：鍵為講者代號（A/B/C），與 segments 的 speaker 一致；僅本地 ASR
+    // 啟用語者分離且成功取得向量時附上，其餘情況（AssemblyAI、未啟用語者分離、
+    // 服務端取得向量失敗）皆從缺，故為選填欄位，沿用既有 #[serde(default)] 慣例。
+    #[serde(default)]
+    speaker_embeddings: Option<HashMap<String, Vec<f32>>>,
+    #[serde(default)]
+    diarization_model: Option<String>,
+}
+
+/// `transcribe_voxnote_asr` 的完整回傳，供呼叫端在格式化文字之外取得講者嵌入
+/// 向量以供聲紋比對；向量僅本地 ASR 供應商啟用語者分離時可能存在。
+#[derive(Debug, Clone)]
+pub struct VoxnoteAsrResult {
+    pub text: String,
+    pub speaker_embeddings: HashMap<String, Vec<f32>>,
+    pub diarization_model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,7 +238,7 @@ pub async fn transcribe_voxnote_asr(
     // 預期講者人數，取自會議與會人員數；0 代表未知，交由 pyannote 自動偵測
     speakers_expected: u32,
     progress_cb: impl Fn(String),
-) -> Result<String> {
+) -> Result<VoxnoteAsrResult> {
     let file_bytes = tokio::fs::read(file_path)
         .await
         .map_err(|e| anyhow!("無法讀取音訊檔案：{}", e))?;
@@ -305,7 +322,7 @@ pub async fn transcribe_live_caption_remote(
         .json()
         .await
         .map_err(|e| anyhow!("無法解析即時字幕遠端回應：{}", e))?;
-    format_local_asr_result(result, false)
+    format_local_asr_result(&result, false)
 }
 
 /// 呼叫低延遲增量端點。此端點只回傳純文字，不經批次的對齊與語者分離流程。
@@ -368,7 +385,7 @@ async fn transcribe_voxnote_asr_bytes(
     speaker_detection: bool,
     speakers_expected: u32,
     progress_cb: impl Fn(String),
-) -> Result<String> {
+) -> Result<VoxnoteAsrResult> {
     let base_url = normalize_local_asr_url(base_url)?;
     let form = build_local_asr_form(
         file_name,
@@ -453,7 +470,12 @@ async fn transcribe_voxnote_asr_bytes(
                 let result = task
                     .result
                     .ok_or_else(|| anyhow!("本地 ASR 任務完成但未回傳結果"))?;
-                return format_local_asr_result(result, speaker_detection);
+                let text = format_local_asr_result(&result, speaker_detection)?;
+                return Ok(VoxnoteAsrResult {
+                    text,
+                    speaker_embeddings: result.speaker_embeddings.unwrap_or_default(),
+                    diarization_model: result.diarization_model,
+                });
             }
             "failed" => {
                 return Err(anyhow!(
@@ -526,7 +548,7 @@ fn map_local_asr_request_error(error: reqwest::Error, action: &str) -> anyhow::E
 }
 
 fn format_local_asr_result(
-    result: LocalServerTranscription,
+    result: &LocalServerTranscription,
     speaker_detection: bool,
 ) -> Result<String> {
     if speaker_detection && !result.segments.is_empty() {
@@ -551,7 +573,7 @@ fn format_local_asr_result(
     if result.text.trim().is_empty() {
         return Err(anyhow!("本地 ASR 伺服器未回傳逐字稿"));
     }
-    Ok(result.text)
+    Ok(result.text.clone())
 }
 
 fn encode_pcm_wav(samples: &[f32]) -> Vec<u8> {

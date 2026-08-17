@@ -321,6 +321,32 @@ def _apply_clustering_threshold(pyannote_pipeline: Any, threshold: float) -> boo
     return True
 
 
+def _map_embeddings_to_labels(
+    raw_embeddings: Any | None, speaker_map: dict[str, str]
+) -> dict[str, list[float]]:
+    """將 pyannote 原始講者 ID 的嵌入向量對應到正規化後的講者代號（A/B/C）。
+
+    `speaker_map` 僅含實際被指派到字的講者（見 `_to_segments`）；未出現在字級
+    標籤中的講者向量無正規化代號可用，予以捨棄而非猜測標籤，避免向量與逐字稿中
+    的講者代號錯位。
+    """
+    if raw_embeddings is None:
+        return {}
+
+    embeddings: dict[str, list[float]] = {}
+    try:
+        items = raw_embeddings.items() if hasattr(raw_embeddings, "items") else []
+        for raw_speaker, vector in items:
+            label = speaker_map.get(str(raw_speaker))
+            if label is None:
+                continue
+            embeddings[label] = [float(value) for value in np.asarray(vector).flatten().tolist()]
+    except Exception:
+        logger.warning("解析語者嵌入向量失敗，將略過聲紋比對欄位", exc_info=True)
+        return {}
+    return embeddings
+
+
 def _speaker_code(index: int) -> str:
     """將語者序號轉為講者代號：0->A、25->Z、26->AA，超過 26 位仍可正確標示。"""
     code = ""
@@ -381,6 +407,11 @@ class WhisperXTranscriber:
                     threshold_raw,
                 )
 
+    @property
+    def diarization_model(self) -> str:
+        """產生語者嵌入向量的 diarization 模型識別，供聲紋比對記錄來源模型。"""
+        return self._diarization_model
+
     def _ensure_asr_model(self) -> Any:
         """惰性載入 ASR 轉錄模型（依 ASR_MODEL 設定）。"""
         if self._asr_model is None:
@@ -438,7 +469,7 @@ class WhisperXTranscriber:
         min_speakers: int | None,
         max_speakers: int | None,
         progress_callback: Callable[[int], None] | None = None,
-    ) -> list[TranscriptSegment]:
+    ) -> tuple[list[TranscriptSegment], dict[str, list[float]]]:
         """執行轉錄、詞級對齊及可選的語者分離。"""
         import whisperx
 
@@ -490,6 +521,7 @@ class WhisperXTranscriber:
             progress_callback(66)
 
         # 3. 可選的語者分離
+        raw_embeddings: dict[str, Any] | None = None
         if diarize:
             diarize_pipeline = self._ensure_diarize_pipeline()
             diarize_kwargs: dict[str, int] = {}
@@ -497,21 +529,36 @@ class WhisperXTranscriber:
                 diarize_kwargs["min_speakers"] = min_speakers
             if max_speakers:
                 diarize_kwargs["max_speakers"] = max_speakers
-            diarize_segments = diarize_pipeline(audio, **diarize_kwargs)
+            try:
+                diarize_segments, raw_embeddings = diarize_pipeline(
+                    audio, return_embeddings=True, **diarize_kwargs
+                )
+            except Exception:
+                # 向量僅為附加資訊，取得失敗不應中斷語者分離本身
+                logger.warning("取得語者嵌入向量失敗，將略過聲紋比對欄位", exc_info=True)
+                diarize_segments = diarize_pipeline(audio, **diarize_kwargs)
+                raw_embeddings = None
             result = whisperx.assign_word_speakers(diarize_segments, result)
 
         if progress_callback:
             progress_callback(100)
-        return self._to_segments(result.get("segments", []))
+        segments, speaker_map = self._to_segments(result.get("segments", []))
+        embeddings = _map_embeddings_to_labels(raw_embeddings, speaker_map)
+        return segments, embeddings
 
     @staticmethod
-    def _to_segments(raw_segments: list[dict[str, Any]]) -> list[TranscriptSegment]:
+    def _to_segments(
+        raw_segments: list[dict[str, Any]],
+    ) -> tuple[list[TranscriptSegment], dict[str, str]]:
         """將 WhisperX segments 轉為 TranscriptSegment，語者標籤正規化為講者 A、B、C。
 
         `assign_word_speakers` 已產生字級講者標籤（`words[i]["speaker"]`），故以此
         切分：相鄰字講者不同時切開為獨立分段，時間戳取自該分段涵蓋的字級區間。
         `words` 缺失或不含任何講者標籤時（未啟用語者分離、或對齊失敗），退回既有的
         segment 層級行為。
+
+        回傳的 `speaker_map` 為 pyannote 原始講者 ID（如 SPEAKER_00）到正規化代號
+        （A/B/C）的對應，供呼叫端將講者嵌入向量對應到相同的講者代號。
         """
         speaker_map: dict[str, str] = {}
 
@@ -544,7 +591,7 @@ class WhisperXTranscriber:
                 continue
 
             segments.extend(WhisperXTranscriber._split_segment_by_word_speaker(raw, words, resolve_label))
-        return segments
+        return segments, speaker_map
 
     @staticmethod
     def _split_segment_by_word_speaker(
@@ -811,7 +858,7 @@ async def _transcribe_audio(
     progress_callback: Callable[[int], None] | None = None,
 ) -> dict[str, object]:
     """執行共用的轉錄與輸出格式化流程。"""
-    segments = await run_in_threadpool(
+    segments, embeddings = await run_in_threadpool(
         transcriber.transcribe,
         audio_path,
         language if language and language != "auto" else None,
@@ -821,12 +868,18 @@ async def _transcribe_audio(
         progress_callback,
     )
     normalized_segments = [normalize_segment(segment, diarize) for segment in segments]
-    return {
+    response: dict[str, object] = {
         "text": "\n".join(str(segment["text"]) for segment in normalized_segments),
         "segments": normalized_segments,
         "language": language or "auto",
         "diarization_enabled": diarize,
     }
+    # 向量欄位僅於啟用語者分離且成功取得向量時附上；未啟用時完全不含此欄位，
+    # 供舊版客戶端與測試明確區分「未分離」與「分離但向量取得失敗」
+    if diarize and embeddings:
+        response["speaker_embeddings"] = embeddings
+        response["diarization_model"] = transcriber.diarization_model
+    return response
 
 
 async def _run_transcription_task(

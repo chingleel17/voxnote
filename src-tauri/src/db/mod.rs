@@ -17,6 +17,7 @@ pub mod speaker_mapping;
 pub mod summary;
 pub mod tag;
 pub mod transcript;
+pub mod voiceprint;
 
 const MIGRATION_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS categories (
@@ -117,6 +118,41 @@ CREATE TABLE IF NOT EXISTS saved_participants (
     created_at TEXT NOT NULL
 );
 
+-- 講者嵌入向量，繫結至 saved_participants（跨會議的全域參與者），供跨會議聲紋
+-- 比對使用。一位參與者可累積多筆聲紋（見 add-speaker-voiceprint-matching design
+-- 決策 4），故不對 participant_id 建唯一約束。model 欄位記錄產生向量的
+-- diarization 模型識別，比對時 MUST 僅納入 model 相符者（模型變更後向量空間不可
+-- 互比，見 design 決策 3）。vector 以 JSON 陣列（f32 列表）序列化為 TEXT，
+-- 與 recording_speaker_embeddings 格式一致；backup.rs 對此表採一般文字欄位的
+-- SELECT * 複製，無需特殊處理。
+-- 注意：saved_participants 以 name 唯一，兩位同名參與者會共用聲紋記錄並產生
+-- 混淆，此為既有資料模型的固有限制，本表不處理。
+CREATE TABLE IF NOT EXISTS voiceprints (
+    id TEXT PRIMARY KEY,
+    participant_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    vector TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (participant_id) REFERENCES saved_participants(id) ON DELETE CASCADE
+);
+
+-- 錄音段落層級的講者嵌入向量暫存，供使用者確認講者對應前的段落內合併與會議內
+-- 串接比對使用（此二層不需聲紋庫）。轉錄完成且附有向量時即寫入，不需使用者
+-- 確認；使用者確認講者對應時，對應向量另外複製一份寫入 voiceprints 並繫結
+-- saved_participants（見 add-speaker-voiceprint-matching design 決策 2.1）。
+CREATE TABLE IF NOT EXISTS recording_speaker_embeddings (
+    id TEXT PRIMARY KEY,
+    meeting_id TEXT NOT NULL,
+    recording_id TEXT NOT NULL,
+    speaker_label TEXT NOT NULL,
+    model TEXT NOT NULL,
+    vector TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(recording_id, speaker_label),
+    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE,
+    FOREIGN KEY (recording_id) REFERENCES recordings(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS meeting_templates (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -156,6 +192,12 @@ CREATE INDEX IF NOT EXISTS idx_summaries_meeting_id
 
 CREATE INDEX IF NOT EXISTS idx_meeting_tags_tag_meeting
     ON meeting_tags(tag_id, meeting_id);
+
+CREATE INDEX IF NOT EXISTS idx_voiceprints_participant_model
+    ON voiceprints(participant_id, model);
+
+CREATE INDEX IF NOT EXISTS idx_recording_speaker_embeddings_meeting
+    ON recording_speaker_embeddings(meeting_id, model);
 "#;
 
 pub async fn init_db(app: &AppHandle) -> Result<SqlitePool> {

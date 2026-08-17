@@ -22,7 +22,9 @@ def fake_result(audio_path: Path, language, diarize, min_speakers, max_speakers,
         callback(33)
         callback(66)
         callback(100)
-    return [app.TranscriptSegment(0.0, 1.0, "測試結果", "A" if diarize else None)]
+    segments = [app.TranscriptSegment(0.0, 1.0, "測試結果", "A" if diarize else None)]
+    embeddings = {"A": [0.1, 0.2, 0.3]} if diarize else {}
+    return segments, embeddings
 
 
 class TestTranscriptionApi(unittest.TestCase):
@@ -58,6 +60,72 @@ class TestTranscriptionApi(unittest.TestCase):
         with patch.object(app.transcriber, "transcribe", fake_result):
             self.run_async(scenario())
 
+
+    def test_diarize_response_includes_embeddings_and_model(self):
+        async def scenario():
+            async with client() as http:
+                response = await http.post(
+                    "/v1/audio/transcriptions",
+                    files={"file": ("test.wav", b"audio", "audio/wav")},
+                    data={"sync": "true", "diarize": "true"},
+                )
+                assert response.status_code == 200
+                payload = response.json()
+                assert payload["speaker_embeddings"] == {"A": [0.1, 0.2, 0.3]}
+                assert payload["diarization_model"] == app.transcriber.diarization_model
+
+        with patch.object(app.transcriber, "transcribe", fake_result):
+            self.run_async(scenario())
+
+    def test_embedding_keys_match_segment_speaker_labels(self):
+        async def scenario():
+            async with client() as http:
+                response = await http.post(
+                    "/v1/audio/transcriptions",
+                    files={"file": ("test.wav", b"audio", "audio/wav")},
+                    data={"sync": "true", "diarize": "true"},
+                )
+                payload = response.json()
+                segment_speakers = {segment["speaker"] for segment in payload["segments"]}
+                assert set(payload["speaker_embeddings"].keys()) == segment_speakers
+
+        with patch.object(app.transcriber, "transcribe", fake_result):
+            self.run_async(scenario())
+
+    def test_non_diarized_response_omits_embeddings(self):
+        async def scenario():
+            async with client() as http:
+                response = await http.post(
+                    "/v1/audio/transcriptions",
+                    files={"file": ("test.wav", b"audio", "audio/wav")},
+                    data={"sync": "true"},
+                )
+                payload = response.json()
+                assert "speaker_embeddings" not in payload
+                assert "diarization_model" not in payload
+
+        with patch.object(app.transcriber, "transcribe", fake_result):
+            self.run_async(scenario())
+
+    def test_embedding_extraction_failure_does_not_break_transcription(self):
+        def result_without_embeddings(audio_path, language, diarize, min_speakers, max_speakers, callback=None):
+            segments = [app.TranscriptSegment(0.0, 1.0, "測試結果", "A" if diarize else None)]
+            return segments, {}
+
+        async def scenario():
+            async with client() as http:
+                response = await http.post(
+                    "/v1/audio/transcriptions",
+                    files={"file": ("test.wav", b"audio", "audio/wav")},
+                    data={"sync": "true", "diarize": "true"},
+                )
+                assert response.status_code == 200
+                payload = response.json()
+                assert payload["text"] == "測試結果"
+                assert "speaker_embeddings" not in payload
+
+        with patch.object(app.transcriber, "transcribe", result_without_embeddings):
+            self.run_async(scenario())
 
     def test_sync_mode_returns_result_without_task(self):
         async def scenario():
@@ -106,7 +174,7 @@ class TestTranscriptionApi(unittest.TestCase):
             active += 1
             maximum = max(maximum, active)
             active -= 1
-            return [app.TranscriptSegment(0.0, 1.0, "完成")]
+            return [app.TranscriptSegment(0.0, 1.0, "完成")], {}
 
         async def scenario():
             async with client() as http:
@@ -136,7 +204,7 @@ class TestTranscriptionApi(unittest.TestCase):
             maximum = max(maximum, active)
             time.sleep(0.02)
             active -= 1
-            return [app.TranscriptSegment(0.0, 1.0, "完成")]
+            return [app.TranscriptSegment(0.0, 1.0, "完成")], {}
 
         async def scenario():
             async with client() as http:
@@ -211,7 +279,7 @@ class TestToSegments(unittest.TestCase):
                 {"word": "好", "start": 0.4, "end": 0.6, "speaker": "SPEAKER_01"},
             ],
         }
-        segments = app.WhisperXTranscriber._to_segments([raw])
+        segments, _ = app.WhisperXTranscriber._to_segments([raw])
         assert [s.text for s in segments] == ["大", "家好"]
 
     def test_word_reconstruction_does_not_space_out_english_acronyms(self):
@@ -233,7 +301,7 @@ class TestToSegments(unittest.TestCase):
                 {"word": "的", "start": 0.9, "end": 1.0, "speaker": "SPEAKER_00"},
             ],
         }
-        segments = app.WhisperXTranscriber._to_segments([raw])
+        segments, _ = app.WhisperXTranscriber._to_segments([raw])
         assert len(segments) == 1
         assert segments[0].text == "他們在測DEBUG的"
 
@@ -247,7 +315,7 @@ class TestToSegments(unittest.TestCase):
                 {"word": "world", "start": 0.4, "end": 0.8, "speaker": "SPEAKER_00"},
             ],
         }
-        segments = app.WhisperXTranscriber._to_segments([raw])
+        segments, _ = app.WhisperXTranscriber._to_segments([raw])
         assert len(segments) == 1
         assert segments[0].text == "hello world"
 
@@ -266,7 +334,7 @@ class TestToSegments(unittest.TestCase):
                 {"word": "好", "start": 1.0, "end": 1.2, "speaker": "SPEAKER_01"},
             ],
         }
-        segments = app.WhisperXTranscriber._to_segments([raw])
+        segments, _ = app.WhisperXTranscriber._to_segments([raw])
         assert len(segments) == 2
         assert segments[0].speaker == "A"
         assert segments[1].speaker == "B"
@@ -283,7 +351,7 @@ class TestToSegments(unittest.TestCase):
                 {"word": "好", "start": 0.4, "end": 0.6, "speaker": "SPEAKER_00"},
             ],
         }
-        segments = app.WhisperXTranscriber._to_segments([raw])
+        segments, _ = app.WhisperXTranscriber._to_segments([raw])
         assert len(segments) == 1
         assert segments[0].text == "大家好"
         assert segments[0].speaker == "A"
@@ -302,7 +370,7 @@ class TestToSegments(unittest.TestCase):
                 {"word": "好", "start": 1.0, "end": 1.2, "speaker": "SPEAKER_01"},
             ],
         }
-        segments = app.WhisperXTranscriber._to_segments([raw])
+        segments, _ = app.WhisperXTranscriber._to_segments([raw])
         assert segments[0].start == 0.0
         assert segments[0].end == 0.6
         assert segments[1].start == 0.6
@@ -319,7 +387,7 @@ class TestToSegments(unittest.TestCase):
                 {"word": "C", "start": 0.4, "end": 0.6, "speaker": "SPEAKER_00"},
             ],
         }
-        segments = app.WhisperXTranscriber._to_segments([raw])
+        segments, _ = app.WhisperXTranscriber._to_segments([raw])
         assert len(segments) == 1
         assert segments[0].speaker == "A"
         assert segments[0].text == "ABC"
@@ -334,20 +402,20 @@ class TestToSegments(unittest.TestCase):
                 {"word": "B", "start": 0.2, "end": 0.4, "speaker": "SPEAKER_00"},
             ],
         }
-        segments = app.WhisperXTranscriber._to_segments([raw])
+        segments, _ = app.WhisperXTranscriber._to_segments([raw])
         assert len(segments) == 1
         assert segments[0].speaker == "A"
 
     def test_missing_words_falls_back_to_segment_level_speaker(self):
         raw = {"start": 0.0, "end": 1.0, "text": "hello", "speaker": "SPEAKER_00"}
-        segments = app.WhisperXTranscriber._to_segments([raw])
+        segments, _ = app.WhisperXTranscriber._to_segments([raw])
         assert len(segments) == 1
         assert segments[0].speaker == "A"
         assert segments[0].text == "hello"
 
     def test_diarization_disabled_yields_no_speaker(self):
         raw = {"start": 0.0, "end": 1.0, "text": "hello"}
-        segments = app.WhisperXTranscriber._to_segments([raw])
+        segments, _ = app.WhisperXTranscriber._to_segments([raw])
         assert len(segments) == 1
         assert segments[0].speaker is None
 
@@ -368,6 +436,26 @@ class TestToSegments(unittest.TestCase):
         first = app.WhisperXTranscriber._to_segments([raw])
         second = app.WhisperXTranscriber._to_segments([raw])
         assert first == second
+
+
+class TestMapEmbeddingsToLabels(unittest.TestCase):
+    """`_map_embeddings_to_labels` 的講者代號對應行為（tasks.md 第 1 節）。"""
+
+    def test_maps_raw_speaker_ids_to_normalized_labels(self):
+        raw_embeddings = {"SPEAKER_00": [0.1, 0.2], "SPEAKER_01": [0.3, 0.4]}
+        speaker_map = {"SPEAKER_00": "A", "SPEAKER_01": "B"}
+        result = app._map_embeddings_to_labels(raw_embeddings, speaker_map)
+        assert result == {"A": [0.1, 0.2], "B": [0.3, 0.4]}
+
+    def test_drops_speakers_absent_from_speaker_map(self):
+        # SPEAKER_02 從未被指派到任何字，speaker_map 中無對應代號
+        raw_embeddings = {"SPEAKER_00": [0.1], "SPEAKER_02": [0.9]}
+        speaker_map = {"SPEAKER_00": "A"}
+        result = app._map_embeddings_to_labels(raw_embeddings, speaker_map)
+        assert result == {"A": [0.1]}
+
+    def test_none_embeddings_returns_empty_dict(self):
+        assert app._map_embeddings_to_labels(None, {"SPEAKER_00": "A"}) == {}
 
 
 class StubPyannotePipeline:

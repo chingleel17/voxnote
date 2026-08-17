@@ -33,11 +33,19 @@ VoxNote 的語者分離以錄音段落為單位執行，講者代號每段從 A 
 
 ### 決策 2：聲紋獨立資料表，繫結 `saved_participants`
 
-新增聲紋表，以 `saved_participants.id` 為外鍵，並記錄產生模型識別、向量本體與建立時間。允許同一參與者多筆聲紋。
+新增聲紋表 `voiceprints`，以 `saved_participants.id` 為外鍵，並記錄產生模型識別、向量本體與建立時間。允許同一參與者多筆聲紋。
 
 不將向量放入 `speaker_mappings` 或 `recording_speaker_mappings` 的新欄位：那兩張表以會議／錄音為範圍且每個 `speaker_label` 唯一，無法承載「一位參與者累積多筆聲紋」的關係。
 
 建表使用 `CREATE TABLE IF NOT EXISTS` 加入 `MIGRATION_SQL`，符合既有慣例且不影響既有欄位。
+
+#### 決策 2.1：轉錄完成到使用者確認之間的暫存層
+
+`voiceprints` 表僅承載「已確認身分」的聲紋，繫結 `saved_participants`。但轉錄完成的當下尚無人名——三層比對（段落內合併、會議內串接、跨會議辨識）的前兩層完全不需要聲紋庫，只需要「這場會議這幾個錄音段落，各自有哪些講者代號、各自的向量」，且此資料需在使用者確認之前就可跨錄音段落、跨 app 重啟取用。
+
+因此新增 `recording_speaker_embeddings` 表，鍵設計比照 `recording_speaker_mappings`：以 `(recording_id, speaker_label)` 唯一，記錄向量本體與模型識別。轉錄完成、附有向量時即寫入此表（不需使用者確認）；使用者確認講者對應時，系統另外將該筆向量複製一份寫入 `voiceprints` 並繫結對應的 `saved_participants`（決策 6 的寫入時機不變，僅資料來源改為讀取此暫存表）。
+
+此表 MUST 納入 `backup.rs` 的備份還原範圍，比照 `recording_speaker_mappings` 隨錄音一併複製；還原後段落內合併與會議內串接的比對資料才不致遺失。
 
 ### 決策 3：模型識別為必要欄位且參與過濾
 

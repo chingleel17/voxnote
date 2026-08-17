@@ -839,6 +839,39 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
   font-size: 13px;
 }
 
+.voiceprint-proposal-panel {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--color-border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.voiceprint-proposal-heading {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  margin-top: 4px;
+}
+
+.voiceprint-proposal-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 8px;
+  border-radius: var(--radius);
+  background: var(--color-bg-secondary);
+}
+
+.voiceprint-proposal-text {
+  font-size: 13px;
+  color: var(--color-text);
+  flex: 1 1 auto;
+  min-width: 200px;
+}
+
 .transcript-base-options {
   display: flex;
   flex-direction: column;

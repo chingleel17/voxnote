@@ -10,6 +10,13 @@ import { getSavedParticipants, upsertSavedParticipant } from '../api/participant
 import { deleteSpeakerMapping, getSpeakerMappings, upsertSpeakerMapping } from '../api/speakerMappings';
 import { createTemplate } from '../api/templates';
 import { getTags } from '../api/tags';
+import { getSettings } from '../api/settings';
+import {
+  confirmSpeakerVoiceprint,
+  getCrossMeetingIdentityProposals,
+  getCrossRecordingLinkProposals,
+  getWithinRecordingMergeProposals,
+} from '../api/voiceprints';
 import { openModal } from '../components/modal';
 import { showToast } from '../components/toast';
 import { applyMediaCrossOrigin, createWaveformPlayer } from '../components/audioPlayer';
@@ -127,6 +134,135 @@ function getMappedSpeakerName(
   speakerLabel: string,
 ): string {
   return mappingBySpeaker.get(getSpeakerMappingKey(recordingId, speakerLabel)) ?? speakerLabel;
+}
+
+/** 講者聲紋比對提議：僅本地 ASR 供應商可用，載入並附加至講者對應面板。 */
+async function loadVoiceprintProposals(
+  meetingId: string,
+  mappingPanel: HTMLElement,
+  onSpeakerMappingChanged: (recordingId: string, speakerLabel: string, participantName: string | null) => Promise<void>,
+): Promise<void> {
+  let config;
+  try {
+    config = await getSettings();
+  } catch {
+    return;
+  }
+  // AssemblyAI 為黑箱 API，不暴露嵌入向量，本能力僅本地 ASR 供應商啟用
+  if (config.asr_provider !== 'voxnote_asr') return;
+
+  const [mergeProposals, linkProposals, identityProposals] = await Promise.all([
+    getWithinRecordingMergeProposals(meetingId).catch(() => []),
+    getCrossRecordingLinkProposals(meetingId).catch(() => []),
+    getCrossMeetingIdentityProposals(meetingId).catch(() => []),
+  ]);
+
+  if (mergeProposals.length === 0 && linkProposals.length === 0 && identityProposals.length === 0) return;
+
+  const proposalPanel = document.createElement('div');
+  proposalPanel.className = 'voiceprint-proposal-panel';
+
+  const renderMergeSection = (title: string, proposals: typeof mergeProposals): void => {
+    if (proposals.length === 0) return;
+    const heading = document.createElement('div');
+    heading.className = 'voiceprint-proposal-heading';
+    heading.textContent = title;
+    proposalPanel.appendChild(heading);
+
+    for (const proposal of proposals) {
+      const row = document.createElement('div');
+      row.className = 'voiceprint-proposal-row';
+
+      const text = document.createElement('span');
+      text.className = 'voiceprint-proposal-text';
+      const percent = Math.round(proposal.similarity * 100);
+      text.textContent = `${proposal.speakerLabelA}（段落）與 ${proposal.speakerLabelB}（段落）可能是同一人（相似度 ${percent}%）`;
+      row.appendChild(text);
+
+      const applyBtn = document.createElement('button');
+      applyBtn.type = 'button';
+      applyBtn.className = 'btn btn-secondary btn-sm';
+      applyBtn.textContent = '套用';
+      applyBtn.addEventListener('click', async () => {
+        const name = window.prompt('請輸入這兩個講者代號的參與者姓名：');
+        if (!name || !name.trim()) return;
+        applyBtn.disabled = true;
+        try {
+          await onSpeakerMappingChanged(proposal.recordingIdA, proposal.speakerLabelA, name.trim());
+          await onSpeakerMappingChanged(proposal.recordingIdB, proposal.speakerLabelB, name.trim());
+          showToast('已套用講者合併提議', 'success');
+          row.remove();
+        } catch (err) {
+          showToast(`套用失敗：${String(err)}`, 'error');
+        } finally {
+          applyBtn.disabled = false;
+        }
+      });
+      row.appendChild(applyBtn);
+
+      const rejectBtn = document.createElement('button');
+      rejectBtn.type = 'button';
+      rejectBtn.className = 'btn btn-ghost btn-sm';
+      rejectBtn.textContent = '略過';
+      rejectBtn.addEventListener('click', () => row.remove());
+      row.appendChild(rejectBtn);
+
+      proposalPanel.appendChild(row);
+    }
+  };
+
+  renderMergeSection('段落內合併提議', mergeProposals);
+  renderMergeSection('跨段落串接提議', linkProposals);
+
+  if (identityProposals.length > 0) {
+    const heading = document.createElement('div');
+    heading.className = 'voiceprint-proposal-heading';
+    heading.textContent = '跨會議候選人名';
+    proposalPanel.appendChild(heading);
+
+    for (const proposal of identityProposals) {
+      const row = document.createElement('div');
+      row.className = 'voiceprint-proposal-row';
+
+      const text = document.createElement('span');
+      text.className = 'voiceprint-proposal-text';
+      const percent = Math.round(proposal.similarity * 100);
+      text.textContent = `${proposal.speakerLabel} 可能是「${proposal.participantName}」（相似度 ${percent}%）`;
+      row.appendChild(text);
+
+      const acceptBtn = document.createElement('button');
+      acceptBtn.type = 'button';
+      acceptBtn.className = 'btn btn-secondary btn-sm';
+      acceptBtn.textContent = '採納';
+      acceptBtn.addEventListener('click', async () => {
+        acceptBtn.disabled = true;
+        try {
+          await onSpeakerMappingChanged(proposal.recordingId, proposal.speakerLabel, proposal.participantName);
+          await confirmSpeakerVoiceprint(proposal.recordingId, proposal.speakerLabel, proposal.participantId);
+          showToast(`已採納「${proposal.participantName}」`, 'success');
+          row.remove();
+        } catch (err) {
+          showToast(`採納失敗：${String(err)}`, 'error');
+        } finally {
+          acceptBtn.disabled = false;
+        }
+      });
+      row.appendChild(acceptBtn);
+
+      const rejectBtn = document.createElement('button');
+      rejectBtn.type = 'button';
+      rejectBtn.className = 'btn btn-ghost btn-sm';
+      rejectBtn.textContent = '拒絕';
+      // 拒絕時講者對應維持原狀，且不寫入聲紋（見 speaker-voiceprint-matching
+      // 規格「使用者拒絕提議」情境）——僅從畫面移除，不呼叫任何寫入 API
+      rejectBtn.addEventListener('click', () => row.remove());
+      row.appendChild(rejectBtn);
+
+      proposalPanel.appendChild(row);
+    }
+  }
+
+  mappingPanel.appendChild(proposalPanel);
 }
 
 function getSpeakerClassName(speakerLabel: string): string {
@@ -1218,6 +1354,13 @@ function buildTranscriptSection(
   );
   if (mappingPanel) section.appendChild(mappingPanel);
   refreshMappingActivity();
+
+  // 講者聲紋比對提議：僅本地 ASR（voxnote_asr）供應商可用，AssemblyAI 不顯示
+  // 任何相關 UI（見 add-speaker-voiceprint-matching design「僅限本地 ASR」）。
+  // 非同步載入，不阻塞逐字稿區塊的初始渲染。
+  if (mappingPanel) {
+    void loadVoiceprintProposals(meetingId, mappingPanel, onSpeakerMappingChanged);
+  }
 
   const getTimeClickHandler = (recordingId: string): (timeInSeconds: number) => void => {
     return (timeInSeconds: number) => {

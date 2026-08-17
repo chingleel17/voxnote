@@ -8,11 +8,12 @@ mod commands;
 mod config;
 mod db;
 mod live_caption;
+mod voiceprint;
 
 use commands::{
     ai_cmds::*, asr_cmds::*, backup_cmds::*, live_caption_cmds::*, meeting_cmds::*,
     meeting_export_cmds::*, recording_cmds::*, settings_cmds::*, speaker_mapping_cmds::*,
-    summary_cmds::*, tag_cmds::*, template_cmds::*, transcript_cmds::*,
+    summary_cmds::*, tag_cmds::*, template_cmds::*, transcript_cmds::*, voiceprint_cmds::*,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -155,6 +156,11 @@ pub fn run() {
             export_full_backup,
             preflight_full_backup,
             import_full_backup,
+            // speaker voiceprint matching
+            get_within_recording_merge_proposals,
+            get_cross_recording_link_proposals,
+            get_cross_meeting_identity_proposals,
+            confirm_speaker_voiceprint,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

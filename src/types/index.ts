@@ -224,6 +224,28 @@ export interface AppConfig {
 
   // 完成通知
   completion_notification_enabled: boolean;
+
+  // 講者聲紋比對相似度門檻（cosine 距離，範圍 0–2，愈小愈相似）。僅本地 ASR
+  // 供應商適用；低於門檻才提議合併／串接／跨會議候選人名。
+  voiceprint_similarity_threshold: number;
+}
+
+/// 段落內合併 / 會議內串接提議：兩個講者代號的相似度達門檻，建議視為同一人。
+export interface MergeProposal {
+  recordingIdA: string;
+  speakerLabelA: string;
+  recordingIdB: string;
+  speakerLabelB: string;
+  similarity: number;
+}
+
+/// 跨會議辨識提議：某講者代號與聲紋庫中某參與者相似度達門檻。
+export interface IdentityProposal {
+  recordingId: string;
+  speakerLabel: string;
+  participantId: string;
+  participantName: string;
+  similarity: number;
 }
 
 export interface SavedParticipant {

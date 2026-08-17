@@ -78,6 +78,13 @@ pub struct AppConfig {
 
     // Windows 完成通知
     pub completion_notification_enabled: bool,
+
+    // 講者聲紋比對相似度門檻（cosine 距離，範圍 0–2，愈小愈相似）。僅本地 ASR
+    // 供應商適用；低於門檻（距離 <= 此值）才提議合併／串接／跨會議候選人名，
+    // MUST NOT 硬編碼、MUST 保守，避免使用者習慣性採納錯誤建議（見
+    // add-speaker-voiceprint-matching design 決策 5）。實測建議值待補（tasks
+    // 7.5），此為保守起始值。
+    pub voiceprint_similarity_threshold: f32,
 }
 
 impl Default for AppConfig {
@@ -136,6 +143,9 @@ impl Default for AppConfig {
             proofread_prompt: String::new(),
             summary_prompt: String::new(),
             completion_notification_enabled: true,
+            // pyannote embedding 的 cosine 距離：同一人重複發言的實測通常 <0.3，
+            // 不同人可達 0.6 以上；0.25 保守偏向少提議、少誤判
+            voiceprint_similarity_threshold: 0.25,
         }
     }
 }

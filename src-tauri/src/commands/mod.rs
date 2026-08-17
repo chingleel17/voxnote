@@ -11,3 +11,4 @@ pub mod summary_cmds;
 pub mod tag_cmds;
 pub mod template_cmds;
 pub mod transcript_cmds;
+pub mod voiceprint_cmds;
