@@ -1,8 +1,10 @@
 import asyncio
 import os
+import sys
 import time
 import unittest
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import patch
 
 import httpx
@@ -24,7 +26,7 @@ def fake_result(audio_path: Path, language, diarize, min_speakers, max_speakers,
         callback(100)
     segments = [app.TranscriptSegment(0.0, 1.0, "測試結果", "A" if diarize else None)]
     embeddings = {"A": [0.1, 0.2, 0.3]} if diarize else {}
-    return segments, embeddings
+    return segments, embeddings, True
 
 
 class TestTranscriptionApi(unittest.TestCase):
@@ -73,6 +75,7 @@ class TestTranscriptionApi(unittest.TestCase):
                 payload = response.json()
                 assert payload["speaker_embeddings"] == {"A": [0.1, 0.2, 0.3]}
                 assert payload["diarization_model"] == app.transcriber.diarization_model
+                assert payload["diarization_degraded"] is False
 
         with patch.object(app.transcriber, "transcribe", fake_result):
             self.run_async(scenario())
@@ -103,14 +106,77 @@ class TestTranscriptionApi(unittest.TestCase):
                 payload = response.json()
                 assert "speaker_embeddings" not in payload
                 assert "diarization_model" not in payload
+                assert payload["diarization_degraded"] is False
 
         with patch.object(app.transcriber, "transcribe", fake_result):
             self.run_async(scenario())
 
+    def test_sync_and_async_responses_include_the_same_diarization_quality(self):
+        def degraded_result(audio_path, language, diarize, min_speakers, max_speakers, callback=None):
+            return [app.TranscriptSegment(0.0, 1.0, "測試結果", "A")], {}, False
+
+        async def scenario():
+            app.transcription_lock = asyncio.Lock()
+            async with client() as http:
+                sync_response = await http.post(
+                    "/v1/audio/transcriptions",
+                    files={"file": ("sync.wav", b"audio", "audio/wav")},
+                    data={"sync": "true", "diarize": "true"},
+                )
+                async_response = await http.post(
+                    "/v1/audio/transcriptions",
+                    files={"file": ("async.wav", b"audio", "audio/wav")},
+                    data={"diarize": "true"},
+                )
+
+                assert sync_response.json()["diarization_degraded"] is True
+                task_id = async_response.json()["task_id"]
+                status = await http.get(f"/v1/tasks/{task_id}")
+                assert status.json()["result"]["diarization_degraded"] is True
+
+        with patch.object(app.transcriber, "transcribe", degraded_result):
+            self.run_async(scenario())
+
+    def test_alignment_failure_continues_transcription_and_marks_degraded(self):
+        class FakeAsrModel:
+            def transcribe(self, audio, batch_size, language):
+                return {
+                    "language": "zh",
+                    "segments": [{"start": 0.0, "end": 1.0, "text": "測試結果"}],
+                }
+
+        class FakeDiarizePipeline:
+            def __call__(self, audio, return_embeddings=False, **kwargs):
+                segments = [{"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00"}]
+                return (segments, {}) if return_embeddings else segments
+
+        whisperx = ModuleType("whisperx")
+        whisperx.align = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("alignment failed"))
+        whisperx.assign_word_speakers = lambda diarize_segments, result: {
+            **result,
+            "segments": [{**result["segments"][0], "speaker": diarize_segments[0]["speaker"]}],
+        }
+
+        transcriber = app.WhisperXTranscriber()
+        transcriber._asr_model = FakeAsrModel()
+        transcriber._align_cache["zh"] = (object(), object())
+        transcriber._diarize_pipeline = FakeDiarizePipeline()
+
+        with patch.dict(sys.modules, {"whisperx": whisperx}), patch.object(
+            app, "load_audio_preprocessed", return_value=object()
+        ):
+            segments, _, alignment_complete = transcriber.transcribe(
+                Path("test.wav"), "zh", True, None, None
+            )
+
+        assert segments[0].text == "測試結果"
+        assert segments[0].speaker == "A"
+        assert alignment_complete is False
+
     def test_embedding_extraction_failure_does_not_break_transcription(self):
         def result_without_embeddings(audio_path, language, diarize, min_speakers, max_speakers, callback=None):
             segments = [app.TranscriptSegment(0.0, 1.0, "測試結果", "A" if diarize else None)]
-            return segments, {}
+            return segments, {}, True
 
         async def scenario():
             async with client() as http:
@@ -174,7 +240,7 @@ class TestTranscriptionApi(unittest.TestCase):
             active += 1
             maximum = max(maximum, active)
             active -= 1
-            return [app.TranscriptSegment(0.0, 1.0, "完成")], {}
+            return [app.TranscriptSegment(0.0, 1.0, "完成")], {}, True
 
         async def scenario():
             async with client() as http:
@@ -204,7 +270,7 @@ class TestTranscriptionApi(unittest.TestCase):
             maximum = max(maximum, active)
             time.sleep(0.02)
             active -= 1
-            return [app.TranscriptSegment(0.0, 1.0, "完成")], {}
+            return [app.TranscriptSegment(0.0, 1.0, "完成")], {}, True
 
         async def scenario():
             async with client() as http:

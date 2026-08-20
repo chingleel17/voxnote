@@ -12,10 +12,10 @@ function waitForStartupRetry(delayMs: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, delayMs));
 }
 
-export async function getMeetings(): Promise<MeetingWithDetails[]> {
+async function invokeWithPoolStartupRetry<T>(command: string): Promise<T> {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      return await invoke<MeetingWithDetails[]>('get_meetings');
+      return await invoke<T>(command);
     } catch (error) {
       const retryDelay = STARTUP_RETRY_DELAYS_MS[attempt];
       if (!isPoolStateStartupError(error) || retryDelay === undefined) throw error;
@@ -24,7 +24,10 @@ export async function getMeetings(): Promise<MeetingWithDetails[]> {
   }
 }
 
-export const getArchivedMeetings = () => invoke<MeetingWithDetails[]>('get_archived_meetings');
+export const getMeetings = () =>
+  invokeWithPoolStartupRetry<MeetingWithDetails[]>('get_meetings');
+export const getArchivedMeetings = () =>
+  invokeWithPoolStartupRetry<MeetingWithDetails[]>('get_archived_meetings');
 export const getMeeting = (id: string) => invoke<MeetingWithDetails | null>('get_meeting', { id });
 export const createMeeting = (request: CreateMeetingRequest) => invoke<MeetingWithDetails>('create_meeting', { request });
 export const updateMeeting = (id: string, request: UpdateMeetingRequest) => invoke<MeetingWithDetails>('update_meeting', { id, request });

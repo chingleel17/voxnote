@@ -280,6 +280,17 @@ function getRecordingTranscriptText(recording: Recording, version: TranscriptVer
   }
 }
 
+function isDiarizationDegraded(recording: Recording): boolean {
+  return recording.diarization_degraded === 1;
+}
+
+function buildDiarizationQualityHint(): HTMLParagraphElement {
+  const hint = document.createElement('p');
+  hint.className = 'diarization-quality-hint';
+  hint.textContent = '講者標籤品質提示：建議優先確認此段落的講者對應；逐字稿文字仍可正常使用。';
+  return hint;
+}
+
 function hasScopedTranscriptText(recordings: Recording[], version: TranscriptVersion): boolean {
   if (version === 'original') {
     return recordings.some((recording) => Boolean(recording.segment_transcript));
@@ -1267,8 +1278,12 @@ function buildTranscriptSection(
           ? `段落 ${segmentIndex}（${recording.original_file_name}）`
           : `段落 ${segmentIndex}`;
         groupTitle.title = `跳至段落 ${segmentIndex} 開始`;
-         groupTitle.addEventListener('click', () => onJump(recording.id));
+        groupTitle.addEventListener('click', () => onJump(recording.id));
         mappingPanel.appendChild(groupTitle);
+
+        if (isDiarizationDegraded(recording)) {
+          mappingPanel.appendChild(buildDiarizationQualityHint());
+        }
 
         const mappingList = document.createElement('div');
         mappingList.className = 'speaker-mapping-list';
@@ -2436,6 +2451,10 @@ function buildRecordingSection(
         originalFileName.className = 'form-hint';
         originalFileName.textContent = `原始檔名：${rec.original_file_name}`;
         segWrap.appendChild(originalFileName);
+      }
+
+      if (isDiarizationDegraded(rec)) {
+        segWrap.appendChild(buildDiarizationQualityHint());
       }
 
       // 播放器

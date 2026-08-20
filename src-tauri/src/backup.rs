@@ -910,7 +910,7 @@ mod tests {
              CREATE TABLE speaker_mappings (id TEXT PRIMARY KEY, meeting_id TEXT, recording_id TEXT, speaker_label TEXT, participant_name TEXT, created_at TEXT, updated_at TEXT);
              CREATE TABLE transcripts (id TEXT PRIMARY KEY);
              CREATE TABLE summaries (id TEXT PRIMARY KEY);
-             CREATE TABLE recordings (id TEXT PRIMARY KEY, meeting_id TEXT, file_path TEXT);
+             CREATE TABLE recordings (id TEXT PRIMARY KEY, meeting_id TEXT, file_path TEXT, diarization_degraded INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE recording_speaker_mappings (id TEXT PRIMARY KEY);
              CREATE TABLE saved_participants (id TEXT PRIMARY KEY, name TEXT UNIQUE, usage_count INTEGER, created_at TEXT);
              CREATE TABLE meeting_templates (id TEXT PRIMARY KEY, name TEXT, title TEXT, category_id TEXT, participants_json TEXT, created_at TEXT);
@@ -1031,7 +1031,7 @@ mod tests {
         let directory = test_directory();
         let database_path = directory.join("source.sqlite");
         let source = create_test_database(&database_path).await;
-        sqlx::query("INSERT INTO recordings VALUES ('recording-1', 'meeting-1', 'C:/old-user/audio.wav')")
+        sqlx::query("INSERT INTO recordings (id, meeting_id, file_path) VALUES ('recording-1', 'meeting-1', 'C:/old-user/audio.wav')")
             .execute(&source)
             .await
             .unwrap();

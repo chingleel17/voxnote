@@ -469,7 +469,7 @@ class WhisperXTranscriber:
         min_speakers: int | None,
         max_speakers: int | None,
         progress_callback: Callable[[int], None] | None = None,
-    ) -> tuple[list[TranscriptSegment], dict[str, list[float]]]:
+    ) -> tuple[list[TranscriptSegment], dict[str, list[float]], bool]:
         """執行轉錄、詞級對齊及可選的語者分離。"""
         import whisperx
 
@@ -544,7 +544,7 @@ class WhisperXTranscriber:
             progress_callback(100)
         segments, speaker_map = self._to_segments(result.get("segments", []))
         embeddings = _map_embeddings_to_labels(raw_embeddings, speaker_map)
-        return segments, embeddings
+        return segments, embeddings, not (diarize and not aligned)
 
     @staticmethod
     def _to_segments(
@@ -858,7 +858,7 @@ async def _transcribe_audio(
     progress_callback: Callable[[int], None] | None = None,
 ) -> dict[str, object]:
     """執行共用的轉錄與輸出格式化流程。"""
-    segments, embeddings = await run_in_threadpool(
+    segments, embeddings, alignment_complete = await run_in_threadpool(
         transcriber.transcribe,
         audio_path,
         language if language and language != "auto" else None,
@@ -873,6 +873,7 @@ async def _transcribe_audio(
         "segments": normalized_segments,
         "language": language or "auto",
         "diarization_enabled": diarize,
+        "diarization_degraded": diarize and not alignment_complete,
     }
     # 向量欄位僅於啟用語者分離且成功取得向量時附上；未啟用時完全不含此欄位，
     # 供舊版客戶端與測試明確區分「未分離」與「分離但向量取得失敗」

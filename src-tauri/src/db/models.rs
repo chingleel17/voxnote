@@ -75,6 +75,7 @@ pub struct Recording {
     pub sort_order: i64,
     pub segment_transcript: Option<String>,
     pub segment_proofread: Option<String>,
+    pub diarization_degraded: i64,
     pub no_break_before: i64,
     pub created_at: String,
 }

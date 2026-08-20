@@ -30,6 +30,9 @@ struct LocalServerTranscription {
     speaker_embeddings: Option<HashMap<String, Vec<f32>>>,
     #[serde(default)]
     diarization_model: Option<String>,
+    // 舊版本地 ASR 伺服器未提供此欄位時，視為未降級。
+    #[serde(default)]
+    diarization_degraded: bool,
 }
 
 /// `transcribe_voxnote_asr` 的完整回傳，供呼叫端在格式化文字之外取得講者嵌入
@@ -39,6 +42,7 @@ pub struct VoxnoteAsrResult {
     pub text: String,
     pub speaker_embeddings: HashMap<String, Vec<f32>>,
     pub diarization_model: Option<String>,
+    pub diarization_degraded: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -475,6 +479,7 @@ async fn transcribe_voxnote_asr_bytes(
                     text,
                     speaker_embeddings: result.speaker_embeddings.unwrap_or_default(),
                     diarization_model: result.diarization_model,
+                    diarization_degraded: result.diarization_degraded,
                 });
             }
             "failed" => {

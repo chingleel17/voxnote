@@ -193,7 +193,7 @@ docker compose up -d --build asr-batch gateway
 | `ASR_COMPUTE_TYPE` | 運算精度；VRAM 較小建議 `int8`，較充裕可用 `float16` | `int8` |
 | `ASR_BATCH_SIZE` | 批次大小；VRAM 較小時調降 | `8` |
 | `DIARIZATION_MODEL` | 語者分離模型（明確指定，不依賴 WhisperX 會變動的預設值） | `pyannote-community/speaker-diarization-community-1` |
-| `DIARIZATION_CLUSTERING_THRESHOLD` | pyannote AHC 分群門檻（cosine 距離，範圍 0–2）；設為空字串則採模型預設值（`0.6`） | `1.0`（實測值） |
+| `DIARIZATION_CLUSTERING_THRESHOLD` | pyannote AHC 分群門檻（cosine 距離，範圍 0–2）；設為空字串則採模型預設值（`0.6`） | `0.8` |
 | `HF_TOKEN` / `HF_TOKEN_FILE` | Hugging Face token（語者分離所需），可直接給值或指向檔案 | 無 |
 | `UPLOAD_DIR` | 上傳音訊暫存目錄 | 系統暫存目錄 |
 | `AUDIO_PREPROCESS` | 音訊前處理總開關；設為 `0` 可停用以比對效果 | `1` |
@@ -225,13 +225,13 @@ pyannote 以 AHC（凝聚式階層分群）依聲紋 embedding 的 cosine 距離
 - **調低**：分群更嚴格，傾向將講者拆得更細（可能加劇「一人被拆成多人」）。
 - **調高**：分群更寬鬆，傾向合併相近的聲紋（可能導致「不同人被合併」）。
 
-`docker-compose.yml` 預設帶入 `1.0`（實測值，理由見下）。要改回模型預設值 `0.6`，於 `server/.env` 寫入空值即可：
+`docker-compose.yml` 預設帶入 `0.8`。要改回模型預設值 `0.6`，於 `server/.env` 寫入空值即可：
 
 ```dotenv
 DIARIZATION_CLUSTERING_THRESHOLD=
 ```
 
-（compose 使用 `${VAR-1.0}` 單破折號語法，故 `.env` 中的空字串會照實傳入而不被預設值取代。）
+（compose 使用 `${VAR-0.8}` 單破折號語法，故 `.env` 中的空字串會照實傳入而不被預設值取代。）
 
 取用底層 pyannote pipeline 參數失敗時（版本升級可能變動未公開介面），服務會記錄 log 並安全降級為模型預設值，不中斷轉錄。
 
@@ -246,7 +246,7 @@ DIARIZATION_CLUSTERING_THRESHOLD=
 | **`1.0`（建議）** | 525 | A:260、B:264 | **C 消失，收斂為正確的兩人** |
 | `1.2` | 91 | A:91 | 過度合併，全部併為同一人（等同未分離） |
 
-**建議值為 `1.0`**：可有效消除「同一人被判為多個講者」，且尚未反向造成不同人被合併（`1.2` 才發生過度合併）。此為單一錄音的實測結果，不同錄音環境（麥克風距離、人數、環境噪音）的最佳值可能不同，建議以自身錄音比對後再定案。
+過去三人會議的實測建議值為 `1.0`，但多人會議可能因此過度合併；目前預設採 `0.8` 作為折衷值。不同錄音環境（麥克風距離、人數、環境噪音）的最佳值可能不同，建議以自身錄音比對後再定案。
 
 需注意：**調高門檻只能解決分群階段的誤拆，無法消除字級切分本身的碎片化**。上表中 `0.6` 與 `1.0` 的分段數同為 5 百多段，因為分段數主要由字級講者標籤的跳動決定，而非講者總數；門檻影響的是「這些分段被歸給幾個講者」。
 

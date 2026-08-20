@@ -80,6 +80,7 @@ export interface Recording {
   sort_order: number;
   segment_transcript: string | null;
   segment_proofread: string | null;
+  diarization_degraded: number;
   no_break_before: number;
   created_at: string;
 }

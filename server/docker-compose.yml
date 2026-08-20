@@ -20,12 +20,11 @@ x-asr-common: &asr-common
     AUDIO_NORMALIZER: ${AUDIO_NORMALIZER:-loudnorm}
     # pyannote AHC 分群門檻（cosine 距離，範圍 0-2）。調低傾向拆細（同一人可能被
     # 拆成多個講者）、調高傾向合併（不同人可能被歸為同一講者）。
-    # 預設 1.0 為實測值：模型預設 0.6 會把同一人誤拆為多位講者，1.0 可正確收斂且
-    # 尚未反向造成不同人被合併（1.2 則過度合併為單一講者）。
+     # 預設 0.8：1.0 在部分多人會議中過度合併，0.8 可在拆分與合併之間取得較穩定的折衷。
     # 於 .env 設為空字串即改採模型預設值（此處用 ${VAR-default} 單破折號語法，
     # 空字串會照實傳入；若用 :- 則空字串會被視為未設定而被預設值取代）。
     # 詳見 server/README.md「分群門檻」一節。
-    DIARIZATION_CLUSTERING_THRESHOLD: ${DIARIZATION_CLUSTERING_THRESHOLD-1.0}
+    DIARIZATION_CLUSTERING_THRESHOLD: ${DIARIZATION_CLUSTERING_THRESHOLD-0.8}
   gpus: all
   restart: unless-stopped
 

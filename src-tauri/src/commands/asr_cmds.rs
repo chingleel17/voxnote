@@ -45,6 +45,7 @@ pub async fn start_transcription(
         .map(|m| m.participants.len() as u32)
         .unwrap_or(0);
 
+    let mut diarization_degraded = false;
     let text = match config.asr_provider.as_str() {
         "assemblyai" => transcribe_assemblyai(
             &config.assembly_ai_key,
@@ -89,6 +90,7 @@ pub async fn start_transcription(
                 }
             }
 
+            diarization_degraded = result.diarization_degraded;
             result.text
         }
         "local" => {
@@ -106,7 +108,7 @@ pub async fn start_transcription(
     };
 
     // 儲存此段落的轉譯結果
-    recording::update_segment_transcript(&pool, &recording_id, &text)
+    recording::update_segment_transcript(&pool, &recording_id, &text, diarization_degraded)
         .await
         .map_err(|e| e.to_string())?;
 
