@@ -1,16 +1,21 @@
 """VoxNote 本地 Breeze ASR 服務。"""
 
+import asyncio
 import logging
 import os
 import subprocess
 import tempfile
+import threading
+import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Callable
 
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from opencc import OpenCC
 
@@ -22,8 +27,48 @@ ASR_SAMPLE_RATE = 16000
 # int16 轉 float32 的正規化係數，與 whisperx.load_audio 相同
 INT16_MAX_ABS = 32768.0
 
-app = FastAPI(title="VoxNote Local ASR", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """依服務角色預載模型，完成前不接受請求。"""
+    preload_mode = os.getenv("ASR_PRELOAD_MODE", "off").strip().lower()
+    preload_language = os.getenv("ASR_PRELOAD_LANGUAGE", "").strip().lower()
+    if preload_mode != "off":
+        await run_in_threadpool(_preload_models, preload_mode, preload_language or None)
+    yield
+
+
+app = FastAPI(title="VoxNote Local ASR", version="0.1.0", lifespan=lifespan)
 opencc = OpenCC("s2twp")
+
+TASK_RETENTION_SECONDS = 60 * 60
+MAX_COMPLETED_TASKS = 1000
+
+
+class TaskStatus(str, Enum):
+    """轉錄任務的生命週期狀態。"""
+
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    DONE = "done"
+    FAILED = "failed"
+
+
+@dataclass
+class TranscriptionTask:
+    """記憶體中的轉錄任務狀態。"""
+
+    status: TaskStatus = TaskStatus.QUEUED
+    progress: int = 0
+    result: dict[str, object] | None = None
+    error: str | None = None
+    created_at: float = 0.0
+    completed_at: float | None = None
+
+
+tasks: dict[str, TranscriptionTask] = {}
+tasks_lock = threading.Lock()
+transcription_lock = asyncio.Lock()
 
 
 @dataclass
@@ -34,6 +79,80 @@ class TranscriptSegment:
     end: float
     text: str
     speaker: str | None = None
+
+
+def _cleanup_tasks_locked() -> None:
+    """清除過期或超過上限的已完成任務；呼叫端必須持有 tasks_lock。"""
+    now = time.time()
+    expired_ids = [
+        task_id
+        for task_id, task in tasks.items()
+        if task.status in (TaskStatus.DONE, TaskStatus.FAILED)
+        and task.completed_at is not None
+        and now - task.completed_at >= TASK_RETENTION_SECONDS
+    ]
+    for task_id in expired_ids:
+        del tasks[task_id]
+
+    completed_ids = [
+        (task.completed_at or task.created_at, task_id)
+        for task_id, task in tasks.items()
+        if task.status in (TaskStatus.DONE, TaskStatus.FAILED)
+    ]
+    completed_ids.sort()
+    for _, task_id in completed_ids[:-MAX_COMPLETED_TASKS]:
+        del tasks[task_id]
+
+
+def _task_response(task: TranscriptionTask) -> dict[str, object]:
+    """將任務狀態轉成不暴露內部欄位的 API 回應。"""
+    response: dict[str, object] = {
+        "status": task.status.value,
+        "progress": task.progress,
+    }
+    if task.result is not None:
+        response["result"] = task.result
+    if task.error is not None:
+        response["error"] = task.error
+    return response
+
+
+def _update_task(
+    task_id: str,
+    *,
+    status: TaskStatus | None = None,
+    progress: int | None = None,
+    result: dict[str, object] | None = None,
+    error: str | None = None,
+) -> None:
+    """以執行緒安全方式更新任務狀態。"""
+    with tasks_lock:
+        task = tasks.get(task_id)
+        if task is None:
+            return
+        if status is not None:
+            task.status = status
+        if progress is not None:
+            task.progress = progress
+        if result is not None:
+            task.result = result
+        if error is not None:
+            task.error = error
+        if task.status in (TaskStatus.DONE, TaskStatus.FAILED):
+            task.completed_at = time.time()
+
+
+def _validate_speaker_options(
+    min_speakers: int | None,
+    max_speakers: int | None,
+) -> None:
+    """驗證語者數量參數。"""
+    if min_speakers is not None and min_speakers < 1:
+        raise HTTPException(status_code=422, detail="min_speakers 必須大於 0")
+    if max_speakers is not None and max_speakers < 1:
+        raise HTTPException(status_code=422, detail="max_speakers 必須大於 0")
+    if min_speakers and max_speakers and min_speakers > max_speakers:
+        raise HTTPException(status_code=422, detail="min_speakers 不可大於 max_speakers")
 
 
 def _build_audio_filters() -> str:
@@ -123,6 +242,123 @@ def load_audio_preprocessed(audio_path: Path) -> np.ndarray:
     return np.frombuffer(result.stdout, np.int16).astype(np.float32) / INT16_MAX_ABS
 
 
+def _needs_space_boundary(left: str, right: str) -> bool:
+    """判斷兩個相鄰字詞之間是否需要插入空白。
+
+    WhisperX 中文斷詞為單一漢字，重組時不應插入空白；英文縮寫（如 NAS、DEBUG）在
+    中文語境下也常被拆成單一字母的字詞（如 'D'、'E'、'B'...），故長度為 1 的字詞
+    一律視為緊鄰、不加空白，無論其為漢字或單一英數字元。只有兩側皆為長度大於 1
+    的英數字詞（真正的獨立英文單字，如 "OPS" 與 "電源" 之間、或兩個英文單字之間）
+    才需要空白分隔，否則會黏成一串無法閱讀。
+    """
+    if not left or not right:
+        return False
+    if len(left) == 1 or len(right) == 1:
+        return False
+    return left[-1].isascii() and left[-1].isalnum() and right[0].isascii() and right[0].isalnum()
+
+
+def _join_words(words: list[dict[str, Any]]) -> str:
+    """將字級 `word` 欄位重組為分段文字，依相鄰字詞的語言特性決定是否插入空白。"""
+    tokens = [str(word.get("word", "")).strip() for word in words]
+    tokens = [token for token in tokens if token]
+    if not tokens:
+        return ""
+    parts = [tokens[0]]
+    for previous, current in zip(tokens, tokens[1:]):
+        if _needs_space_boundary(previous, current):
+            parts.append(" ")
+        parts.append(current)
+    return "".join(parts).strip()
+
+
+def _first_word_time(words: list[dict[str, Any]], key: str) -> float | None:
+    """取字級清單中第一個含有效時間戳之字的值；forced alignment 可能遺漏個別字的時間戳。"""
+    for word in words:
+        value = word.get(key)
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _last_word_time(words: list[dict[str, Any]], key: str) -> float | None:
+    """取字級清單中最後一個含有效時間戳之字的值，用途同 `_first_word_time`。"""
+    for word in reversed(words):
+        value = word.get(key)
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _apply_clustering_threshold(pyannote_pipeline: Any, threshold: float) -> bool:
+    """覆寫 pyannote pipeline 的分群門檻，保留其餘既有參數，回傳是否成功套用。
+
+    WhisperX 的 `DiarizationPipeline` 不暴露分群超參數（上游 issue #1579 已標記
+    wontfix），門檻位於其包裝的底層 pyannote pipeline（`self.model`）。
+    pyannote 的 `instantiate()` 需要完整參數字典，僅傳入 `{"clustering":
+    {"threshold": x}}` 會使 `min_cluster_size`、segmentation 相關參數等其餘既有
+    設定遺失，故 MUST 先以 `parameters(instantiated=True)` 取得完整參數，覆寫
+    `clustering.threshold` 後整份傳回 `instantiate()`。
+
+    存取此內部結構或找不到預期的 `clustering.threshold` 鍵時視為失敗並回傳
+    False，呼叫端須降級為模型預設值、記錄 log，不得中斷轉錄。
+    """
+    try:
+        parameters = pyannote_pipeline.parameters(instantiated=True)
+    except Exception:
+        logger.warning("無法取得 pyannote pipeline 參數，分群門檻將採模型預設值", exc_info=True)
+        return False
+
+    clustering = parameters.get("clustering") if isinstance(parameters, dict) else None
+    if not isinstance(clustering, dict) or "threshold" not in clustering:
+        logger.warning(
+            "pyannote pipeline 參數不含 clustering.threshold（可用鍵：%s），"
+            "分群門檻將採模型預設值",
+            list(parameters.keys()) if isinstance(parameters, dict) else type(parameters),
+        )
+        return False
+
+    clustering["threshold"] = threshold
+    try:
+        pyannote_pipeline.instantiate(parameters)
+    except Exception:
+        logger.warning("套用分群門檻失敗，將採模型預設值", exc_info=True)
+        return False
+    return True
+
+
+def _map_embeddings_to_labels(
+    raw_embeddings: Any | None, speaker_map: dict[str, str]
+) -> dict[str, list[float]]:
+    """將 pyannote 原始講者 ID 的嵌入向量對應到正規化後的講者代號（A/B/C）。
+
+    `speaker_map` 僅含實際被指派到字的講者（見 `_to_segments`）；未出現在字級
+    標籤中的講者向量無正規化代號可用，予以捨棄而非猜測標籤，避免向量與逐字稿中
+    的講者代號錯位。
+    """
+    if raw_embeddings is None:
+        return {}
+
+    embeddings: dict[str, list[float]] = {}
+    try:
+        items = raw_embeddings.items() if hasattr(raw_embeddings, "items") else []
+        for raw_speaker, vector in items:
+            label = speaker_map.get(str(raw_speaker))
+            if label is None:
+                continue
+            embeddings[label] = [float(value) for value in np.asarray(vector).flatten().tolist()]
+    except Exception:
+        logger.warning("解析語者嵌入向量失敗，將略過聲紋比對欄位", exc_info=True)
+        return {}
+    return embeddings
+
+
 def _speaker_code(index: int) -> str:
     """將語者序號轉為講者代號：0->A、25->Z、26->AA，超過 26 位仍可正確標示。"""
     code = ""
@@ -170,6 +406,24 @@ class WhisperXTranscriber:
         self._compute_type = os.getenv("ASR_COMPUTE_TYPE", "int8")
         self._batch_size = int(os.getenv("ASR_BATCH_SIZE", "8"))
 
+        # pyannote AHC 分群門檻（cosine 距離，範圍 0-2）。未設定時採模型預設值，
+        # 行為與本變更前一致；調低傾向拆細、調高傾向合併（見 server/README.md）。
+        self._clustering_threshold: float | None = None
+        threshold_raw = os.getenv("DIARIZATION_CLUSTERING_THRESHOLD", "").strip()
+        if threshold_raw:
+            try:
+                self._clustering_threshold = float(threshold_raw)
+            except ValueError:
+                logger.warning(
+                    "DIARIZATION_CLUSTERING_THRESHOLD 非合法數值：%s，將採模型預設值",
+                    threshold_raw,
+                )
+
+    @property
+    def diarization_model(self) -> str:
+        """產生語者嵌入向量的 diarization 模型識別，供聲紋比對記錄來源模型。"""
+        return self._diarization_model
+
     def _ensure_asr_model(self) -> Any:
         """惰性載入 ASR 轉錄模型（依 ASR_MODEL 設定）。"""
         if self._asr_model is None:
@@ -211,6 +465,12 @@ class WhisperXTranscriber:
                 token=hf_token,
                 device=self._device,
             )
+            if self._clustering_threshold is not None:
+                # DiarizationPipeline 包裝底層 pyannote pipeline 於 self.model；
+                # 此為未公開介面，版本升級可能變動（詳見 _apply_clustering_threshold）
+                _apply_clustering_threshold(
+                    self._diarize_pipeline.model, self._clustering_threshold
+                )
         return self._diarize_pipeline
 
     def transcribe(
@@ -220,7 +480,8 @@ class WhisperXTranscriber:
         diarize: bool,
         min_speakers: int | None,
         max_speakers: int | None,
-    ) -> list[TranscriptSegment]:
+        progress_callback: Callable[[int], None] | None = None,
+    ) -> tuple[list[TranscriptSegment], dict[str, list[float]], bool]:
         """執行轉錄、詞級對齊及可選的語者分離。"""
         import whisperx
 
@@ -242,6 +503,8 @@ class WhisperXTranscriber:
             batch_size=self._batch_size,
             language=language,
         )
+        if progress_callback:
+            progress_callback(33)
         detected_language = result.get("language", language or "zh")
 
         # 2. 詞級強制對齊
@@ -266,7 +529,11 @@ class WhisperXTranscriber:
         if diarize and not aligned:
             logger.warning("詞級對齊未完成，語者分離結果可能不完整")
 
+        if progress_callback:
+            progress_callback(66)
+
         # 3. 可選的語者分離
+        raw_embeddings: dict[str, Any] | None = None
         if diarize:
             diarize_pipeline = self._ensure_diarize_pipeline()
             diarize_kwargs: dict[str, int] = {}
@@ -274,39 +541,209 @@ class WhisperXTranscriber:
                 diarize_kwargs["min_speakers"] = min_speakers
             if max_speakers:
                 diarize_kwargs["max_speakers"] = max_speakers
-            diarize_segments = diarize_pipeline(audio, **diarize_kwargs)
+            try:
+                diarize_segments, raw_embeddings = diarize_pipeline(
+                    audio, return_embeddings=True, **diarize_kwargs
+                )
+            except Exception:
+                # 向量僅為附加資訊，取得失敗不應中斷語者分離本身
+                logger.warning("取得語者嵌入向量失敗，將略過聲紋比對欄位", exc_info=True)
+                diarize_segments = diarize_pipeline(audio, **diarize_kwargs)
+                raw_embeddings = None
             result = whisperx.assign_word_speakers(diarize_segments, result)
 
-        return self._to_segments(result.get("segments", []))
+        if progress_callback:
+            progress_callback(100)
+        segments, speaker_map = self._to_segments(result.get("segments", []))
+        embeddings = _map_embeddings_to_labels(raw_embeddings, speaker_map)
+        return segments, embeddings, not (diarize and not aligned)
 
     @staticmethod
-    def _to_segments(raw_segments: list[dict[str, Any]]) -> list[TranscriptSegment]:
-        """將 WhisperX segments 轉為 TranscriptSegment，語者標籤正規化為講者 A、B、C。"""
+    def _to_segments(
+        raw_segments: list[dict[str, Any]],
+    ) -> tuple[list[TranscriptSegment], dict[str, str]]:
+        """將 WhisperX segments 轉為 TranscriptSegment，語者標籤正規化為講者 A、B、C。
+
+        `assign_word_speakers` 已產生字級講者標籤（`words[i]["speaker"]`），故以此
+        切分：相鄰字講者不同時切開為獨立分段，時間戳取自該分段涵蓋的字級區間。
+        `words` 缺失或不含任何講者標籤時（未啟用語者分離、或對齊失敗），退回既有的
+        segment 層級行為。
+
+        回傳的 `speaker_map` 為 pyannote 原始講者 ID（如 SPEAKER_00）到正規化代號
+        （A/B/C）的對應，供呼叫端將講者嵌入向量對應到相同的講者代號。
+        """
         speaker_map: dict[str, str] = {}
+
+        def resolve_label(raw_speaker: str | None) -> str | None:
+            if not raw_speaker:
+                return None
+            # pyannote 輸出如 SPEAKER_00，正規化為由 A 起算的講者代號
+            if raw_speaker not in speaker_map:
+                speaker_map[raw_speaker] = _speaker_code(len(speaker_map))
+            return speaker_map[raw_speaker]
+
         segments: list[TranscriptSegment] = []
         for raw in raw_segments:
+            words = raw.get("words")
+            has_word_speakers = bool(words) and any(
+                isinstance(word, dict) and word.get("speaker") for word in words
+            )
+            if not has_word_speakers:
+                text = str(raw.get("text", "")).strip()
+                if not text:
+                    continue
+                segments.append(
+                    TranscriptSegment(
+                        start=float(raw.get("start", 0.0)),
+                        end=float(raw.get("end", 0.0)),
+                        text=text,
+                        speaker=resolve_label(raw.get("speaker")),
+                    )
+                )
+                continue
+
+            segments.extend(WhisperXTranscriber._split_segment_by_word_speaker(raw, words, resolve_label))
+        return segments, speaker_map
+
+    @staticmethod
+    def _split_segment_by_word_speaker(
+        raw: dict[str, Any],
+        words: list[Any],
+        resolve_label: Callable[[str | None], str | None],
+    ) -> list[TranscriptSegment]:
+        """依字級講者標籤將單一 segment 切分為多個分段。
+
+        缺漏標籤的字沿用前一字的標籤（whisperX issue #1072：`assign_word_speakers`
+        會間歇性遺漏部分字的 speaker 鍵，缺值代表資訊未知而非講者變更）。段落首字
+        即缺漏時，沿用該 segment 內第一個有標籤之字的標籤；全數缺漏時視為單一講者
+        （等同未分離）。
+        """
+        segment_start = float(raw.get("start", 0.0))
+        segment_end = float(raw.get("end", 0.0))
+
+        # 段落首字缺漏標籤時，以第一個有標籤的字回填，避免整段落入 None 講者
+        carry_speaker: str | None = None
+        for word in words:
+            if isinstance(word, dict) and word.get("speaker"):
+                carry_speaker = str(word["speaker"])
+                break
+
+        runs: list[tuple[str | None, list[dict[str, Any]]]] = []
+        for word in words:
+            if not isinstance(word, dict):
+                continue
+            raw_speaker = word.get("speaker")
+            if raw_speaker:
+                carry_speaker = str(raw_speaker)
+            if runs and runs[-1][0] == carry_speaker:
+                runs[-1][1].append(word)
+            else:
+                runs.append((carry_speaker, [word]))
+
+        if not runs:
             text = str(raw.get("text", "")).strip()
             if not text:
-                continue
-            speaker_label: str | None = None
-            raw_speaker = raw.get("speaker")
-            if raw_speaker:
-                # pyannote 輸出如 SPEAKER_00，正規化為由 A 起算的講者代號
-                if raw_speaker not in speaker_map:
-                    speaker_map[raw_speaker] = _speaker_code(len(speaker_map))
-                speaker_label = speaker_map[raw_speaker]
-            segments.append(
+                return []
+            return [
                 TranscriptSegment(
-                    start=float(raw.get("start", 0.0)),
-                    end=float(raw.get("end", 0.0)),
+                    start=segment_start,
+                    end=segment_end,
                     text=text,
-                    speaker=speaker_label,
+                    speaker=resolve_label(raw.get("speaker")),
+                )
+            ]
+
+        if len(runs) == 1:
+            # 講者一致：不切分，維持原 segment 文字與時間戳（逐字重組可能因語言
+            # 相依的分隔規則與原文不同，故直接沿用原文避免無謂差異）
+            text = str(raw.get("text", "")).strip()
+            if not text:
+                return []
+            return [
+                TranscriptSegment(
+                    start=segment_start,
+                    end=segment_end,
+                    text=text,
+                    speaker=resolve_label(runs[0][0]),
+                )
+            ]
+
+        result: list[TranscriptSegment] = []
+        for run_speaker, run_words in runs:
+            text = _join_words(run_words)
+            if not text:
+                continue
+            start = _first_word_time(run_words, "start")
+            end = _last_word_time(run_words, "end")
+            result.append(
+                TranscriptSegment(
+                    start=start if start is not None else segment_start,
+                    end=end if end is not None else segment_end,
+                    text=text,
+                    speaker=resolve_label(run_speaker),
                 )
             )
-        return segments
+        return result
+
+
+class IncrementalTranscriber:
+    """低延遲路徑：直接使用 faster-whisper，不做對齊或語者分離。"""
+
+    def __init__(self) -> None:
+        self._model: Any | None = None
+        self._model_dir = os.getenv("ASR_INCREMENTAL_MODEL") or os.getenv(
+            "ASR_MODEL", "MediaTek-Research/Breeze-ASR-26"
+        )
+        self._device = os.getenv("ASR_INCREMENTAL_DEVICE", os.getenv("ASR_DEVICE", "cuda"))
+        self._compute_type = os.getenv(
+            "ASR_INCREMENTAL_COMPUTE_TYPE", os.getenv("ASR_COMPUTE_TYPE", "int8")
+        )
+
+    def _ensure_model(self) -> Any:
+        if self._model is None:
+            try:
+                from faster_whisper import WhisperModel
+
+                self._model = WhisperModel(
+                    self._model_dir,
+                    device=self._device,
+                    compute_type=self._compute_type,
+                )
+            except Exception as error:
+                raise RuntimeError(f"低延遲 ASR 模型載入失敗：{error}") from error
+        return self._model
+
+    def transcribe(self, audio: np.ndarray, language: str | None) -> str:
+        model = self._ensure_model()
+        segments, _ = model.transcribe(
+            audio,
+            language=language,
+            beam_size=1,
+            vad_filter=False,
+            condition_on_previous_text=False,
+        )
+        # faster-whisper 的 segments 是惰性 generator，必須在此完整消費才會執行推論。
+        return opencc.convert("".join(segment.text for segment in segments)).strip()
 
 
 transcriber = WhisperXTranscriber()
+incremental_transcriber = IncrementalTranscriber()
+
+
+def _preload_models(mode: str, language: str | None) -> None:
+    """在服務啟動階段將指定推論路徑的模型載入 RAM／VRAM。"""
+    logger.info("開始預載 ASR 模型：mode=%s, language=%s", mode, language or "auto")
+    if mode == "full":
+        transcriber._ensure_asr_model()
+        if language:
+            transcriber._ensure_align_model(language)
+    elif mode == "incremental":
+        incremental_transcriber._ensure_model()
+    else:
+        raise RuntimeError(
+            f"ASR_PRELOAD_MODE 不支援 {mode!r}，僅可使用 off、full 或 incremental"
+        )
+    logger.info("ASR 模型預載完成：mode=%s", mode)
 
 
 def read_hf_token() -> str | None:
@@ -341,19 +778,16 @@ async def health() -> dict[str, str]:
 
 @app.post("/v1/audio/transcriptions")
 async def create_transcription(
+    background_tasks: BackgroundTasks,
     file: Annotated[UploadFile, File()],
     language: Annotated[str | None, Form()] = None,
     diarize: Annotated[bool, Form()] = False,
     min_speakers: Annotated[int | None, Form()] = None,
     max_speakers: Annotated[int | None, Form()] = None,
+    sync: Annotated[bool, Form()] = False,
 ) -> dict[str, object]:
-    """以 OpenAI 相容 multipart 契約接收音訊並回傳逐字稿與片段。"""
-    if min_speakers is not None and min_speakers < 1:
-        raise HTTPException(status_code=422, detail="min_speakers 必須大於 0")
-    if max_speakers is not None and max_speakers < 1:
-        raise HTTPException(status_code=422, detail="max_speakers 必須大於 0")
-    if min_speakers and max_speakers and min_speakers > max_speakers:
-        raise HTTPException(status_code=422, detail="min_speakers 不可大於 max_speakers")
+    """接收音訊；預設建立背景任務，sync=true 時直接回傳逐字稿。"""
+    _validate_speaker_options(min_speakers, max_speakers)
 
     upload_dir = Path(os.getenv("UPLOAD_DIR", tempfile.gettempdir())) / "voxnote-asr"
     upload_dir.mkdir(parents=True, exist_ok=True)
@@ -363,30 +797,162 @@ async def create_transcription(
 
     try:
         audio_path.write_bytes(await file.read())
-        segments = await run_in_threadpool(
-            transcriber.transcribe,
+        await file.close()
+
+        if sync:
+            try:
+                # 同步模式刻意不使用任務表或 BackgroundTasks，供即時字幕使用。
+                # WhisperX pipeline 會在轉錄期間修改共用的 tokenizer；同步請求也
+                # 必須與背景任務共用序列化鎖，否則多個檔案同時送入會發生 tokenizer=None。
+                async with transcription_lock:
+                    return await _transcribe_audio(
+                        audio_path,
+                        language,
+                        diarize,
+                        min_speakers,
+                        max_speakers,
+                    )
+            except RuntimeError as error:
+                logger.error("轉錄前置條件不符：%s", error, exc_info=True)
+                raise HTTPException(status_code=503, detail=str(error)) from error
+            except Exception as error:
+                logger.exception("轉錄失敗")
+                raise HTTPException(status_code=500, detail=f"轉錄失敗：{error}") from error
+            finally:
+                audio_path.unlink(missing_ok=True)
+
+        task_id = uuid.uuid4().hex
+        with tasks_lock:
+            _cleanup_tasks_locked()
+            tasks[task_id] = TranscriptionTask(created_at=time.time())
+        background_tasks.add_task(
+            _run_transcription_task,
+            task_id,
             audio_path,
-            language if language and language != "auto" else None,
+            language,
             diarize,
             min_speakers,
             max_speakers,
         )
+        return {"task_id": task_id, "status": TaskStatus.QUEUED.value, "progress": 0}
+    except HTTPException:
+        await file.close()
+        audio_path.unlink(missing_ok=True)
+        raise
+    except Exception:
+        await file.close()
+        audio_path.unlink(missing_ok=True)
+        raise
+
+
+@app.post("/v1/audio/transcriptions/incremental")
+async def create_incremental_transcription(
+    file: Annotated[UploadFile, File()],
+    language: Annotated[str | None, Form()] = None,
+) -> dict[str, object]:
+    """以 faster-whisper 直接轉錄短音訊視窗，不建立背景任務。"""
+    upload_dir = Path(os.getenv("UPLOAD_DIR", tempfile.gettempdir())) / "voxnote-asr"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(file.filename or "audio.wav").suffix or ".wav"
+    audio_path = upload_dir / f"{uuid.uuid4().hex}{suffix}"
+
+    try:
+        audio_path.write_bytes(await file.read())
+        await file.close()
+        audio = await run_in_threadpool(load_audio_preprocessed, audio_path)
+        text = await run_in_threadpool(
+            incremental_transcriber.transcribe,
+            audio,
+            language if language and language != "auto" else None,
+        )
+        return {"text": text, "language": language or "auto"}
     except RuntimeError as error:
-        # 設定或環境問題（模型載入失敗、缺少 token 等），記錄後回報 503
-        logger.error("轉錄前置條件不符：%s", error, exc_info=True)
+        logger.error("低延遲轉錄前置條件不符：%s", error, exc_info=True)
         raise HTTPException(status_code=503, detail=str(error)) from error
     except Exception as error:
-        # 未預期錯誤須記錄完整 traceback，否則僅憑 HTTP 回應無法診斷
-        logger.exception("轉錄失敗")
-        raise HTTPException(status_code=500, detail=f"轉錄失敗：{error}") from error
+        logger.exception("低延遲轉錄失敗")
+        raise HTTPException(status_code=500, detail=f"低延遲轉錄失敗：{error}") from error
     finally:
         await file.close()
         audio_path.unlink(missing_ok=True)
 
+
+async def _transcribe_audio(
+    audio_path: Path,
+    language: str | None,
+    diarize: bool,
+    min_speakers: int | None,
+    max_speakers: int | None,
+    progress_callback: Callable[[int], None] | None = None,
+) -> dict[str, object]:
+    """執行共用的轉錄與輸出格式化流程。"""
+    segments, embeddings, alignment_complete = await run_in_threadpool(
+        transcriber.transcribe,
+        audio_path,
+        language if language and language != "auto" else None,
+        diarize,
+        min_speakers,
+        max_speakers,
+        progress_callback,
+    )
     normalized_segments = [normalize_segment(segment, diarize) for segment in segments]
-    return {
+    response: dict[str, object] = {
         "text": "\n".join(str(segment["text"]) for segment in normalized_segments),
         "segments": normalized_segments,
         "language": language or "auto",
         "diarization_enabled": diarize,
+        "diarization_degraded": diarize and not alignment_complete,
     }
+    # 向量欄位僅於啟用語者分離且成功取得向量時附上；未啟用時完全不含此欄位，
+    # 供舊版客戶端與測試明確區分「未分離」與「分離但向量取得失敗」
+    if diarize and embeddings:
+        response["speaker_embeddings"] = embeddings
+        response["diarization_model"] = transcriber.diarization_model
+    return response
+
+
+async def _run_transcription_task(
+    task_id: str,
+    audio_path: Path,
+    language: str | None,
+    diarize: bool,
+    min_speakers: int | None,
+    max_speakers: int | None,
+) -> None:
+    """在單一程序內循序執行背景轉錄任務。"""
+    try:
+        async with transcription_lock:
+            _update_task(task_id, status=TaskStatus.PROCESSING, progress=0)
+            result = await _transcribe_audio(
+                audio_path,
+                language,
+                diarize,
+                min_speakers,
+                max_speakers,
+                lambda progress: _update_task(task_id, progress=progress),
+            )
+            _update_task(
+                task_id,
+                status=TaskStatus.DONE,
+                progress=100,
+                result=result,
+            )
+    except RuntimeError as error:
+        logger.error("轉錄前置條件不符：%s", error, exc_info=True)
+        _update_task(task_id, status=TaskStatus.FAILED, error=f"轉錄失敗：{error}")
+    except Exception as error:
+        logger.exception("轉錄失敗")
+        _update_task(task_id, status=TaskStatus.FAILED, error=f"轉錄失敗：{error}")
+    finally:
+        audio_path.unlink(missing_ok=True)
+
+
+@app.get("/v1/tasks/{task_id}")
+async def get_transcription_task(task_id: str) -> dict[str, object]:
+    """查詢背景轉錄任務狀態與完成結果。"""
+    with tasks_lock:
+        _cleanup_tasks_locked()
+        task = tasks.get(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"找不到轉錄任務：{task_id}")
+        return {"task_id": task_id, **_task_response(task)}

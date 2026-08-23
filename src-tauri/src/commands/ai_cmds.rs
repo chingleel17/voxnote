@@ -18,6 +18,16 @@ use crate::{
 /// 重試至多四輪；長逐字稿累積下來可能耗時數小時，故以此上限中止並保留原始逐字稿。
 const PROOFREAD_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
+/// 校稿的核心修正原則：同音字誤植、缺漏標點、斷句不順。
+/// 批次逐字稿與即時字幕（`live_caption` 模組）共用此常數，維持校正方向一致；
+/// 批次專屬的格式規則（時間標記／講者標記保留、禁止省略）不在此列，
+/// 因即時字幕的單段輸入不含這些標記，套用會產生無意義的限制。
+/// 此指示內容不開放使用者自訂（維持行為一致與可預期，見
+/// add-live-caption-overlay 的「Live caption proofreading shares its
+/// prompt with batch transcript proofreading」）。
+pub(crate) const PROOFREAD_CORE_SYSTEM: &str =
+    "你是一位專業的中文校對員。請校正輸入內容中的錯字（同音字、漏字、多字、標點錯誤），並修順不通順的斷句。";
+
 const PROOFREAD_SYSTEM: &str = "\
 你是一位專業的中文會議記錄校對員。\
 請校正以下逐字稿中的錯字（同音字、漏字、多字、標點錯誤）。\

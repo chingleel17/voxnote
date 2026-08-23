@@ -9,7 +9,7 @@ use crate::{
     backup::DataOperationLock,
     commands::ai_cmds::proofread_recording_segment_with_config,
     config::load_config,
-    db::{meeting, recording, transcript},
+    db::{meeting, recording, transcript, voiceprint},
 };
 
 fn emit_asr_progress(app: &AppHandle, meeting_id: &str, message: &str) {
@@ -45,6 +45,7 @@ pub async fn start_transcription(
         .map(|m| m.participants.len() as u32)
         .unwrap_or(0);
 
+    let mut diarization_degraded = false;
     let text = match config.asr_provider.as_str() {
         "assemblyai" => transcribe_assemblyai(
             &config.assembly_ai_key,
@@ -57,16 +58,41 @@ pub async fn start_transcription(
         )
         .await
         .map_err(|e| e.to_string())?,
-        "voxnote_asr" => transcribe_voxnote_asr(
-            &config.local_asr_base_url,
-            &file_path,
-            &config.asr_language,
-            config.speaker_detection,
-            speakers_expected,
-            |msg| emit_asr_progress(&app, &meeting_id, &msg),
-        )
-        .await
-        .map_err(|e| e.to_string())?,
+        "voxnote_asr" => {
+            let result = transcribe_voxnote_asr(
+                &config.local_asr_base_url,
+                &file_path,
+                &config.asr_language,
+                config.speaker_detection,
+                speakers_expected,
+                |msg| emit_asr_progress(&app, &meeting_id, &msg),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+            // 講者嵌入向量僅本地 ASR 啟用語者分離且成功取得時附上；寫入暫存表供
+            // 段落內合併與會議內串接比對使用（不需使用者確認，見 design 決策 2.1）
+            if let Some(model) = result.diarization_model.as_deref() {
+                for (speaker_label, vector) in &result.speaker_embeddings {
+                    if let Err(error) = voiceprint::upsert_recording_speaker_embedding(
+                        &pool,
+                        &meeting_id,
+                        &recording_id,
+                        speaker_label,
+                        model,
+                        vector,
+                    )
+                    .await
+                    {
+                        // 聲紋比對為附加功能，寫入失敗不應中斷轉錄本身
+                        eprintln!("[asr] 講者嵌入向量寫入失敗：{}", error);
+                    }
+                }
+            }
+
+            diarization_degraded = result.diarization_degraded;
+            result.text
+        }
         "local" => {
             emit_asr_progress(&app, &meeting_id, "啟動本地 Whisper...");
             transcribe_local_whisper(
@@ -82,7 +108,7 @@ pub async fn start_transcription(
     };
 
     // 儲存此段落的轉譯結果
-    recording::update_segment_transcript(&pool, &recording_id, &text)
+    recording::update_segment_transcript(&pool, &recording_id, &text, diarization_degraded)
         .await
         .map_err(|e| e.to_string())?;
 

@@ -1,15 +1,22 @@
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { MeetingWithDetails, Transcript, Summary, Recording, SavedParticipant, CreateTemplateRequest, Tag, SpeakerMapping, Category, ExportTextFile } from '../types';
+import type { MeetingWithDetails, Transcript, Summary, Recording, SavedParticipant, CreateTemplateRequest, Tag, SpeakerMapping, Category, ExportTextFile, PendingRecordingUpload } from '../types';
 import { getMeeting, getCategories, updateMeeting, archiveMeeting, unarchiveMeeting } from '../api/meetings';
 import { exportTextFileToPath, getTranscript, saveTranscriptManual, saveTranscriptProofread, switchTranscriptVersion } from '../api/transcripts';
 import { getSummary } from '../api/summaries';
-import { getRecordings, deleteRecording, setNoBreakBefore, reorderRecordings, remergeSegments } from '../api/recordings';
+import { getRecordings, deleteRecording, setNoBreakBefore, reorderRecordings, remergeSegments, importRecordingFiles } from '../api/recordings';
 import { startTranscription, proofreadRecordingSegment, proofreadTranscript, generateSummary } from '../api/settings';
 import { getSavedParticipants, upsertSavedParticipant } from '../api/participants';
 import { deleteSpeakerMapping, getSpeakerMappings, upsertSpeakerMapping } from '../api/speakerMappings';
 import { createTemplate } from '../api/templates';
 import { getTags } from '../api/tags';
+import { getSettings } from '../api/settings';
+import {
+  confirmSpeakerVoiceprint,
+  getCrossMeetingIdentityProposals,
+  getCrossRecordingLinkProposals,
+  getWithinRecordingMergeProposals,
+} from '../api/voiceprints';
 import { openModal } from '../components/modal';
 import { showToast } from '../components/toast';
 import { applyMediaCrossOrigin, createWaveformPlayer } from '../components/audioPlayer';
@@ -37,6 +44,31 @@ interface TranscriptSectionResult {
 
 const transcriptUtteranceRe = /^\[(\d+:\d{2})(?:\s+([^\]]+))?\]\s+(.*)$/;
 const MERGED_BREAK_SEPARATOR = '\n\n--- ☕ 中場休息 ---\n\n';
+
+interface TranscriptDraftRow {
+  id: string;
+  recordingId: string;
+  segmentIndex: number;
+  time: string;
+  speakerLabel?: string;
+  text: string;
+  noBreakBefore: boolean;
+  timeHint?: string;
+}
+
+interface TranscriptDraftParseResult {
+  rows: TranscriptDraftRow[];
+  reason?: string;
+}
+
+interface TranscriptSegmentSource {
+  recording: Recording;
+  segmentIndex: number;
+  text: string;
+}
+
+const manualDraftParseCache = new Map<string, TranscriptDraftParseResult>();
+const MANUAL_DRAFT_CACHE_LIMIT = 6;
 
 function parseTimeToSeconds(timeStr: string): number {
   const [minutesPart, secondsPart] = timeStr.split(':');
@@ -80,6 +112,10 @@ function extractSpeakerLabels(...texts: Array<string | null | undefined>): strin
   return Array.from(speakers).sort((a, b) => a.localeCompare(b));
 }
 
+function isSpeakerLabel(value: string | undefined): value is string {
+  return Boolean(value?.trim().startsWith('講者'));
+}
+
 function getSpeakerMappingKey(recordingId: string, speakerLabel: string): string {
   return `${recordingId}::${speakerLabel}`;
 }
@@ -100,6 +136,135 @@ function getMappedSpeakerName(
   return mappingBySpeaker.get(getSpeakerMappingKey(recordingId, speakerLabel)) ?? speakerLabel;
 }
 
+/** 講者聲紋比對提議：僅本地 ASR 供應商可用，載入並附加至講者對應面板。 */
+async function loadVoiceprintProposals(
+  meetingId: string,
+  mappingPanel: HTMLElement,
+  onSpeakerMappingChanged: (recordingId: string, speakerLabel: string, participantName: string | null) => Promise<void>,
+): Promise<void> {
+  let config;
+  try {
+    config = await getSettings();
+  } catch {
+    return;
+  }
+  // AssemblyAI 為黑箱 API，不暴露嵌入向量，本能力僅本地 ASR 供應商啟用
+  if (config.asr_provider !== 'voxnote_asr') return;
+
+  const [mergeProposals, linkProposals, identityProposals] = await Promise.all([
+    getWithinRecordingMergeProposals(meetingId).catch(() => []),
+    getCrossRecordingLinkProposals(meetingId).catch(() => []),
+    getCrossMeetingIdentityProposals(meetingId).catch(() => []),
+  ]);
+
+  if (mergeProposals.length === 0 && linkProposals.length === 0 && identityProposals.length === 0) return;
+
+  const proposalPanel = document.createElement('div');
+  proposalPanel.className = 'voiceprint-proposal-panel';
+
+  const renderMergeSection = (title: string, proposals: typeof mergeProposals): void => {
+    if (proposals.length === 0) return;
+    const heading = document.createElement('div');
+    heading.className = 'voiceprint-proposal-heading';
+    heading.textContent = title;
+    proposalPanel.appendChild(heading);
+
+    for (const proposal of proposals) {
+      const row = document.createElement('div');
+      row.className = 'voiceprint-proposal-row';
+
+      const text = document.createElement('span');
+      text.className = 'voiceprint-proposal-text';
+      const percent = Math.round(proposal.similarity * 100);
+      text.textContent = `${proposal.speakerLabelA}（段落）與 ${proposal.speakerLabelB}（段落）可能是同一人（相似度 ${percent}%）`;
+      row.appendChild(text);
+
+      const applyBtn = document.createElement('button');
+      applyBtn.type = 'button';
+      applyBtn.className = 'btn btn-secondary btn-sm';
+      applyBtn.textContent = '套用';
+      applyBtn.addEventListener('click', async () => {
+        const name = window.prompt('請輸入這兩個講者代號的參與者姓名：');
+        if (!name || !name.trim()) return;
+        applyBtn.disabled = true;
+        try {
+          await onSpeakerMappingChanged(proposal.recordingIdA, proposal.speakerLabelA, name.trim());
+          await onSpeakerMappingChanged(proposal.recordingIdB, proposal.speakerLabelB, name.trim());
+          showToast('已套用講者合併提議', 'success');
+          row.remove();
+        } catch (err) {
+          showToast(`套用失敗：${String(err)}`, 'error');
+        } finally {
+          applyBtn.disabled = false;
+        }
+      });
+      row.appendChild(applyBtn);
+
+      const rejectBtn = document.createElement('button');
+      rejectBtn.type = 'button';
+      rejectBtn.className = 'btn btn-ghost btn-sm';
+      rejectBtn.textContent = '略過';
+      rejectBtn.addEventListener('click', () => row.remove());
+      row.appendChild(rejectBtn);
+
+      proposalPanel.appendChild(row);
+    }
+  };
+
+  renderMergeSection('段落內合併提議', mergeProposals);
+  renderMergeSection('跨段落串接提議', linkProposals);
+
+  if (identityProposals.length > 0) {
+    const heading = document.createElement('div');
+    heading.className = 'voiceprint-proposal-heading';
+    heading.textContent = '跨會議候選人名';
+    proposalPanel.appendChild(heading);
+
+    for (const proposal of identityProposals) {
+      const row = document.createElement('div');
+      row.className = 'voiceprint-proposal-row';
+
+      const text = document.createElement('span');
+      text.className = 'voiceprint-proposal-text';
+      const percent = Math.round(proposal.similarity * 100);
+      text.textContent = `${proposal.speakerLabel} 可能是「${proposal.participantName}」（相似度 ${percent}%）`;
+      row.appendChild(text);
+
+      const acceptBtn = document.createElement('button');
+      acceptBtn.type = 'button';
+      acceptBtn.className = 'btn btn-secondary btn-sm';
+      acceptBtn.textContent = '採納';
+      acceptBtn.addEventListener('click', async () => {
+        acceptBtn.disabled = true;
+        try {
+          await onSpeakerMappingChanged(proposal.recordingId, proposal.speakerLabel, proposal.participantName);
+          await confirmSpeakerVoiceprint(proposal.recordingId, proposal.speakerLabel, proposal.participantId);
+          showToast(`已採納「${proposal.participantName}」`, 'success');
+          row.remove();
+        } catch (err) {
+          showToast(`採納失敗：${String(err)}`, 'error');
+        } finally {
+          acceptBtn.disabled = false;
+        }
+      });
+      row.appendChild(acceptBtn);
+
+      const rejectBtn = document.createElement('button');
+      rejectBtn.type = 'button';
+      rejectBtn.className = 'btn btn-ghost btn-sm';
+      rejectBtn.textContent = '拒絕';
+      // 拒絕時講者對應維持原狀，且不寫入聲紋（見 speaker-voiceprint-matching
+      // 規格「使用者拒絕提議」情境）——僅從畫面移除，不呼叫任何寫入 API
+      rejectBtn.addEventListener('click', () => row.remove());
+      row.appendChild(rejectBtn);
+
+      proposalPanel.appendChild(row);
+    }
+  }
+
+  mappingPanel.appendChild(proposalPanel);
+}
+
 function getSpeakerClassName(speakerLabel: string): string {
   return `speaker-${speakerLabel.replace('講者', '').replace(/[^A-Za-z0-9_-]/g, '')}`;
 }
@@ -113,6 +278,17 @@ function getRecordingTranscriptText(recording: Recording, version: TranscriptVer
     case 'manual':
       return null;
   }
+}
+
+function isDiarizationDegraded(recording: Recording): boolean {
+  return recording.diarization_degraded === 1;
+}
+
+function buildDiarizationQualityHint(): HTMLParagraphElement {
+  const hint = document.createElement('p');
+  hint.className = 'diarization-quality-hint';
+  hint.textContent = '講者標籤品質提示：建議優先確認此段落的講者對應；逐字稿文字仍可正常使用。';
+  return hint;
 }
 
 function hasScopedTranscriptText(recordings: Recording[], version: TranscriptVersion): boolean {
@@ -576,6 +752,8 @@ function renderTranscriptSegmentInto(
   text: string,
   mapSpeakerLabel: (speakerLabel: string) => string = (speakerLabel) => speakerLabel,
   onTimeClick?: (timeInSeconds: number) => void,
+  recordingId?: string,
+  recordings: Recording[] = [],
 ): void {
   const lines = text.split('\n');
   const hasTimestamps = lines.some((line) => transcriptUtteranceRe.test(line.trim()));
@@ -593,6 +771,8 @@ function renderTranscriptSegmentInto(
       const [, time, speaker, body] = match;
       const row = document.createElement('div');
       row.className = 'transcript-row';
+      if (recordingId) row.dataset.recordingId = recordingId;
+      if (speaker) row.dataset.speakerLabel = speaker;
 
       const timeEl = document.createElement('span');
       timeEl.className = 'transcript-time';
@@ -607,7 +787,9 @@ function renderTranscriptSegmentInto(
       if (speaker) {
         const displaySpeaker = mapSpeakerLabel(speaker);
         const speakerEl = document.createElement('span');
-        speakerEl.className = `transcript-speaker ${getSpeakerClassName(speaker)}`;
+        speakerEl.className = `transcript-speaker ${recordingId
+          ? getSpeakerScopeClassName(recordings, recordingId, speaker)
+          : getSpeakerClassName(speaker)}`;
         speakerEl.textContent = `${displaySpeaker}：`;
         textEl.appendChild(speakerEl);
         textEl.appendChild(document.createTextNode(body));
@@ -631,9 +813,11 @@ function renderTranscriptTextInto(
   text: string,
   mapSpeakerLabel: (speakerLabel: string) => string = (speakerLabel) => speakerLabel,
   onTimeClick?: (timeInSeconds: number) => void,
+  recordingId?: string,
+  recordings: Recording[] = [],
 ): void {
   container.innerHTML = '';
-  renderTranscriptSegmentInto(container, text, mapSpeakerLabel, onTimeClick);
+  renderTranscriptSegmentInto(container, text, mapSpeakerLabel, onTimeClick, recordingId, recordings);
 }
 
 function renderGeneratedTranscriptInto(
@@ -647,8 +831,21 @@ function renderGeneratedTranscriptInto(
 
   const mappingBySpeaker = buildSpeakerMappingLookup(speakerMappings);
   const segments = getGeneratedTranscriptSegments(recordings, version);
+  const showSegmentLabels = segments.length > 1;
 
   for (const [index, { recording, text }] of segments.entries()) {
+    if (showSegmentLabels) {
+      const segmentBadge = document.createElement('div');
+      segmentBadge.className = 'transcript-segment-badge';
+      segmentBadge.dataset.recordingId = recording.id;
+      segmentBadge.dataset.segmentIndex = String(recordings.findIndex((item) => item.id === recording.id) + 1);
+      const segmentIndex = recordings.findIndex((item) => item.id === recording.id) + 1;
+      segmentBadge.textContent = recording.original_file_name
+        ? `段落 ${segmentIndex}（${recording.original_file_name}）`
+        : `段落 ${segmentIndex}`;
+      container.appendChild(segmentBadge);
+    }
+
     if (index > 0 && !recording.no_break_before) {
       const divider = document.createElement('div');
       divider.className = 'recording-break-divider';
@@ -661,7 +858,71 @@ function renderGeneratedTranscriptInto(
       text,
       (speakerLabel) => getMappedSpeakerName(mappingBySpeaker, recording.id, speakerLabel),
       getTimeClickHandler?.(recording.id),
+      recording.id,
+      recordings,
     );
+  }
+}
+
+function renderDraftRowsInto(
+  container: HTMLElement,
+  rows: TranscriptDraftRow[],
+  recordings: Recording[],
+  speakerMappings: SpeakerMapping[],
+  getTimeClickHandler: (recordingId: string) => (timeInSeconds: number) => void,
+): void {
+  container.innerHTML = '';
+  const mappingBySpeaker = buildSpeakerMappingLookup(speakerMappings);
+  const showSegmentLabels = new Set(rows.map((row) => row.recordingId)).size > 1;
+  let previousRecordingId = '';
+
+  for (const rowData of rows) {
+    if (rowData.recordingId !== previousRecordingId) {
+      if (previousRecordingId && !rowData.noBreakBefore) {
+        const divider = document.createElement('div');
+        divider.className = 'recording-break-divider';
+        divider.textContent = '☕ 中場休息';
+        container.appendChild(divider);
+      }
+      if (showSegmentLabels) {
+        const badge = document.createElement('div');
+        badge.className = 'transcript-segment-badge';
+        badge.dataset.recordingId = rowData.recordingId;
+        badge.dataset.segmentIndex = String(rowData.segmentIndex);
+        const recording = recordings.find((item) => item.id === rowData.recordingId);
+        badge.textContent = recording?.original_file_name
+          ? `段落 ${rowData.segmentIndex}（${recording.original_file_name}）`
+          : `段落 ${rowData.segmentIndex}`;
+        container.appendChild(badge);
+      }
+      previousRecordingId = rowData.recordingId;
+    }
+
+    const row = document.createElement('div');
+    row.className = 'transcript-row';
+    row.dataset.recordingId = rowData.recordingId;
+    if (rowData.speakerLabel) row.dataset.speakerLabel = rowData.speakerLabel;
+
+    const time = document.createElement('span');
+    time.className = 'transcript-time';
+    time.textContent = rowData.time;
+    time.title = '點擊跳轉至此時間點播放';
+    time.addEventListener('click', () => {
+      getTimeClickHandler(rowData.recordingId)(parseTimeToSeconds(rowData.time));
+    });
+    row.appendChild(time);
+
+    const text = document.createElement('span');
+    text.className = 'transcript-text';
+    if (rowData.speakerLabel) {
+      const speaker = document.createElement('span');
+      speaker.className = `transcript-speaker ${getSpeakerScopeClassName(recordings, rowData.recordingId, rowData.speakerLabel)}`;
+      speaker.textContent = `${getMappedSpeakerName(mappingBySpeaker, rowData.recordingId, rowData.speakerLabel)}：`;
+      text.appendChild(speaker);
+    }
+    text.appendChild(document.createTextNode(rowData.text));
+    row.appendChild(text);
+    container.appendChild(row);
   }
 }
 
@@ -848,6 +1109,36 @@ function buildTranscriptSection(
     }))
     .filter((group) => group.speakerLabels.length > 0);
 
+  const getBaseSegments = (baseVersion: ManualBaseVersion): TranscriptSegmentSource[] =>
+    getGeneratedTranscriptSegments(recordings, baseVersion).map((segment) => ({
+      recording: segment.recording,
+      segmentIndex: segment.segmentIndex,
+      text: segment.text,
+    }));
+
+  const getManualDraftParse = (): TranscriptDraftParseResult => {
+    if (!loadedTranscript.manual_content || !loadedTranscript.manual_base_version) {
+      return { rows: [], reason: '尚未建立手動版基底' };
+    }
+    return getCachedManualDraftParse(
+      loadedTranscript.manual_content,
+      getBaseSegments(loadedTranscript.manual_base_version),
+    );
+  };
+
+  const getSpeakerLabelsForRecording = (recordingId: string): string[] => {
+    const labels = new Set<string>();
+    const recording = recordings.find((item) => item.id === recordingId);
+    for (const label of extractSpeakerLabels(recording?.segment_transcript, recording?.segment_proofread)) labels.add(label);
+    for (const row of getManualDraftParse().rows) {
+      if (row.recordingId === recordingId && isSpeakerLabel(row.speakerLabel)) labels.add(row.speakerLabel);
+    }
+    for (const mapping of localMappings) {
+      if (mapping.recording_id === recordingId && isSpeakerLabel(mapping.speaker_label)) labels.add(mapping.speaker_label);
+    }
+    return Array.from(labels).sort((left, right) => left.localeCompare(right));
+  };
+
   // 版本切換 Tab
   const tabs = document.createElement('div');
   tabs.className = 'version-tabs';
@@ -906,12 +1197,69 @@ function buildTranscriptSection(
     }
   };
 
-  if (recordingSpeakerGroups.length > 0) {
-    const mappingPanel = document.createElement('div');
-    mappingPanel.className = 'speaker-mapping-panel';
+  const scrollTranscriptTo = (recordingId: string, speakerLabel?: string, root: HTMLElement = content): void => {
+    const escapedRecordingId = CSS.escape(recordingId);
+    const selector = speakerLabel
+      ? `.transcript-row[data-recording-id="${escapedRecordingId}"][data-speaker-label="${CSS.escape(speakerLabel)}"], .structured-editor-row[data-recording-id="${escapedRecordingId}"][data-speaker-label="${CSS.escape(speakerLabel)}"]`
+      : `.transcript-segment-badge[data-recording-id="${escapedRecordingId}"], .structured-editor-segment[data-recording-id="${escapedRecordingId}"], .transcript-row[data-recording-id="${escapedRecordingId}"], .structured-editor-row[data-recording-id="${escapedRecordingId}"]`;
+    const target = root.querySelector<HTMLElement>(selector);
+    if (!target) {
+      showToast('目前逐字稿版本沒有可定位的錄音段落資訊', 'info');
+      return;
+    }
+    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
 
-    const mappingTitle = document.createElement('div');
-    mappingTitle.className = 'speaker-mapping-title';
+  const mappingRowElements = new Map<string, Set<HTMLElement>>();
+  const getActiveSpeakerLabels = (version: TranscriptVersion): Map<string, Set<string>> | null => {
+    const active = new Map<string, Set<string>>();
+    if (version === 'manual') {
+      const parsed = getManualDraftParse();
+      if (parsed.reason) return null;
+      for (const row of parsed.rows) {
+        if (!isSpeakerLabel(row.speakerLabel)) continue;
+        const labels = active.get(row.recordingId) ?? new Set<string>();
+        labels.add(row.speakerLabel);
+        active.set(row.recordingId, labels);
+      }
+      return active;
+    }
+
+    for (const recording of recordings) {
+      const labels = extractSpeakerLabels(getRecordingTranscriptText(recording, version));
+      active.set(recording.id, new Set(labels));
+    }
+    return active;
+  };
+
+  const refreshMappingActivity = (): void => {
+    const active = getActiveSpeakerLabels(currentVersion);
+    if (!active) return;
+    for (const [key, elements] of mappingRowElements) {
+      const separatorIndex = key.indexOf('::');
+      const recordingId = key.slice(0, separatorIndex);
+      const speakerLabel = key.slice(separatorIndex + 2);
+      const isActive = active.get(recordingId)?.has(speakerLabel) ?? false;
+      for (const element of elements) {
+        element.classList.toggle('speaker-mapping-unused', !isActive);
+        element.title = isActive
+          ? ''
+          : '目前版本未使用此講者，但仍保留對應供其他版本使用';
+      }
+    }
+  };
+
+  const buildSpeakerMappingPanel = (
+    onJump: (recordingId: string, speakerLabel?: string) => void,
+    open = true,
+  ): HTMLElement | null => {
+    if (recordingSpeakerGroups.length === 0) return null;
+    const mappingPanel = document.createElement('details');
+    mappingPanel.className = 'speaker-mapping-panel';
+    mappingPanel.open = open;
+
+    const mappingTitle = document.createElement('summary');
+    mappingTitle.className = 'speaker-mapping-title speaker-mapping-summary';
     mappingTitle.textContent = '講者對應';
     mappingPanel.appendChild(mappingTitle);
 
@@ -921,24 +1269,49 @@ function buildTranscriptSection(
       hint.textContent = '請先在編輯會議新增參與者後，再設定講者對應。';
       mappingPanel.appendChild(hint);
     } else {
-      for (const { recording, segmentIndex, speakerLabels } of recordingSpeakerGroups) {
-        const groupTitle = document.createElement('div');
-        groupTitle.className = 'speaker-mapping-title';
+      for (const { recording, segmentIndex } of recordingSpeakerGroups) {
+        const speakerLabels = getSpeakerLabelsForRecording(recording.id);
+        const groupTitle = document.createElement('button');
+        groupTitle.type = 'button';
+        groupTitle.className = 'speaker-mapping-title speaker-mapping-segment-link';
         groupTitle.textContent = recording.original_file_name
           ? `段落 ${segmentIndex}（${recording.original_file_name}）`
           : `段落 ${segmentIndex}`;
+        groupTitle.title = `跳至段落 ${segmentIndex} 開始`;
+        groupTitle.addEventListener('click', () => onJump(recording.id));
         mappingPanel.appendChild(groupTitle);
+
+        if (isDiarizationDegraded(recording)) {
+          mappingPanel.appendChild(buildDiarizationQualityHint());
+        }
 
         const mappingList = document.createElement('div');
         mappingList.className = 'speaker-mapping-list';
 
         for (const speakerLabel of speakerLabels) {
-          const row = document.createElement('label');
-          row.className = 'speaker-mapping-row';
+           const row = document.createElement('label');
+           row.className = 'speaker-mapping-row';
+           const rowKey = getSpeakerMappingKey(recording.id, speakerLabel);
+           const rowsForSpeaker = mappingRowElements.get(rowKey) ?? new Set<HTMLElement>();
+           rowsForSpeaker.add(row);
+           mappingRowElements.set(rowKey, rowsForSpeaker);
 
           const label = document.createElement('span');
-          label.className = `transcript-speaker ${getSpeakerClassName(speakerLabel)}`;
-          label.textContent = speakerLabel;
+           label.className = `transcript-speaker ${getSpeakerScopeClassName(recordings, recording.id, speakerLabel, speakerLabels)}`;
+           label.dataset.recordingId = recording.id;
+           label.textContent = speakerLabel;
+           label.title = `跳至段落 ${segmentIndex} 的${speakerLabel}首次發言`;
+           label.tabIndex = 0;
+           label.setAttribute('role', 'button');
+           const jumpToSpeaker = (event: Event): void => {
+             event.preventDefault();
+             event.stopPropagation();
+             onJump(recording.id, speakerLabel);
+           };
+           label.addEventListener('click', jumpToSpeaker);
+           label.addEventListener('keydown', (event) => {
+             if (event instanceof KeyboardEvent && (event.key === 'Enter' || event.key === ' ')) jumpToSpeaker(event);
+           });
 
           const select = document.createElement('select');
           select.className = 'form-control speaker-mapping-select';
@@ -988,7 +1361,20 @@ function buildTranscriptSection(
       }
     }
 
-    section.appendChild(mappingPanel);
+    return mappingPanel;
+  };
+
+  const mappingPanel = buildSpeakerMappingPanel((recordingId, speakerLabel) =>
+    scrollTranscriptTo(recordingId, speakerLabel),
+  );
+  if (mappingPanel) section.appendChild(mappingPanel);
+  refreshMappingActivity();
+
+  // 講者聲紋比對提議：僅本地 ASR（voxnote_asr）供應商可用，AssemblyAI 不顯示
+  // 任何相關 UI（見 add-speaker-voiceprint-matching design「僅限本地 ASR」）。
+  // 非同步載入，不阻塞逐字稿區塊的初始渲染。
+  if (mappingPanel) {
+    void loadVoiceprintProposals(meetingId, mappingPanel, onSpeakerMappingChanged);
   }
 
   const getTimeClickHandler = (recordingId: string): (timeInSeconds: number) => void => {
@@ -996,16 +1382,23 @@ function buildTranscriptSection(
       const audioEl = document.querySelector<HTMLAudioElement>(
         `audio[data-recording-id="${CSS.escape(recordingId)}"]`,
       );
-      if (!audioEl) return;
-      const target = isFinite(audioEl.duration) ? Math.min(timeInSeconds, audioEl.duration) : timeInSeconds;
+      if (!audioEl || !audioEl.src) {
+        showToast('找不到此逐字稿列所屬的錄音', 'warning');
+        return;
+      }
+      const target = isFinite(audioEl.duration) ? Math.min(Math.max(0, timeInSeconds), audioEl.duration) : Math.max(0, timeInSeconds);
       audioEl.currentTime = target;
-      void audioEl.play().catch(() => { /* 忽略播放中斷 */ });
+      void audioEl.play().catch((error) => {
+        showToast(`錄音播放失敗：${String(error)}`, 'warning');
+      });
     };
   };
 
-  const getFallbackTimeClickHandler = (): ((timeInSeconds: number) => void) | undefined => {
-    const firstRec = recordings.find((r) => r.file_path);
-    return firstRec ? getTimeClickHandler(firstRec.id) : undefined;
+  const renderManualTranscript = (container: HTMLElement): boolean => {
+    const parsed = getManualDraftParse();
+    if (parsed.reason || parsed.rows.length === 0) return false;
+    renderDraftRowsInto(container, parsed.rows, recordings, localMappings, getTimeClickHandler);
+    return true;
   };
 
   function showVersion(version: TranscriptVersion): void {
@@ -1024,17 +1417,19 @@ function buildTranscriptSection(
         localMappings,
         getTimeClickHandler,
       );
+    } else if (version === 'manual' && renderManualTranscript(content)) {
+      // 可安全解析的手動版逐列保留錄音來源，時間戳可精確播放。
     } else {
       renderTranscriptTextInto(
-        content,
-        getTranscriptRenderText(loadedTranscript, recordings, version),
-        mapTranscriptSpeakerLabel(),
-        getFallbackTimeClickHandler(),
-      );
+          content,
+          getTranscriptRenderText(loadedTranscript, recordings, version),
+          mapTranscriptSpeakerLabel(),
+        );
     }
     for (const [tabVersion, button] of tabButtons) {
       button.classList.toggle('active', tabVersion === version);
     }
+    refreshMappingActivity();
   }
 
   async function ensureManualVersion(
@@ -1114,7 +1509,233 @@ function buildTranscriptSection(
 
     let overlayVersion: TranscriptVersion = initialVersion;
     let isEditing = startEditing;
-    let editorValue = getTranscriptDisplayText(loadedTranscript, recordings, 'manual', localMappings);
+    type ManualEditMode = 'structured' | 'text';
+    let editMode: ManualEditMode = 'structured';
+    let draftText = getTranscriptRenderText(loadedTranscript, recordings, 'manual');
+    let draftRows: TranscriptDraftRow[] | null = null;
+    let lastSavedText = draftText;
+    let structuredError = '';
+
+    const getDraftBaseSegments = (): TranscriptSegmentSource[] => {
+      const baseVersion = loadedTranscript.manual_base_version ?? 'original';
+      return getGeneratedTranscriptSegments(recordings, baseVersion).map((segment) => ({
+        recording: segment.recording,
+        segmentIndex: segment.segmentIndex,
+        text: segment.text,
+      }));
+    };
+
+    const initializeDraft = (): void => {
+      draftText = getTranscriptRenderText(loadedTranscript, recordings, 'manual');
+      lastSavedText = draftText;
+      const result = getCachedManualDraftParse(draftText, getDraftBaseSegments());
+      draftRows = result.reason ? null : result.rows;
+      structuredError = result.reason ?? '';
+      editMode = draftRows ? 'structured' : 'text';
+    };
+
+    const syncDraftTextFromRows = (): void => {
+      if (draftRows) draftText = serializeDraftRows(draftRows, recordings);
+    };
+
+    const getDraftSpeakerLabels = (recordingId: string): string[] => {
+      const labels = new Set(getSpeakerLabelsForRecording(recordingId));
+      for (const row of draftRows ?? []) {
+        if (row.recordingId === recordingId && isSpeakerLabel(row.speakerLabel)) labels.add(row.speakerLabel);
+      }
+      return Array.from(labels).sort((left, right) => left.localeCompare(right));
+    };
+
+    const getNextSpeakerLabel = (recordingId: string): string => {
+      const used = new Set(getDraftSpeakerLabels(recordingId));
+      for (let index = 0; index < 26; index += 1) {
+        const label = `講者${String.fromCharCode(65 + index)}`;
+        if (!used.has(label)) return label;
+      }
+      let index = 1;
+      while (used.has(`講者${index}`)) index += 1;
+      return `講者${index}`;
+    };
+
+    const getTimeError = (row: TranscriptDraftRow, value: string): string => {
+      if (!/^\d+:\d{2}$/.test(value.trim())) return '格式須為分:秒，例如 02:05';
+      const seconds = parseTimeToSeconds(value);
+      if (!Number.isFinite(seconds) || seconds < 0) return '時間不可為負值';
+      const recording = recordings.find((item) => item.id === row.recordingId);
+      if (recording?.duration_seconds !== null && recording?.duration_seconds !== undefined && seconds > recording.duration_seconds) {
+        return '時間不可超出所屬錄音長度';
+      }
+      return '';
+    };
+
+    const validateDraftRows = (): string => {
+      for (const row of draftRows ?? []) {
+        const error = getTimeError(row, row.time);
+        if (error) return error;
+        if (!row.text.trim()) return '逐字稿列不可為空白';
+      }
+      return '';
+    };
+
+    const focusRowText = (rowId: string): void => {
+      window.setTimeout(() => {
+        document.querySelector<HTMLTextAreaElement>(`textarea[data-row-id="${CSS.escape(rowId)}"]`)?.focus();
+      }, 0);
+    };
+
+    const renderStructuredEditor = (editor: HTMLElement): void => {
+      editor.innerHTML = '';
+      if (!draftRows?.length) {
+        const empty = document.createElement('p');
+        empty.className = 'empty-hint';
+        empty.textContent = structuredError || '沒有可編輯的結構化逐字稿列。';
+        editor.appendChild(empty);
+        return;
+      }
+
+      let currentRecordingId = '';
+      for (const row of draftRows) {
+        if (row.recordingId !== currentRecordingId) {
+          currentRecordingId = row.recordingId;
+          const recording = recordings.find((item) => item.id === row.recordingId);
+          const heading = document.createElement('div');
+          heading.className = 'structured-editor-segment';
+          heading.dataset.recordingId = row.recordingId;
+          heading.dataset.segmentIndex = String(row.segmentIndex);
+          heading.textContent = recordings.length > 1
+            ? `段落 ${row.segmentIndex}${recording?.original_file_name ? `（${recording.original_file_name}）` : ''}`
+            : '錄音內容';
+          editor.appendChild(heading);
+        }
+
+        const rowEl = document.createElement('div');
+        rowEl.className = `structured-editor-row ${row.speakerLabel
+          ? getSpeakerScopeClassName(recordings, row.recordingId, row.speakerLabel, getDraftSpeakerLabels(row.recordingId))
+          : ''}`;
+        rowEl.dataset.recordingId = row.recordingId;
+        if (row.speakerLabel) rowEl.dataset.speakerLabel = row.speakerLabel;
+
+        const timeInput = document.createElement('input');
+        timeInput.className = 'structured-editor-time';
+        timeInput.type = 'text';
+        timeInput.value = row.time;
+        timeInput.title = '點擊播放，或直接編輯時間';
+        const timeError = getTimeError(row, row.time);
+        timeInput.classList.toggle('has-error', Boolean(timeError));
+        timeInput.addEventListener('click', (event) => {
+          if ((event.target as HTMLInputElement).selectionStart !== (event.target as HTMLInputElement).selectionEnd) return;
+          getTimeClickHandler(row.recordingId)(parseTimeToSeconds(row.time));
+        });
+        timeInput.addEventListener('input', () => {
+          row.time = timeInput.value.trim();
+          timeInput.classList.toggle('has-error', Boolean(getTimeError(row, row.time)));
+        });
+        rowEl.appendChild(timeInput);
+
+        const controls = document.createElement('div');
+        controls.className = 'structured-editor-controls';
+        const speakerSelect = document.createElement('select');
+        speakerSelect.className = 'structured-editor-speaker';
+        const emptySpeakerOption = document.createElement('option');
+        emptySpeakerOption.value = '';
+        emptySpeakerOption.textContent = '未指定講者';
+        speakerSelect.appendChild(emptySpeakerOption);
+        const labels = getDraftSpeakerLabels(row.recordingId);
+        for (const label of labels) {
+          const option = document.createElement('option');
+          option.value = label;
+          option.textContent = getSpeakerDisplayLabel(
+            buildSpeakerMappingLookup(localMappings),
+            row.recordingId,
+            label,
+          );
+          speakerSelect.appendChild(option);
+        }
+        const addSpeakerOption = document.createElement('option');
+        addSpeakerOption.value = '__add_speaker__';
+        addSpeakerOption.textContent = '＋新增講者代號（自動產生）';
+        speakerSelect.appendChild(addSpeakerOption);
+        if (row.speakerLabel) speakerSelect.value = row.speakerLabel;
+        speakerSelect.addEventListener('change', () => {
+          if (speakerSelect.value === addSpeakerOption.value) {
+            row.speakerLabel = getNextSpeakerLabel(row.recordingId);
+            renderFullscreen();
+            focusRowText(row.id);
+            return;
+          }
+          row.speakerLabel = speakerSelect.value || undefined;
+          renderFullscreen();
+          focusRowText(row.id);
+        });
+        controls.appendChild(speakerSelect);
+        rowEl.appendChild(controls);
+
+        const textInput = document.createElement('textarea');
+        textInput.className = 'structured-editor-text';
+        textInput.dataset.rowId = row.id;
+        textInput.value = row.text;
+        textInput.rows = 2;
+        textInput.addEventListener('input', () => {
+          row.text = textInput.value;
+        });
+        rowEl.appendChild(textInput);
+
+        const splitBtn = document.createElement('button');
+        splitBtn.className = 'btn btn-ghost btn-xs structured-editor-split';
+        splitBtn.type = 'button';
+        splitBtn.textContent = '在游標處拆分';
+        splitBtn.addEventListener('click', () => {
+          const cursor = textInput.selectionStart ?? 0;
+          const before = row.text.slice(0, cursor);
+          const after = row.text.slice(cursor);
+          if (!before.trim() || !after.trim()) {
+            showToast('拆分位置前後都必須有文字', 'warning');
+            return;
+          }
+          const audioEl = document.querySelector<HTMLAudioElement>(`audio[data-recording-id="${CSS.escape(row.recordingId)}"]`);
+          const isPlaying = Boolean(audioEl && !audioEl.paused && Number.isFinite(audioEl.currentTime));
+          const newRow: TranscriptDraftRow = {
+            ...row,
+            id: `${row.id}-split-${Date.now()}`,
+            text: after.trimStart(),
+            time: isPlaying ? formatSecondsToTime(audioEl!.currentTime) : row.time,
+            timeHint: isPlaying ? undefined : '時間沿用原列，可修改',
+          };
+          row.text = before.trimEnd();
+          const rowIndex = draftRows!.findIndex((item) => item.id === row.id);
+          draftRows!.splice(rowIndex + 1, 0, newRow);
+          renderFullscreen();
+          focusRowText(newRow.id);
+        });
+        rowEl.appendChild(splitBtn);
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'btn btn-ghost btn-xs structured-editor-delete';
+        deleteBtn.type = 'button';
+        deleteBtn.textContent = '刪除此列';
+        deleteBtn.title = '刪除目前時間戳與文字列';
+        deleteBtn.addEventListener('click', () => {
+          const rowIndex = draftRows!.findIndex((item) => item.id === row.id);
+          const segmentRowCount = draftRows!.filter((item) => item.recordingId === row.recordingId).length;
+          if (segmentRowCount <= 1) {
+            showToast('每個錄音段落至少保留一列；可先將內容合併到其他列', 'warning');
+            return;
+          }
+          const focusRow = draftRows![rowIndex + 1] ?? draftRows![rowIndex - 1];
+          draftRows!.splice(rowIndex, 1);
+          renderFullscreen();
+          if (focusRow) focusRowText(focusRow.id);
+        });
+        rowEl.appendChild(deleteBtn);
+        if (row.timeHint) {
+          const hint = document.createElement('span');
+          hint.className = 'structured-editor-row-hint';
+          hint.textContent = row.timeHint;
+          rowEl.appendChild(hint);
+        }
+        editor.appendChild(rowEl);
+      }
+    };
 
     const renderFullscreen = (): void => {
       body.innerHTML = '';
@@ -1146,27 +1767,90 @@ function buildTranscriptSection(
       meta.textContent = loadedTranscript.manual_content && overlayVersion === 'manual' && loadedTranscript.manual_base_version
         ? `來源：${getTranscriptVersionLabel(loadedTranscript.manual_base_version)}`
         : getTranscriptVersionLabel(overlayVersion);
+      if (isEditing) {
+        const editorStatus = document.createElement('span');
+        editorStatus.className = 'transcript-editor-status';
+        editorStatus.textContent = '手動編輯版會獨立保存，不會覆蓋原始版或校稿版。';
+        meta.appendChild(editorStatus);
+      }
 
       if (isEditing) {
-        const hint = document.createElement('p');
-        hint.className = 'form-hint transcript-editor-hint';
-        hint.textContent = '手動編輯版會獨立保存，不會覆蓋原始版或校稿版。';
-        body.appendChild(hint);
+        const modeControls = document.createElement('div');
+        modeControls.className = 'transcript-editor-mode-controls';
+        modeControls.setAttribute('role', 'tablist');
+        modeControls.setAttribute('aria-label', '手動編輯模式');
+        for (const mode of [
+          { value: 'structured' as const, label: '結構化編輯' },
+          { value: 'text' as const, label: '純文字編輯' },
+        ]) {
+          const modeBtn = document.createElement('button');
+          modeBtn.type = 'button';
+          modeBtn.className = `transcript-editor-mode-tab ${editMode === mode.value ? 'active' : ''}`;
+          modeBtn.textContent = mode.label;
+          modeBtn.setAttribute('role', 'tab');
+          modeBtn.setAttribute('aria-selected', String(editMode === mode.value));
+          modeBtn.addEventListener('click', () => {
+            if (editMode === mode.value) return;
+            if (editMode === 'structured') {
+              syncDraftTextFromRows();
+            } else if (mode.value === 'structured') {
+              const parsed = getCachedManualDraftParse(draftText, getDraftBaseSegments());
+              if (parsed.reason) {
+                structuredError = parsed.reason;
+                showToast(`無法安全切換為結構化編輯：${parsed.reason}`, 'warning');
+                return;
+              }
+              draftRows = parsed.rows;
+            }
+            editMode = mode.value;
+            renderFullscreen();
+          });
+          modeControls.appendChild(modeBtn);
+        }
+        body.appendChild(modeControls);
 
-        const textarea = document.createElement('textarea');
-        textarea.className = 'transcript-editor';
-        textarea.value = editorValue;
-        textarea.addEventListener('input', () => {
-          editorValue = textarea.value;
-        });
-        body.appendChild(textarea);
+        const editorShell = document.createElement('div');
+        editorShell.className = `transcript-editor-shell ${editMode === 'structured' ? 'structured-editor' : ''}`;
+        const editorMappingPanel = buildSpeakerMappingPanel(
+          (recordingId, speakerLabel) => scrollTranscriptTo(recordingId, speakerLabel, editorShell),
+          false,
+        );
+        if (editorMappingPanel) {
+          editorMappingPanel.classList.add('transcript-editor-mapping-panel');
+          body.appendChild(editorMappingPanel);
+          refreshMappingActivity();
+        }
+        if (editMode === 'structured') {
+          renderStructuredEditor(editorShell);
+        } else {
+          const textarea = document.createElement('textarea');
+          textarea.className = 'transcript-editor';
+          textarea.value = draftText;
+          const rowCountHint = document.createElement('div');
+          rowCountHint.className = 'form-hint transcript-editor-row-count';
+          const updateRowCountHint = (): void => {
+            const rowCount = draftText.split('\n').filter((line) => transcriptUtteranceRe.test(line.trim())).length;
+            rowCountHint.textContent = `目前可辨識逐字稿列：${rowCount}`;
+          };
+          updateRowCountHint();
+          textarea.addEventListener('input', () => {
+            draftText = textarea.value;
+            structuredError = '';
+            updateRowCountHint();
+          });
+          editorShell.appendChild(textarea);
+          editorShell.appendChild(rowCountHint);
+        }
+        body.appendChild(editorShell);
 
         const cancelBtn = document.createElement('button');
         cancelBtn.className = 'btn btn-secondary';
         cancelBtn.textContent = '取消';
-        cancelBtn.addEventListener('click', () => {
+          cancelBtn.addEventListener('click', () => {
           isEditing = false;
-          editorValue = getTranscriptDisplayText(loadedTranscript, recordings, 'manual', localMappings);
+          draftText = lastSavedText;
+          draftRows = null;
+          structuredError = '';
           renderFullscreen();
         });
 
@@ -1175,12 +1859,20 @@ function buildTranscriptSection(
         saveBtn.textContent = '儲存手動編輯版';
         saveBtn.addEventListener('click', async () => {
           try {
+            if (editMode === 'structured') syncDraftTextFromRows();
+            const validationError = editMode === 'structured' ? validateDraftRows() : '';
+            if (validationError) {
+              showToast(validationError, 'warning');
+              return;
+            }
             const baseVersion = (loadedTranscript.manual_base_version ?? 'original') as ManualBaseVersion;
-            const updated = await onSaveManualTranscript(editorValue, baseVersion);
+            const updated = await onSaveManualTranscript(draftText, baseVersion);
             replaceTranscript(updated);
             overlayVersion = 'manual';
             isEditing = false;
-            editorValue = getTranscriptDisplayText(loadedTranscript, recordings, 'manual', localMappings);
+            lastSavedText = draftText;
+            draftRows = null;
+            structuredError = '';
             showVersion('manual');
             renderFullscreen();
             showToast('手動編輯版已儲存', 'success');
@@ -1211,12 +1903,13 @@ function buildTranscriptSection(
           localMappings,
           getTimeClickHandler,
         );
+      } else if (overlayVersion === 'manual' && renderManualTranscript(viewer)) {
+        // 可安全解析的手動版逐列保留錄音來源，時間戳可精確播放。
       } else {
         renderTranscriptTextInto(
           viewer,
           getTranscriptRenderText(loadedTranscript, recordings, overlayVersion),
           mapTranscriptSpeakerLabel(),
-          getFallbackTimeClickHandler(),
         );
       }
       body.appendChild(viewer);
@@ -1230,12 +1923,12 @@ function buildTranscriptSection(
       });
       footer.appendChild(copyBtn);
 
-      if (overlayVersion === 'manual' && loadedTranscript.manual_content) {
+        if (overlayVersion === 'manual' && loadedTranscript.manual_content) {
         const editBtn = document.createElement('button');
         editBtn.className = 'btn btn-primary';
         editBtn.textContent = '編輯手動版';
         editBtn.addEventListener('click', () => {
-          editorValue = getTranscriptDisplayText(loadedTranscript, recordings, 'manual', localMappings);
+          initializeDraft();
           isEditing = true;
           renderFullscreen();
         });
@@ -1251,7 +1944,7 @@ function buildTranscriptSection(
           const created = await ensureManualVersion(preferredBaseVersion);
           if (created) {
             overlayVersion = 'manual';
-            editorValue = getTranscriptDisplayText(loadedTranscript, recordings, 'manual', localMappings);
+            initializeDraft();
             isEditing = true;
             renderFullscreen();
           }
@@ -1273,6 +1966,7 @@ function buildTranscriptSection(
       }
     });
 
+    if (isEditing) initializeDraft();
     renderFullscreen();
   }
 
@@ -1625,6 +2319,10 @@ function buildRecordingSection(
   onReordered: (recordingId: string, direction: -1 | 1) => Promise<void>,
   onSegmentProofread: (recordingId: string) => Promise<{ warning: string | null }>,
   onBreakChanged: () => void,
+  pendingUploads: PendingRecordingUpload[],
+  isSavingUpload: boolean,
+  onPendingUploadsChanged: (saving?: boolean) => void,
+  onUploadCompleted: () => Promise<void>,
   // 逐字稿的校稿狀態。前端的處理中狀態存於記憶體，離開頁面即消失，
   // 故重新進入時需改以資料庫狀態判斷背景工作是否仍在進行。
   proofreadStatus?: string,
@@ -1637,6 +2335,35 @@ function buildRecordingSection(
   const heading = document.createElement('h3');
   heading.textContent = '錄音';
   header.appendChild(heading);
+
+  const uploadBtn = document.createElement('button');
+  uploadBtn.className = 'btn btn-secondary btn-sm recording-upload-btn';
+  uploadBtn.textContent = '上傳音訊';
+  uploadBtn.disabled = isSavingUpload;
+  uploadBtn.addEventListener('click', async () => {
+    if (isSavingUpload) return;
+    const selected = await openDialog({
+      multiple: true,
+      filters: [{ name: '音訊檔案', extensions: ['wav', 'mp3', 'm4a', 'aac', 'flac', 'ogg', 'wma'] }],
+    });
+    if (!selected) return;
+    const selectedPaths = Array.isArray(selected) ? selected : [selected];
+    const existingPaths = new Set(pendingUploads.map((item) => normalizeUploadPath(item.sourcePath)));
+    let added = false;
+    for (const sourcePath of selectedPaths) {
+      const normalizedPath = normalizeUploadPath(sourcePath);
+      if (existingPaths.has(normalizedPath)) continue;
+      existingPaths.add(normalizedPath);
+      pendingUploads.push({
+        sourcePath,
+        originalFileName: getUploadFileName(sourcePath),
+        error: null,
+      });
+      added = true;
+    }
+    if (added) onPendingUploadsChanged();
+  });
+  header.appendChild(uploadBtn);
   section.appendChild(header);
 
   const validRecordings = recordings.filter((r) => r.file_path);
@@ -1654,284 +2381,673 @@ function buildRecordingSection(
       window.location.hash = `#record/${meetingId}`;
     });
     section.appendChild(goBtn);
-    return section;
-  }
+  } else {
+    // 收折功能（2段以上才顯示）
+    let collapsed = validRecordings.length >= 2 ? isCollapsed : false;
+    const recordingList = document.createElement('div');
+    recordingList.className = 'recording-list';
+    recordingList.classList.toggle('hidden', collapsed);
 
-  // 收折功能（2段以上才顯示）
-  let collapsed = validRecordings.length >= 2 ? isCollapsed : false;
-  const recordingList = document.createElement('div');
-  recordingList.className = 'recording-list';
-  recordingList.classList.toggle('hidden', collapsed);
-
-  if (validRecordings.length >= 2) {
-    const toggleBtn = document.createElement('button');
-    toggleBtn.className = 'btn btn-ghost btn-sm recording-collapse-btn';
-    toggleBtn.textContent = getRecordingToggleLabel(validRecordings.length, collapsed);
-    toggleBtn.addEventListener('click', () => {
-      collapsed = !collapsed;
-      recordingList.classList.toggle('hidden', collapsed);
+    if (validRecordings.length >= 2) {
+      const toggleBtn = document.createElement('button');
+      toggleBtn.className = 'btn btn-ghost btn-sm recording-collapse-btn';
       toggleBtn.textContent = getRecordingToggleLabel(validRecordings.length, collapsed);
-      onCollapseChanged(collapsed);
-    });
-    header.appendChild(toggleBtn);
-  }
-
-  for (let i = 0; i < validRecordings.length; i++) {
-    const rec = validRecordings[i]!;
-    const segIndex = i + 1;
-    const transcribeKey = `transcribe:${rec.id}`;
-    const segmentProofreadKey = `proofread-segment:${rec.id}`;
-
-    const segWrap = document.createElement('div');
-    segWrap.className = 'recording-segment';
-
-    // 段落標題列
-    const segHeader = document.createElement('div');
-    segHeader.className = 'recording-segment-header';
-
-    const segTitle = document.createElement('span');
-    segTitle.className = 'recording-segment-title';
-    segTitle.textContent = validRecordings.length > 1 ? `段落 ${segIndex}` : '錄音檔';
-    segHeader.appendChild(segTitle);
-
-    if (rec.duration_seconds !== null) {
-      const dur = document.createElement('span');
-      dur.className = 'recording-segment-duration';
-      const m = Math.floor(rec.duration_seconds / 60);
-      const s = rec.duration_seconds % 60;
-      dur.textContent = `${m}:${String(s).padStart(2, '0')}`;
-      segHeader.appendChild(dur);
+      toggleBtn.addEventListener('click', () => {
+        collapsed = !collapsed;
+        recordingList.classList.toggle('hidden', collapsed);
+        toggleBtn.textContent = getRecordingToggleLabel(validRecordings.length, collapsed);
+        onCollapseChanged(collapsed);
+      });
+      header.appendChild(toggleBtn);
     }
 
-    // 轉譯狀態標籤。除了前端記憶體中的處理狀態，另需反映資料庫記錄的背景校稿，
-    // 否則離開頁面再進入時，仍在校稿的段落會被誤標為「轉譯中」。
-    const statusBadge = document.createElement('span');
-    const isTranscribing = isProcessing(transcribeKey);
-    const isBackgroundProofreading = proofreadStatus === 'running' && Boolean(rec.segment_transcript);
-    const inProgress = isTranscribing || isBackgroundProofreading;
-    statusBadge.className = `recording-segment-status ${inProgress ? 'processing' : rec.segment_transcript ? 'transcribed' : 'pending'}`;
-    statusBadge.textContent = isTranscribing
-      ? '轉譯中'
-      : isBackgroundProofreading
-        ? 'AI 校稿中'
-        : rec.segment_transcript
-          ? '已轉譯'
-          : '未轉譯';
-    segHeader.appendChild(statusBadge);
+    for (let i = 0; i < validRecordings.length; i++) {
+      const rec = validRecordings[i]!;
+      const segIndex = i + 1;
+      const transcribeKey = `transcribe:${rec.id}`;
+      const segmentProofreadKey = `proofread-segment:${rec.id}`;
 
-    segWrap.appendChild(segHeader);
+      const segWrap = document.createElement('div');
+      segWrap.className = 'recording-segment';
 
-    if (rec.original_file_name) {
-      const originalFileName = document.createElement('div');
-      originalFileName.className = 'form-hint';
-      originalFileName.textContent = `原始檔名：${rec.original_file_name}`;
-      segWrap.appendChild(originalFileName);
-    }
+      // 段落標題列
+      const segHeader = document.createElement('div');
+      segHeader.className = 'recording-segment-header';
 
-    // 播放器
-    const audioEl = document.createElement('audio');
-    audioEl.preload = 'metadata';
-    audioEl.style.display = 'none';
-    audioEl.dataset.recordingId = rec.id;
-    void resolveRecordingSource(rec.file_path!).then((src) => {
-      if (audioEl.dataset.recordingId === rec.id) {
-        // crossOrigin 必須早於 src 設定才會生效。asset 協定與本頁不同源，
-        // 未以 CORS 模式載入時播放增益會因規範限制而被消音。
-        applyMediaCrossOrigin(audioEl, src);
-        audioEl.src = src;
+      const segTitle = document.createElement('span');
+      segTitle.className = 'recording-segment-title';
+      segTitle.textContent = validRecordings.length > 1 ? `段落 ${segIndex}` : '錄音檔';
+      segHeader.appendChild(segTitle);
+
+      if (rec.duration_seconds !== null) {
+        const dur = document.createElement('span');
+        dur.className = 'recording-segment-duration';
+        const m = Math.floor(rec.duration_seconds / 60);
+        const s = rec.duration_seconds % 60;
+        dur.textContent = `${m}:${String(s).padStart(2, '0')}`;
+        segHeader.appendChild(dur);
       }
-    }).catch((err) => {
-      showToast(`載入錄音失敗：${String(err)}`, 'error');
-    });
-    const playerEl = createWaveformPlayer(audioEl);
-    segWrap.appendChild(audioEl);
-    segWrap.appendChild(playerEl);
 
-    // 操作列
-    const segActions = document.createElement('div');
-    segActions.className = 'recording-segment-actions';
+      // 轉譯狀態標籤。除了前端記憶體中的處理狀態，另需反映資料庫記錄的背景校稿，
+      // 否則離開頁面再進入時，仍在校稿的段落會被誤標為「轉譯中」。
+      const statusBadge = document.createElement('span');
+      const isTranscribing = isProcessing(transcribeKey);
+      const isBackgroundProofreading = proofreadStatus === 'running' && Boolean(rec.segment_transcript);
+      const inProgress = isTranscribing || isBackgroundProofreading;
+      statusBadge.className = `recording-segment-status ${inProgress ? 'processing' : rec.segment_transcript ? 'transcribed' : 'pending'}`;
+      statusBadge.textContent = isTranscribing
+        ? '轉譯中'
+        : isBackgroundProofreading
+          ? 'AI 校稿中'
+          : rec.segment_transcript
+            ? '已轉譯'
+            : '未轉譯';
+      segHeader.appendChild(statusBadge);
 
-    if (validRecordings.length > 1) {
-      const moveUpBtn = document.createElement('button');
-      moveUpBtn.className = 'btn btn-ghost btn-sm';
-      moveUpBtn.textContent = '↑ 上移';
-      moveUpBtn.disabled = i === 0;
-      moveUpBtn.addEventListener('click', async () => {
-        try {
-          await onReordered(rec.id, -1);
-          showToast(`已將段落 ${segIndex} 往前移動`, 'success');
-        } catch (err) {
-          showToast(`調整順序失敗：${String(err)}`, 'error');
+      segWrap.appendChild(segHeader);
+
+      if (rec.original_file_name) {
+        const originalFileName = document.createElement('div');
+        originalFileName.className = 'form-hint';
+        originalFileName.textContent = `原始檔名：${rec.original_file_name}`;
+        segWrap.appendChild(originalFileName);
+      }
+
+      if (isDiarizationDegraded(rec)) {
+        segWrap.appendChild(buildDiarizationQualityHint());
+      }
+
+      // 播放器
+      const audioEl = document.createElement('audio');
+      audioEl.preload = 'metadata';
+      audioEl.style.display = 'none';
+      audioEl.dataset.recordingId = rec.id;
+      void resolveRecordingSource(rec.file_path!).then((src) => {
+        if (audioEl.dataset.recordingId === rec.id) {
+          // crossOrigin 必須早於 src 設定才會生效。asset 協定與本頁不同源，
+          // 未以 CORS 模式載入時播放增益會因規範限制而被消音。
+          applyMediaCrossOrigin(audioEl, src);
+          audioEl.src = src;
         }
+      }).catch((err) => {
+        showToast(`載入錄音失敗：${String(err)}`, 'error');
       });
-      segActions.appendChild(moveUpBtn);
+      const playerEl = createWaveformPlayer(audioEl);
+      segWrap.appendChild(audioEl);
+      segWrap.appendChild(playerEl);
 
-      const moveDownBtn = document.createElement('button');
-      moveDownBtn.className = 'btn btn-ghost btn-sm';
-      moveDownBtn.textContent = '↓ 下移';
-      moveDownBtn.disabled = i === validRecordings.length - 1;
-      moveDownBtn.addEventListener('click', async () => {
-        try {
-          await onReordered(rec.id, 1);
-          showToast(`已將段落 ${segIndex} 往後移動`, 'success');
-        } catch (err) {
-          showToast(`調整順序失敗：${String(err)}`, 'error');
-        }
-      });
-      segActions.appendChild(moveDownBtn);
-    }
+      // 操作列
+      const segActions = document.createElement('div');
+      segActions.className = 'recording-segment-actions';
 
-    const transcribeBtn = document.createElement('button');
-    transcribeBtn.className = 'btn btn-primary btn-sm';
-    if (isTranscribing) {
-      transcribeBtn.textContent = '轉譯中…';
-      transcribeBtn.disabled = true;
-    } else if (isBackgroundProofreading) {
-      // 背景校稿期間不可重新轉譯，否則會與進行中的校稿競寫同一份逐字稿
-      transcribeBtn.textContent = 'AI 校稿中…';
-      transcribeBtn.disabled = true;
-    } else {
-      transcribeBtn.textContent = rec.segment_transcript ? '重新轉譯' : '產生逐字稿';
-    }
-    transcribeBtn.addEventListener('click', async () => {
-      const key = `transcribe:${rec.id}`;
-      if (isProcessing(key)) return;
-      startProcessing(key, buildProcessingLabel(meetingTitle, '轉譯中', segIndex));
-      transcribeBtn.disabled = true;
-      transcribeBtn.textContent = '轉譯中…';
-      statusBadge.className = 'recording-segment-status processing';
-      statusBadge.textContent = '轉譯中';
-      showToast(`段落 ${segIndex} 轉譯中，請稍候…`, 'info');
+      if (validRecordings.length > 1) {
+        const moveUpBtn = document.createElement('button');
+        moveUpBtn.className = 'btn btn-ghost btn-sm';
+        moveUpBtn.textContent = '↑ 上移';
+        moveUpBtn.disabled = i === 0;
+        moveUpBtn.addEventListener('click', async () => {
+          try {
+            await onReordered(rec.id, -1);
+            showToast(`已將段落 ${segIndex} 往前移動`, 'success');
+          } catch (err) {
+            showToast(`調整順序失敗：${String(err)}`, 'error');
+          }
+        });
+        segActions.appendChild(moveUpBtn);
 
-      // 後端會在轉錄、AI 校稿等階段發出進度事件。長錄音的校稿需分段送交 LLM，
-      // 耗時可能遠超轉錄本身，若不顯示階段訊息會讓人誤以為程式卡住。
-      const unlistenProgress = await listen<{ meetingId: string; message: string }>(
-        'asr_progress',
-        (event) => {
-          if (event.payload.meetingId !== meetingId) return;
-          statusBadge.textContent = event.payload.message;
-          transcribeBtn.textContent = event.payload.message;
-        },
-      );
+        const moveDownBtn = document.createElement('button');
+        moveDownBtn.className = 'btn btn-ghost btn-sm';
+        moveDownBtn.textContent = '↓ 下移';
+        moveDownBtn.disabled = i === validRecordings.length - 1;
+        moveDownBtn.addEventListener('click', async () => {
+          try {
+            await onReordered(rec.id, 1);
+            showToast(`已將段落 ${segIndex} 往後移動`, 'success');
+          } catch (err) {
+            showToast(`調整順序失敗：${String(err)}`, 'error');
+          }
+        });
+        segActions.appendChild(moveDownBtn);
+      }
 
-      try {
-        await startTranscription(meetingId, rec.id, rec.file_path!);
-        showToast(
-          validRecordings.length > 1
-            ? `段落 ${segIndex} 轉譯完成，逐字稿已更新（含中場休息分隔）`
-            : '逐字稿已生成',
-          'success'
-        );
-        notifyTranscriptionCompleted(meetingTitle, segIndex, validRecordings.length > 1);
-        finishProcessing(key);
-        onTranscribed(rec.id);
-      } catch (err) {
-        showToast(`轉譯失敗：${String(err)}`, 'error');
-        finishProcessing(key, false);
-        transcribeBtn.disabled = false;
+      const transcribeBtn = document.createElement('button');
+      transcribeBtn.className = 'btn btn-primary btn-sm';
+      if (isTranscribing) {
+        transcribeBtn.textContent = '轉譯中…';
+        transcribeBtn.disabled = true;
+      } else if (isBackgroundProofreading) {
+        // 背景校稿期間不可重新轉譯，否則會與進行中的校稿競寫同一份逐字稿
+        transcribeBtn.textContent = 'AI 校稿中…';
+        transcribeBtn.disabled = true;
+      } else {
         transcribeBtn.textContent = rec.segment_transcript ? '重新轉譯' : '產生逐字稿';
-        statusBadge.className = `recording-segment-status ${rec.segment_transcript ? 'transcribed' : 'pending'}`;
-        statusBadge.textContent = rec.segment_transcript ? '已轉譯' : '未轉譯';
-      } finally {
-        unlistenProgress();
       }
-    });
-    segActions.appendChild(transcribeBtn);
+      transcribeBtn.addEventListener('click', async () => {
+        const key = `transcribe:${rec.id}`;
+        if (isProcessing(key)) return;
+        startProcessing(key, buildProcessingLabel(meetingTitle, '轉譯中', segIndex));
+        transcribeBtn.disabled = true;
+        transcribeBtn.textContent = '轉譯中…';
+        statusBadge.className = 'recording-segment-status processing';
+        statusBadge.textContent = '轉譯中';
+        showToast(`段落 ${segIndex} 轉譯中，請稍候…`, 'info');
 
-    if (rec.segment_transcript) {
-      const segmentProofreadBtn = document.createElement('button');
-      segmentProofreadBtn.className = 'btn btn-secondary btn-sm';
-      const isSegmentProofreading = isProcessing(segmentProofreadKey);
-      segmentProofreadBtn.textContent = isSegmentProofreading
-        ? '校稿此段中…'
-        : (rec.segment_proofread ? '重新校稿此段' : '校稿此段');
-      segmentProofreadBtn.disabled = isSegmentProofreading;
-      segmentProofreadBtn.addEventListener('click', async () => {
-        if (isProcessing(segmentProofreadKey)) return;
-        startProcessing(segmentProofreadKey, buildProcessingLabel(meetingTitle, 'AI校稿中', segIndex));
-        segmentProofreadBtn.disabled = true;
-        segmentProofreadBtn.textContent = '校稿此段中…';
-        showToast(`段落 ${segIndex} 校稿中，請稍候…`, 'info');
+        // 後端會在轉錄、AI 校稿等階段發出進度事件。長錄音的校稿需分段送交 LLM，
+        // 耗時可能遠超轉錄本身，若不顯示階段訊息會讓人誤以為程式卡住。
+        const unlistenProgress = await listen<{ meetingId: string; message: string }>(
+          'asr_progress',
+          (event) => {
+            if (event.payload.meetingId !== meetingId) return;
+            statusBadge.textContent = event.payload.message;
+            transcribeBtn.textContent = event.payload.message;
+          },
+        );
+
         try {
-          const result = await onSegmentProofread(rec.id);
+          await startTranscription(meetingId, rec.id, rec.file_path!);
           showToast(
-            result.warning
-              ? `段落 ${segIndex} 校稿已儲存，但結果可能不完整：${normalizeWarningMessage(result.warning)}`
-              : `段落 ${segIndex} 校稿完成，已更新校稿版逐字稿`,
-            result.warning ? 'warning' : 'success',
+            validRecordings.length > 1
+              ? `段落 ${segIndex} 轉譯完成，逐字稿已更新（含中場休息分隔）`
+              : '逐字稿已生成',
+            'success'
           );
-          notifySegmentProofreadCompleted(meetingTitle, segIndex, result.warning);
+          notifyTranscriptionCompleted(meetingTitle, segIndex, validRecordings.length > 1);
+          finishProcessing(key);
+          onTranscribed(rec.id);
         } catch (err) {
-          showToast(`段落校稿失敗：${String(err)}`, 'error');
+          showToast(`轉譯失敗：${String(err)}`, 'error');
+          finishProcessing(key, false);
+          transcribeBtn.disabled = false;
+          transcribeBtn.textContent = rec.segment_transcript ? '重新轉譯' : '產生逐字稿';
+          statusBadge.className = `recording-segment-status ${rec.segment_transcript ? 'transcribed' : 'pending'}`;
+          statusBadge.textContent = rec.segment_transcript ? '已轉譯' : '未轉譯';
+        } finally {
+          unlistenProgress();
         }
       });
-      segActions.appendChild(segmentProofreadBtn);
-    }
+      segActions.appendChild(transcribeBtn);
 
-    const deleteBtn = document.createElement('button');
-    deleteBtn.className = 'btn btn-danger btn-sm';
-    deleteBtn.textContent = '刪除';
-    deleteBtn.addEventListener('click', async () => {
-      if (!confirm(`確定要刪除段落 ${segIndex} 的錄音嗎？`)) return;
-      try {
-        await deleteRecording(rec.id);
-        showToast('錄音段落已刪除', 'success');
-        await onDeleted(rec.id);
-      } catch (err) {
-        showToast(`刪除失敗：${String(err)}`, 'error');
+      if (rec.segment_transcript) {
+        const segmentProofreadBtn = document.createElement('button');
+        segmentProofreadBtn.className = 'btn btn-secondary btn-sm';
+        const isSegmentProofreading = isProcessing(segmentProofreadKey);
+        segmentProofreadBtn.textContent = isSegmentProofreading
+          ? '校稿此段中…'
+          : (rec.segment_proofread ? '重新校稿此段' : '校稿此段');
+        segmentProofreadBtn.disabled = isSegmentProofreading;
+        segmentProofreadBtn.addEventListener('click', async () => {
+          if (isProcessing(segmentProofreadKey)) return;
+          startProcessing(segmentProofreadKey, buildProcessingLabel(meetingTitle, 'AI校稿中', segIndex));
+          segmentProofreadBtn.disabled = true;
+          segmentProofreadBtn.textContent = '校稿此段中…';
+          showToast(`段落 ${segIndex} 校稿中，請稍候…`, 'info');
+          try {
+            const result = await onSegmentProofread(rec.id);
+            showToast(
+              result.warning
+                ? `段落 ${segIndex} 校稿已儲存，但結果可能不完整：${normalizeWarningMessage(result.warning)}`
+                : `段落 ${segIndex} 校稿完成，已更新校稿版逐字稿`,
+              result.warning ? 'warning' : 'success',
+            );
+            notifySegmentProofreadCompleted(meetingTitle, segIndex, result.warning);
+          } catch (err) {
+            showToast(`段落校稿失敗：${String(err)}`, 'error');
+          }
+        });
+        segActions.appendChild(segmentProofreadBtn);
       }
-    });
-    segActions.appendChild(deleteBtn);
 
-    segWrap.appendChild(segActions);
-    recordingList.appendChild(segWrap);
-
-    // 段落間的中場休息分隔符（可刪除）
-    if (i < validRecordings.length - 1) {
-      const nextRec = validRecordings[i + 1]!;
-      const breakEl = document.createElement('div');
-      breakEl.className = `recording-break-divider${nextRec.no_break_before ? ' removed' : ''}`;
-
-      const breakLabel = document.createElement('span');
-      breakLabel.textContent = nextRec.no_break_before ? '（已移除中場休息）' : '☕ 中場休息';
-      breakEl.appendChild(breakLabel);
-
-      const breakToggleBtn = document.createElement('button');
-      breakToggleBtn.className = 'btn btn-ghost btn-xs break-toggle-btn';
-      breakToggleBtn.textContent = nextRec.no_break_before ? '✚ 還原' : '✕ 移除';
-      breakToggleBtn.addEventListener('click', async () => {
-        const newVal = !nextRec.no_break_before;
+      const deleteBtn = document.createElement('button');
+      deleteBtn.className = 'btn btn-danger btn-sm';
+      deleteBtn.textContent = '刪除';
+      deleteBtn.addEventListener('click', async () => {
+        if (!confirm(`確定要刪除段落 ${segIndex} 的錄音嗎？`)) return;
         try {
-          await setNoBreakBefore(nextRec.id, newVal);
-          nextRec.no_break_before = newVal ? 1 : 0;
-          breakEl.className = `recording-break-divider${newVal ? ' removed' : ''}`;
-          breakLabel.textContent = newVal ? '（已移除中場休息）' : '☕ 中場休息';
-          breakToggleBtn.textContent = newVal ? '✚ 還原' : '✕ 移除';
-          // 重新合併逐字稿
-          await remergeSegments(meetingId);
-          showToast(newVal ? '已移除中場休息分隔' : '已還原中場休息分隔', 'success');
-          onBreakChanged();
+          await deleteRecording(rec.id);
+          showToast('錄音段落已刪除', 'success');
+          await onDeleted(rec.id);
         } catch (err) {
-          showToast(`操作失敗：${String(err)}`, 'error');
+          showToast(`刪除失敗：${String(err)}`, 'error');
         }
       });
-      breakEl.appendChild(breakToggleBtn);
-      recordingList.appendChild(breakEl);
+      segActions.appendChild(deleteBtn);
+
+      segWrap.appendChild(segActions);
+      recordingList.appendChild(segWrap);
+
+      // 段落間的中場休息分隔符（可刪除）
+      if (i < validRecordings.length - 1) {
+        const nextRec = validRecordings[i + 1]!;
+        const breakEl = document.createElement('div');
+        breakEl.className = `recording-break-divider${nextRec.no_break_before ? ' removed' : ''}`;
+
+        const breakLabel = document.createElement('span');
+        breakLabel.textContent = nextRec.no_break_before ? '（已移除中場休息）' : '☕ 中場休息';
+        breakEl.appendChild(breakLabel);
+
+        const breakToggleBtn = document.createElement('button');
+        breakToggleBtn.className = 'btn btn-ghost btn-xs break-toggle-btn';
+        breakToggleBtn.textContent = nextRec.no_break_before ? '✚ 還原' : '✕ 移除';
+        breakToggleBtn.addEventListener('click', async () => {
+          const newVal = !nextRec.no_break_before;
+          try {
+            await setNoBreakBefore(nextRec.id, newVal);
+            nextRec.no_break_before = newVal ? 1 : 0;
+            breakEl.className = `recording-break-divider${newVal ? ' removed' : ''}`;
+            breakLabel.textContent = newVal ? '（已移除中場休息）' : '☕ 中場休息';
+            breakToggleBtn.textContent = newVal ? '✚ 還原' : '✕ 移除';
+            // 重新合併逐字稿
+            await remergeSegments(meetingId);
+            showToast(newVal ? '已移除中場休息分隔' : '已還原中場休息分隔', 'success');
+            onBreakChanged();
+          } catch (err) {
+            showToast(`操作失敗：${String(err)}`, 'error');
+          }
+        });
+        breakEl.appendChild(breakToggleBtn);
+        recordingList.appendChild(breakEl);
+      }
     }
+
+    section.appendChild(recordingList);
+
+    // 前往錄音頁新增段落
+    const addBtn = document.createElement('button');
+    addBtn.className = 'btn btn-secondary btn-sm recording-add-btn';
+    addBtn.textContent = '+ 新增錄音段落';
+    addBtn.addEventListener('click', () => {
+      window.location.hash = `#record/${meetingId}`;
+    });
+    section.appendChild(addBtn);
   }
 
-  section.appendChild(recordingList);
+  if (pendingUploads.length > 0) {
+    const panel = document.createElement('div');
+    panel.className = 'pending-recording-upload';
 
-  // 前往錄音頁新增段落
-  const addBtn = document.createElement('button');
-  addBtn.className = 'btn btn-secondary btn-sm recording-add-btn';
-  addBtn.textContent = '+ 新增錄音段落';
-  addBtn.addEventListener('click', () => {
-    window.location.hash = `#record/${meetingId}`;
-  });
-  section.appendChild(addBtn);
+    const panelTitle = document.createElement('div');
+    panelTitle.className = 'pending-recording-upload-title';
+    panelTitle.textContent = `待上傳檔案（${pendingUploads.length}）`;
+    panel.appendChild(panelTitle);
+
+    const list = document.createElement('div');
+    list.className = 'pending-recording-upload-list';
+    pendingUploads.forEach((item, index) => {
+      const row = document.createElement('div');
+      row.className = `pending-recording-upload-row${item.error ? ' has-error' : ''}`;
+      const name = document.createElement('span');
+      name.className = 'pending-recording-upload-name';
+      name.textContent = item.originalFileName;
+      name.title = item.sourcePath;
+      row.appendChild(name);
+      if (item.error) {
+        const error = document.createElement('span');
+        error.className = 'pending-recording-upload-error';
+        error.textContent = item.error;
+        row.appendChild(error);
+      }
+      const removeBtn = document.createElement('button');
+      removeBtn.className = 'btn btn-ghost btn-sm';
+      removeBtn.textContent = '移除';
+      removeBtn.disabled = isSavingUpload;
+      removeBtn.addEventListener('click', () => {
+        if (isSavingUpload) return;
+        pendingUploads.splice(index, 1);
+        onPendingUploadsChanged();
+      });
+      row.appendChild(removeBtn);
+      list.appendChild(row);
+    });
+    panel.appendChild(list);
+
+    const actions = document.createElement('div');
+    actions.className = 'pending-recording-upload-actions';
+    const addMoreBtn = document.createElement('button');
+    addMoreBtn.className = 'btn btn-secondary btn-sm';
+    addMoreBtn.textContent = '加入更多檔案';
+    addMoreBtn.disabled = isSavingUpload;
+    addMoreBtn.addEventListener('click', () => uploadBtn.click());
+    actions.appendChild(addMoreBtn);
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn btn-ghost btn-sm';
+    cancelBtn.textContent = '取消全部';
+    cancelBtn.disabled = isSavingUpload;
+    cancelBtn.addEventListener('click', () => {
+      if (isSavingUpload) return;
+      pendingUploads.splice(0, pendingUploads.length);
+      onPendingUploadsChanged();
+    });
+    actions.appendChild(cancelBtn);
+
+    const saveUploadBtn = document.createElement('button');
+    saveUploadBtn.className = 'btn btn-primary btn-sm';
+    saveUploadBtn.textContent = isSavingUpload ? '儲存中…' : '儲存錄音';
+    saveUploadBtn.disabled = isSavingUpload || pendingUploads.length === 0;
+    saveUploadBtn.addEventListener('click', async () => {
+      if (isSavingUpload || pendingUploads.length === 0) return;
+      onPendingUploadsChanged(true);
+      try {
+        const result = await importRecordingFiles(meetingId, pendingUploads.map((item) => ({
+          sourcePath: item.sourcePath,
+          originalFileName: item.originalFileName,
+        })));
+        const failedByPath = new Map(
+          result.results
+            .filter((item) => item.error)
+            .map((item) => [normalizeUploadPath(item.sourcePath), item.error!]),
+        );
+        for (let i = pendingUploads.length - 1; i >= 0; i--) {
+          const item = pendingUploads[i]!;
+          const error = failedByPath.get(normalizeUploadPath(item.sourcePath));
+          if (error) item.error = error;
+          else pendingUploads.splice(i, 1);
+        }
+        if (result.successCount > 0) await onUploadCompleted();
+        showToast(
+          result.failureCount === 0
+            ? `已成功儲存 ${result.successCount} 個錄音`
+            : result.successCount > 0
+              ? `已儲存 ${result.successCount} 個錄音，${result.failureCount} 個失敗`
+              : `${result.failureCount} 個錄音皆儲存失敗`,
+          result.failureCount === 0 ? 'success' : result.successCount > 0 ? 'warning' : 'error',
+        );
+      } catch (err) {
+        for (const item of pendingUploads) item.error = `批次匯入失敗：${String(err)}`;
+        showToast(`儲存錄音失敗：${String(err)}`, 'error');
+      } finally {
+        onPendingUploadsChanged(false);
+      }
+    });
+    actions.appendChild(saveUploadBtn);
+    panel.appendChild(actions);
+    section.appendChild(panel);
+  }
 
   return section;
+}
+
+function formatSecondsToTime(seconds: number): string {
+  const safeSeconds = Math.max(0, Math.floor(seconds));
+  return `${Math.floor(safeSeconds / 60)}:${String(safeSeconds % 60).padStart(2, '0')}`;
+}
+
+function parseUtteranceRows(text: string): Array<{ time: string; speakerLabel?: string; text: string }> | null {
+  const rows: Array<{ time: string; speakerLabel?: string; text: string }> = [];
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    const match = line.trim().match(transcriptUtteranceRe);
+    if (!match) return null;
+    const [, time, speakerLabel, body] = match;
+    rows.push({ time, speakerLabel: speakerLabel?.trim() || undefined, text: body });
+  }
+  return rows;
+}
+
+function splitTranscriptSegments(text: string): string[] {
+  return text.includes(MERGED_BREAK_SEPARATOR)
+    ? text.split(MERGED_BREAK_SEPARATOR).map((segment) => segment.trim())
+    : [text.trim()];
+}
+
+function normalizeTranscriptRowText(text: string): string {
+  return text.replace(/\s+/g, '').trim().toLocaleLowerCase();
+}
+
+function inferRowsByRecordingSegment(
+  manualRows: Array<{ time: string; speakerLabel?: string; text: string }>,
+  baseRows: Array<Array<{ time: string; speakerLabel?: string; text: string }>>,
+): Array<Array<{ time: string; speakerLabel?: string; text: string }>> | null {
+  if (baseRows.length === 1) return [manualRows];
+
+  const totalBaseRows = baseRows.reduce((total, rows) => total + rows.length, 0);
+  if (manualRows.length === totalBaseRows) {
+    const fixedRows: Array<Array<{ time: string; speakerLabel?: string; text: string }>> = [];
+    let offset = 0;
+    for (const segmentRows of baseRows) {
+      fixedRows.push(manualRows.slice(offset, offset + segmentRows.length));
+      offset += segmentRows.length;
+    }
+    return fixedRows;
+  }
+
+  const difference = manualRows.length - totalBaseRows;
+  const searchRadius = Math.min(32, Math.max(8, Math.abs(difference) + 6));
+  const inferred: Array<Array<{ time: string; speakerLabel?: string; text: string }>> = [];
+  let manualOffset = 0;
+  let baseOffset = 0;
+
+  for (let segmentIndex = 0; segmentIndex < baseRows.length; segmentIndex += 1) {
+    const segmentRows = baseRows[segmentIndex]!;
+    if (segmentIndex === baseRows.length - 1) {
+      const remaining = manualRows.slice(manualOffset);
+      if (!remaining.length) return null;
+      inferred.push(remaining);
+      break;
+    }
+
+    const nextBaseRows = baseRows[segmentIndex + 1]!;
+    const expectedBoundary = Math.round(
+      (baseOffset + segmentRows.length) + difference * ((baseOffset + segmentRows.length) / Math.max(1, totalBaseRows)),
+    );
+    const minimumBoundary = manualOffset + 1;
+    const remainingSegmentCount = baseRows.length - segmentIndex - 1;
+    const maximumBoundary = manualRows.length - remainingSegmentCount;
+    const from = Math.max(minimumBoundary, expectedBoundary - searchRadius);
+    const to = Math.min(maximumBoundary, expectedBoundary + searchRadius);
+    let bestBoundary = -1;
+    let bestScore = Number.NEGATIVE_INFINITY;
+
+    for (let boundary = from; boundary <= to; boundary += 1) {
+      let score = -Math.abs(boundary - expectedBoundary) * 0.05;
+      for (let lookahead = 0; lookahead < 4; lookahead += 1) {
+        const baseRow = nextBaseRows[lookahead];
+        const manualRow = manualRows[boundary + lookahead];
+        if (!baseRow || !manualRow) break;
+        if (baseRow.time === manualRow.time) score += 3;
+        if (normalizeTranscriptRowText(baseRow.text) === normalizeTranscriptRowText(manualRow.text)) score += 4;
+        if (baseRow.speakerLabel === manualRow.speakerLabel) score += 1;
+      }
+      const previousBaseRow = segmentRows[segmentRows.length - 1];
+      const previousManualRow = manualRows[boundary - 1];
+      if (previousBaseRow && previousManualRow) {
+        if (previousBaseRow.time === previousManualRow.time) score += 2;
+        if (normalizeTranscriptRowText(previousBaseRow.text) === normalizeTranscriptRowText(previousManualRow.text)) score += 3;
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestBoundary = boundary;
+      }
+    }
+
+    if (bestBoundary < 0 || bestScore < 3) return null;
+    inferred.push(manualRows.slice(manualOffset, bestBoundary));
+    manualOffset = bestBoundary;
+    baseOffset += segmentRows.length;
+  }
+
+  return inferred.length === baseRows.length ? inferred : null;
+}
+
+function parseManualDraftRows(
+  manualText: string,
+  baseSegments: TranscriptSegmentSource[],
+): TranscriptDraftParseResult {
+  if (!manualText.trim() || baseSegments.length === 0) {
+    return { rows: [], reason: '沒有可供結構化的逐字稿段落' };
+  }
+
+  const manualSegments = splitTranscriptSegments(manualText);
+  const baseRows = baseSegments.map((segment) => parseUtteranceRows(segment.text));
+  const invalidBaseIndex = baseRows.findIndex((rows) => !rows);
+  if (invalidBaseIndex >= 0) {
+    return { rows: [], reason: `基底逐字稿第 ${baseSegments[invalidBaseIndex]!.segmentIndex} 段包含無法辨識的格式` };
+  }
+
+  let rowsBySegment: Array<Array<{ time: string; speakerLabel?: string; text: string }>>;
+  if (manualSegments.length === baseSegments.length) {
+    rowsBySegment = [];
+    for (const [index, segment] of manualSegments.entries()) {
+      const parsedRows = parseUtteranceRows(segment);
+      if (!parsedRows) {
+        return { rows: [], reason: `手動版第 ${baseSegments[index]!.segmentIndex} 段包含無法辨識的文字格式` };
+      }
+      if (parsedRows.length === 0 && (baseRows[index]?.length ?? 0) > 0) {
+        return { rows: [], reason: `手動版第 ${baseSegments[index]!.segmentIndex} 段沒有可辨識列（基底有 ${baseRows[index]!.length} 列）` };
+      }
+      rowsBySegment.push(parsedRows);
+    }
+  } else if (manualSegments.length === 1) {
+    const allRows = parseUtteranceRows(manualSegments[0]!);
+    if (!allRows) return { rows: [], reason: '內容包含自由格式文字，無法安全對應錄音段落' };
+    const inferredRows = inferRowsByRecordingSegment(
+      allRows,
+      baseRows as Array<Array<{ time: string; speakerLabel?: string; text: string }>>,
+    );
+    if (!inferredRows) {
+      const expectedCount = baseRows.reduce((total, rows) => total + (rows?.length ?? 0), 0);
+      return {
+        rows: [],
+        reason: `目前 ${allRows.length} 列、基底 ${expectedCount} 列，且無法只依時間與文字可靠判定錄音段落邊界；這不一定是中場休息，可能是錄音中斷。請確認每列仍保留「[分:秒]」時間格式`,
+      };
+    }
+    rowsBySegment = inferredRows;
+  } else {
+    return {
+      rows: [],
+      reason: `手動版有 ${manualSegments.length} 個分隔段落，但基底有 ${baseSegments.length} 段錄音`,
+    };
+  }
+
+  const rows: TranscriptDraftRow[] = [];
+  for (const [segmentOffset, segment] of baseSegments.entries()) {
+    for (const [rowOffset, row] of rowsBySegment[segmentOffset]!.entries()) {
+      const baseRow = baseRows[segmentOffset]?.[rowOffset];
+      const speakerLabel = isSpeakerLabel(row.speakerLabel)
+        ? row.speakerLabel
+        : isSpeakerLabel(baseRow?.speakerLabel)
+          ? baseRow.speakerLabel
+          : undefined;
+      rows.push({
+        id: `${segment.recording.id}-${segmentOffset}-${rowOffset}-${Math.random().toString(36).slice(2, 8)}`,
+        recordingId: segment.recording.id,
+        segmentIndex: segment.segmentIndex,
+        time: row.time,
+        speakerLabel,
+        text: row.text,
+        noBreakBefore: rowOffset === 0 ? Boolean(segment.recording.no_break_before) : true,
+      });
+    }
+  }
+  return { rows };
+}
+
+function buildManualDraftCacheKey(manualText: string, baseSegments: TranscriptSegmentSource[]): string {
+  let hash = 2166136261;
+  const updateHash = (value: string): void => {
+    for (let index = 0; index < value.length; index += 1) {
+      hash ^= value.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+  };
+  updateHash(manualText);
+  for (const segment of baseSegments) {
+    updateHash(segment.recording.id);
+    updateHash(String(segment.segmentIndex));
+    updateHash(segment.text);
+    updateHash(String(segment.recording.no_break_before));
+  }
+  return String(hash >>> 0);
+}
+
+function cloneManualDraftParseResult(result: TranscriptDraftParseResult): TranscriptDraftParseResult {
+  return {
+    reason: result.reason,
+    rows: result.rows.map((row) => ({ ...row })),
+  };
+}
+
+function getCachedManualDraftParse(
+  manualText: string,
+  baseSegments: TranscriptSegmentSource[],
+): TranscriptDraftParseResult {
+  const key = buildManualDraftCacheKey(manualText, baseSegments);
+  const cached = manualDraftParseCache.get(key);
+  if (cached) return cloneManualDraftParseResult(cached);
+
+  const parsed = parseManualDraftRows(manualText, baseSegments);
+  manualDraftParseCache.set(key, parsed);
+  while (manualDraftParseCache.size > MANUAL_DRAFT_CACHE_LIMIT) {
+    const oldestKey = manualDraftParseCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    manualDraftParseCache.delete(oldestKey);
+  }
+  return cloneManualDraftParseResult(parsed);
+}
+
+function serializeDraftRows(rows: TranscriptDraftRow[], recordings: Recording[]): string {
+  const grouped = new Map<string, TranscriptDraftRow[]>();
+  for (const row of rows) {
+    const group = grouped.get(row.recordingId) ?? [];
+    group.push(row);
+    grouped.set(row.recordingId, group);
+  }
+
+  const segments: string[] = [];
+  for (const recording of recordings) {
+    const segmentRows = grouped.get(recording.id);
+    if (!segmentRows?.length) continue;
+    segments.push(segmentRows.map((row) => {
+      const speaker = row.speakerLabel ? ` ${row.speakerLabel}` : '';
+      return `[${row.time}${speaker}] ${row.text}`;
+    }).join('\n'));
+  }
+
+  return segments.map((segment, index) => {
+    if (index === 0) return segment;
+    const priorRecordingIds = recordings.filter((item) => grouped.has(item.id));
+    const currentRecording = priorRecordingIds[index];
+    const firstRow = currentRecording ? grouped.get(currentRecording.id)?.[0] : undefined;
+    return firstRow?.noBreakBefore || currentRecording?.no_break_before
+      ? `\n\n${segment}`
+      : `${MERGED_BREAK_SEPARATOR}${segment}`;
+  }).join('');
+}
+
+function getSpeakerScopeClassName(
+  recordings: Recording[],
+  recordingId: string,
+  speakerLabel: string,
+  extraLabels: string[] = [],
+): string {
+  const recordingIndex = Math.max(0, recordings.findIndex((recording) => recording.id === recordingId));
+  const labels = new Set<string>(extraLabels);
+  const recording = recordings.find((item) => item.id === recordingId);
+  if (recording) {
+    for (const label of extractSpeakerLabels(recording.segment_transcript, recording.segment_proofread)) {
+      labels.add(label);
+    }
+  }
+  labels.add(speakerLabel);
+  const speakerIndex = Array.from(labels).sort((left, right) => left.localeCompare(right)).indexOf(speakerLabel);
+  return `speaker-scope-${(recordingIndex * 3 + Math.max(0, speakerIndex)) % 8 + 1}`;
+}
+
+function getSpeakerDisplayLabel(
+  mappingBySpeaker: Map<string, string>,
+  recordingId: string,
+  speakerLabel: string,
+): string {
+  const participantName = getMappedSpeakerName(mappingBySpeaker, recordingId, speakerLabel);
+  return participantName === speakerLabel ? speakerLabel : `${participantName}（${speakerLabel}）`;
+}
+
+function normalizeUploadPath(sourcePath: string): string {
+  return sourcePath.replace(/\\/g, '/').toLowerCase();
+}
+
+function getUploadFileName(sourcePath: string): string {
+  return sourcePath.split(/[/\\]/).pop() ?? sourcePath;
 }
 
 export async function renderMeetingPage(container: HTMLElement, meetingId: string): Promise<void> {
@@ -1946,6 +3062,8 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
   let allTags: Tag[] = [];
   let speakerMappings: SpeakerMapping[] = [];
   let isRecordingListCollapsed = false;
+  let pendingUploads: PendingRecordingUpload[] = [];
+  let isSavingUpload = false;
   let currentTranscriptSection: TranscriptSectionResult | null = null;
 
   try {
@@ -2195,6 +3313,22 @@ export async function renderMeetingPage(container: HTMLElement, meetingId: strin
         if (window.location.hash !== `#meeting/${meetingId}`) return;
         try {
           transcript = await getTranscript(meetingId);
+        } catch { /* ignore */ }
+        build();
+      },
+      pendingUploads,
+      isSavingUpload,
+      (saving) => {
+        if (typeof saving === 'boolean') isSavingUpload = saving;
+        build();
+      },
+      async () => {
+        if (window.location.hash !== `#meeting/${meetingId}`) return;
+        try {
+          [transcript, recordings] = await Promise.all([
+            getTranscript(meetingId),
+            getRecordings(meetingId),
+          ]);
         } catch { /* ignore */ }
         build();
       },

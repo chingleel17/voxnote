@@ -1,9 +1,4 @@
 import { renderNav, updateNavActive } from './components/nav';
-import { renderHomePage } from './pages/home';
-import { renderManagePage } from './pages/manage';
-import { renderMeetingPage } from './pages/meeting';
-import { renderRecordPage } from './pages/record';
-import { renderSettingsPage } from './pages/settings';
 import { initStatusBar } from './components/statusBar';
 import { initConfigStore } from './utils/configStore';
 import { initNotificationFocusTracking } from './utils/notifications';
@@ -21,35 +16,62 @@ function parseRoute(hash: string): ParsedRoute {
 }
 
 async function renderPage(container: HTMLElement, route: ParsedRoute): Promise<void> {
-  switch (route.page) {
-    case 'home':
-      await renderHomePage(container);
-      break;
-    case 'meeting':
-      if (route.id) {
-        await renderMeetingPage(container, route.id);
-      } else {
+  container.innerHTML = '<div class="loading">載入中...</div>';
+
+  try {
+    switch (route.page) {
+      case 'home': {
+        const { renderHomePage } = await import('./pages/home');
+        await renderHomePage(container);
+        break;
+      }
+      case 'meeting': {
+        if (route.id) {
+          const { renderMeetingPage } = await import('./pages/meeting');
+          await renderMeetingPage(container, route.id);
+        } else {
+          const { renderHomePage } = await import('./pages/home');
+          await renderHomePage(container);
+        }
+        break;
+      }
+      case 'record': {
+        const { renderRecordPage } = await import('./pages/record');
+        await renderRecordPage(container, route.id);
+        break;
+      }
+      case 'manage': {
+        const { renderManagePage } = await import('./pages/manage');
+        await renderManagePage(container);
+        break;
+      }
+      case 'settings': {
+        const { renderSettingsPage } = await import('./pages/settings');
+        await renderSettingsPage(container);
+        break;
+      }
+      case 'live-caption': {
+        const { renderLiveCaptionPage } = await import('./pages/liveCaption');
+        await renderLiveCaptionPage(container);
+        break;
+      }
+      default: {
+        const { renderHomePage } = await import('./pages/home');
         await renderHomePage(container);
       }
-      break;
-    case 'record':
-      await renderRecordPage(container, route.id);
-      break;
-    case 'manage':
-      await renderManagePage(container);
-      break;
-    case 'settings':
-      await renderSettingsPage(container);
-      break;
-    default:
-      await renderHomePage(container);
+    }
+  } catch (error) {
+    console.error('頁面載入失敗', error);
+    container.innerHTML = `<div class="error-state">頁面載入失敗：${String(error)}</div>`;
   }
 }
 
 window.addEventListener('DOMContentLoaded', () => {
   initTheme();
   initNotificationFocusTracking();
-  void initConfigStore();
+  void initConfigStore().catch((error) => {
+    console.error('設定載入失敗', error);
+  });
 
   const sidebar = document.getElementById('sidebar');
   const content = document.getElementById('content');
@@ -60,12 +82,12 @@ window.addEventListener('DOMContentLoaded', () => {
 
   const initialHash = window.location.hash || '#home';
   if (!window.location.hash) {
-    window.location.hash = '#home';
+    window.history.replaceState(null, '', '#home');
   }
 
   const initialRoute = parseRoute(initialHash);
   updateNavActive(initialHash);
-  renderPage(content, initialRoute);
+  void renderPage(content, initialRoute);
 });
 
 window.addEventListener('hashchange', () => {
@@ -75,5 +97,5 @@ window.addEventListener('hashchange', () => {
   const hash = window.location.hash;
   const route = parseRoute(hash);
   updateNavActive(hash);
-  renderPage(content, route);
+  void renderPage(content, route);
 });

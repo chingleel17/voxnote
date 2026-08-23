@@ -80,8 +80,33 @@ export interface Recording {
   sort_order: number;
   segment_transcript: string | null;
   segment_proofread: string | null;
+  diarization_degraded: number;
   no_break_before: number;
   created_at: string;
+}
+
+export interface RecordingImportItem {
+  sourcePath: string;
+  originalFileName: string | null;
+}
+
+export interface RecordingImportItemResult {
+  sourcePath: string;
+  originalFileName: string | null;
+  recording: Recording | null;
+  error: string | null;
+}
+
+export interface RecordingImportBatchResult {
+  results: RecordingImportItemResult[];
+  successCount: number;
+  failureCount: number;
+}
+
+export interface PendingRecordingUpload {
+  sourcePath: string;
+  originalFileName: string;
+  error: string | null;
 }
 
 export type RecordingSourceMode = 'microphone' | 'system' | 'mix';
@@ -105,6 +130,36 @@ export interface RecordingPreview {
   warning: string | null;
 }
 
+export interface LiveCaptionStatus {
+  active: boolean;
+  backend: 'local_whisper' | 'voxnote_asr' | null;
+  audio_source: 'microphone' | 'system' | null;
+}
+
+export interface LiveCaptionPayload {
+  sequence: number;
+  original: string;
+  translation: string | null;
+  display_text: string;
+  confirmed_text: string;
+  tentative_text: string;
+  is_tentative: boolean;
+}
+
+export interface LiveCaptionErrorPayload {
+  message: string;
+}
+
+export interface LiveCaptionSettingsPayload {
+  font_size: number;
+  clear_seconds: number;
+  click_through: boolean;
+}
+
+export interface LiveCaptionBuildInfo {
+  cuda_enabled: boolean;
+}
+
 export interface AppConfig {
   // ASR
   asr_provider: 'assemblyai' | 'local' | 'voxnote_asr';
@@ -120,6 +175,27 @@ export interface AppConfig {
   asr_language: string;       // "zh" | "en" | "auto"
   speaker_detection: boolean; // 說話人偵測
   auto_proofread_after_transcription: boolean; // 逐段轉譯完成後自動 AI 校稿
+
+  // 即時字幕
+  live_caption_backend: 'local_whisper' | 'voxnote_asr';
+  live_caption_model_path: string;
+  live_caption_audio_source: 'microphone' | 'system';
+  live_caption_window_seconds: number;
+  live_caption_step_seconds: number;
+  live_caption_incremental_enabled: boolean;
+  live_caption_decode_interval_ms: number;
+  live_caption_silence_threshold: number;
+  live_caption_translate: boolean;
+  live_caption_proofread: boolean; // 校稿與翻譯獨立開關，輸出語言等於來源語言
+  live_caption_display_mode: 'translation' | 'original' | 'both';
+  live_caption_font_size: number; // 僅接受 S/M/L/XL 四檔預設值，見 liveCaptionSettings.ts
+  live_caption_clear_seconds: number;
+  live_caption_click_through: boolean;
+  // 即時字幕來源語言與遠端端點，與批次流程（asr_language / local_asr_base_url）各自獨立
+  live_caption_language: string; // "zh" | "en" | "auto"
+  live_caption_remote_base_url: string; // 空字串代表沿用 local_asr_base_url
+  live_caption_remote_model: string;
+  live_caption_remote_timeout_seconds: number;
 
   // 播放增益（會議錄音響度通常低於一般影音內容）
   playback_gain: number;         // 增益倍率，1.0 為原始音量
@@ -149,6 +225,28 @@ export interface AppConfig {
 
   // 完成通知
   completion_notification_enabled: boolean;
+
+  // 講者聲紋比對相似度門檻（cosine 距離，範圍 0–2，愈小愈相似）。僅本地 ASR
+  // 供應商適用；低於門檻才提議合併／串接／跨會議候選人名。
+  voiceprint_similarity_threshold: number;
+}
+
+/// 段落內合併 / 會議內串接提議：兩個講者代號的相似度達門檻，建議視為同一人。
+export interface MergeProposal {
+  recordingIdA: string;
+  speakerLabelA: string;
+  recordingIdB: string;
+  speakerLabelB: string;
+  similarity: number;
+}
+
+/// 跨會議辨識提議：某講者代號與聲紋庫中某參與者相似度達門檻。
+export interface IdentityProposal {
+  recordingId: string;
+  speakerLabel: string;
+  participantId: string;
+  participantName: string;
+  similarity: number;
 }
 
 export interface SavedParticipant {

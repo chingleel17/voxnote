@@ -75,8 +75,33 @@ pub struct Recording {
     pub sort_order: i64,
     pub segment_transcript: Option<String>,
     pub segment_proofread: Option<String>,
+    pub diarization_degraded: i64,
     pub no_break_before: i64,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingImportItem {
+    pub source_path: String,
+    pub original_file_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingImportItemResult {
+    pub source_path: String,
+    pub original_file_name: Option<String>,
+    pub recording: Option<Recording>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingImportBatchResult {
+    pub results: Vec<RecordingImportItemResult>,
+    pub success_count: usize,
+    pub failure_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -127,6 +152,32 @@ pub struct UpdateMeetingRequest {
     pub participants: Vec<String>,
     pub tag_ids: Option<Vec<String>>,
     pub meeting_date: Option<String>,
+}
+
+/// 繫結至 `saved_participants` 的聲紋記錄，經使用者確認講者對應時寫入。
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct Voiceprint {
+    pub id: String,
+    pub participant_id: String,
+    pub model: String,
+    /// f32 向量的 JSON 陣列序列化（見 `db::voiceprint` 模組註解）
+    pub vector: String,
+    pub created_at: String,
+}
+
+/// 錄音段落層級的講者嵌入向量暫存，供使用者確認講者對應前的段落內合併與
+/// 會議內串接比對使用。
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingSpeakerEmbedding {
+    pub id: String,
+    pub meeting_id: String,
+    pub recording_id: String,
+    pub speaker_label: String,
+    pub model: String,
+    pub vector: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

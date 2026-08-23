@@ -1,6 +1,7 @@
 pub mod ai_cmds;
 pub mod asr_cmds;
 pub mod backup_cmds;
+pub mod live_caption_cmds;
 pub mod meeting_cmds;
 pub mod meeting_export_cmds;
 pub mod recording_cmds;
@@ -10,3 +11,4 @@ pub mod summary_cmds;
 pub mod tag_cmds;
 pub mod template_cmds;
 pub mod transcript_cmds;
+pub mod voiceprint_cmds;

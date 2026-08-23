@@ -20,10 +20,40 @@ pub struct AppConfig {
     pub speaker_detection: bool,                  // 是否啟用說話人偵測
     pub auto_proofread_after_transcription: bool, // 逐段轉譯完成後自動 AI 校稿
 
+    // 即時字幕
+    pub live_caption_backend: String, // "local_whisper" | "voxnote_asr"
+    pub live_caption_model_path: String, // GGML .bin 模型路徑
+    pub live_caption_audio_source: String, // "microphone" | "system"
+    pub live_caption_window_seconds: u32,
+    pub live_caption_step_seconds: u32,
+    pub live_caption_incremental_enabled: bool,
+    pub live_caption_decode_interval_ms: u32,
+    pub live_caption_silence_threshold: f32,
+    pub live_caption_translate: bool,
+    // 校稿與翻譯為獨立開關：翻譯輸出語言可能與來源不同，校稿則輸出語言等於來源，
+    // 僅修正辨識錯誤（同音字、標點、斷句）。兩者互不取代，見
+    // add-live-caption-overlay 的「Translation and proofreading are
+    // independent options」。
+    pub live_caption_proofread: bool,
+    pub live_caption_display_mode: String, // "translation" | "original" | "both"
+    // 字級僅接受 S/M/L/XL 四檔預設值（見 live_caption 模組），不開放自由輸入數字；
+    // 欄位型別維持 u32（實際像素）以相容既有 config.toml，介面層負責限制為四檔選項。
+    pub live_caption_font_size: u32,
+    // 同時顯示的段數已改由字幕視窗高度與目前字級決定，不再由使用者設定固定行數
+    // （2026-08-11：手動設定的行數與視窗高度不一致會導致文字溢出並互相疊字）。
+    pub live_caption_clear_seconds: u32, // 無新字幕達此秒數即清空，0 代表不清空
+    pub live_caption_click_through: bool, // 字幕視窗是否啟用點擊穿透
+    // 即時字幕的來源語言與遠端端點與批次流程（asr_language / local_asr_base_url）各自獨立，
+    // 因為即時字幕的實際用途（如觀看外語影片）常與批次會議轉錄的語言相反。
+    pub live_caption_language: String, // "zh" | "en" | "auto"
+    pub live_caption_remote_base_url: String, // 空字串代表沿用 local_asr_base_url
+    pub live_caption_remote_model: String,
+    pub live_caption_remote_timeout_seconds: u32, // 即時逾時，與批次的 LOCAL_ASR_TIMEOUT_SECS 分離
+
     // 播放增益：會議錄音響度通常遠低於一般影音內容，故播放時額外補償
-    pub playback_gain: f32,          // 增益倍率，1.0 為原始音量
-    pub playback_compressor: bool,   // 動態壓縮，拉近大小聲差距
-    pub playback_highpass: bool,     // 高通濾波，濾除低頻噪音
+    pub playback_gain: f32,        // 增益倍率，1.0 為原始音量
+    pub playback_compressor: bool, // 動態壓縮，拉近大小聲差距
+    pub playback_highpass: bool,   // 高通濾波，濾除低頻噪音
 
     // LLM 供應商："openai" | "claude" | "gemini" | "openrouter" | "ollama" | "custom"
     pub llm_provider: String,
@@ -48,6 +78,13 @@ pub struct AppConfig {
 
     // Windows 完成通知
     pub completion_notification_enabled: bool,
+
+    // 講者聲紋比對相似度門檻（cosine 距離，範圍 0–2，愈小愈相似）。僅本地 ASR
+    // 供應商適用；低於門檻（距離 <= 此值）才提議合併／串接／跨會議候選人名，
+    // MUST NOT 硬編碼、MUST 保守，避免使用者習慣性採納錯誤建議（見
+    // add-speaker-voiceprint-matching design 決策 5）。實測建議值待補（tasks
+    // 7.5），此為保守起始值。
+    pub voiceprint_similarity_threshold: f32,
 }
 
 impl Default for AppConfig {
@@ -66,6 +103,24 @@ impl Default for AppConfig {
             asr_language: "zh".into(),
             speaker_detection: true,
             auto_proofread_after_transcription: false,
+            live_caption_backend: "local_whisper".into(),
+            live_caption_model_path: String::new(),
+            live_caption_audio_source: "system".into(),
+            live_caption_window_seconds: 5,
+            live_caption_step_seconds: 3,
+            live_caption_incremental_enabled: false,
+            live_caption_decode_interval_ms: 800,
+            live_caption_silence_threshold: 0.01,
+            live_caption_translate: true,
+            live_caption_proofread: false,
+            live_caption_display_mode: "translation".into(),
+            live_caption_font_size: 28,
+            live_caption_clear_seconds: 8,
+            live_caption_click_through: true,
+            live_caption_language: "auto".into(),
+            live_caption_remote_base_url: String::new(),
+            live_caption_remote_model: String::new(),
+            live_caption_remote_timeout_seconds: 8,
             // 預設 2 倍增益並開啟壓縮：手機於會議室桌面收音的錄音多半偏小聲
             playback_gain: 2.0,
             playback_compressor: true,
@@ -88,6 +143,9 @@ impl Default for AppConfig {
             proofread_prompt: String::new(),
             summary_prompt: String::new(),
             completion_notification_enabled: true,
+            // pyannote embedding 的 cosine 距離：同一人重複發言的實測通常 <0.3，
+            // 不同人可達 0.6 以上；0.25 保守偏向少提議、少誤判
+            voiceprint_similarity_threshold: 0.25,
         }
     }
 }
@@ -128,6 +186,62 @@ speaker_detection = true
         assert!(config.playback_highpass);
         // 既有欄位不應被預設值覆蓋
         assert_eq!(config.asr_provider, "voxnote_asr");
+    }
+
+    #[test]
+    fn existing_config_gets_new_live_caption_defaults() {
+        // 既有使用者的 config.toml 已有即時字幕欄位，但沒有後續新增的三項；
+        // 若 serde(default) 未涵蓋，載入會失敗導致應用程式無法啟動。
+        let existing = r#"
+asr_language = "zh"
+live_caption_backend = "local_whisper"
+live_caption_model_path = 'C:\models\ggml-small.bin'
+live_caption_audio_source = "system"
+live_caption_window_seconds = 15
+live_caption_step_seconds = 3
+live_caption_silence_threshold = 0.01
+live_caption_translate = false
+live_caption_display_mode = "original"
+live_caption_font_size = 28
+"#;
+        let config: AppConfig = toml::from_str(existing).expect("既有設定應可解析");
+        assert_eq!(config.live_caption_clear_seconds, 8);
+        assert!(config.live_caption_click_through);
+        assert!(!config.live_caption_proofread);
+        // 既有欄位不應被預設值覆蓋
+        assert_eq!(config.live_caption_window_seconds, 15);
+        assert!(!config.live_caption_translate);
+        assert_eq!(config.live_caption_display_mode, "original");
+    }
+
+    #[test]
+    fn existing_config_gets_live_caption_remote_defaults() {
+        // 既有使用者的 config.toml 沒有即時字幕獨立語言／遠端端點欄位，
+        // 若 serde(default) 未涵蓋，載入會失敗導致應用程式無法啟動。
+        let existing = r#"
+asr_language = "zh"
+live_caption_backend = "voxnote_asr"
+live_caption_click_through = true
+"#;
+        let config: AppConfig = toml::from_str(existing).expect("既有設定應可解析");
+        assert_eq!(config.live_caption_language, "auto");
+        assert_eq!(config.live_caption_remote_base_url, "");
+        assert_eq!(config.live_caption_remote_model, "");
+        assert_eq!(config.live_caption_remote_timeout_seconds, 8);
+        assert!(!config.live_caption_incremental_enabled);
+        assert_eq!(config.live_caption_decode_interval_ms, 800);
+        // 既有欄位不應被預設值覆蓋
+        assert_eq!(config.asr_language, "zh");
+    }
+
+    #[test]
+    fn live_caption_incremental_defaults_round_trip() {
+        let config = AppConfig::default();
+        let serialized = toml::to_string_pretty(&config).expect("應可序列化");
+        let reparsed: AppConfig = toml::from_str(&serialized).expect("應可重新解析");
+
+        assert!(!reparsed.live_caption_incremental_enabled);
+        assert_eq!(reparsed.live_caption_decode_interval_ms, 800);
     }
 
     #[test]

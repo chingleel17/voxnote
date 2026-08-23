@@ -477,16 +477,17 @@ async fn replace_database(pool: &SqlitePool, database: &Path) -> Result<()> {
     let result = async {
         let mut tx = connection.begin().await?;
         for table in [
-            "recording_speaker_mappings", "speaker_mappings", "meeting_tags", "recordings",
-            "summaries", "transcripts", "participants", "meeting_templates", "meetings", "tags",
-            "categories", "saved_participants",
+            "voiceprints", "recording_speaker_embeddings", "recording_speaker_mappings",
+            "speaker_mappings", "meeting_tags", "recordings", "summaries", "transcripts",
+            "participants", "meeting_templates", "meetings", "tags", "categories",
+            "saved_participants",
         ] {
             sqlx::query(&format!("DELETE FROM {table}")).execute(&mut *tx).await?;
         }
         for table in [
             "categories", "meetings", "participants", "speaker_mappings", "transcripts", "summaries",
-            "recordings", "recording_speaker_mappings", "saved_participants", "meeting_templates", "tags",
-            "meeting_tags",
+            "recordings", "recording_speaker_mappings", "recording_speaker_embeddings",
+            "saved_participants", "voiceprints", "meeting_templates", "tags", "meeting_tags",
         ] {
             sqlx::query(&format!("INSERT INTO {table} SELECT * FROM backup.{table}"))
                 .execute(&mut *tx)
@@ -516,9 +517,14 @@ async fn merge_database(pool: &SqlitePool, database: &Path) -> Result<(u64, u64)
         sqlx::query("UPDATE backup.meetings SET category_id = (SELECT categories.id FROM categories JOIN backup.categories source ON source.name = categories.name WHERE source.id = backup.meetings.category_id) WHERE category_id IS NOT NULL").execute(&mut *tx).await?;
         sqlx::query("UPDATE backup.meeting_templates SET category_id = (SELECT categories.id FROM categories JOIN backup.categories source ON source.name = categories.name WHERE source.id = backup.meeting_templates.category_id) WHERE category_id IS NOT NULL").execute(&mut *tx).await?;
         sqlx::query("UPDATE backup.meeting_tags SET tag_id = (SELECT tags.id FROM tags JOIN backup.tags source ON source.name = tags.name WHERE source.id = backup.meeting_tags.tag_id)").execute(&mut *tx).await?;
-        for table in ["meetings", "participants", "speaker_mappings", "transcripts", "summaries", "recordings", "recording_speaker_mappings", "meeting_templates", "meeting_tags"] {
+        for table in ["meetings", "participants", "speaker_mappings", "transcripts", "summaries", "recordings", "recording_speaker_mappings", "recording_speaker_embeddings", "meeting_templates", "meeting_tags"] {
             sqlx::query(&format!("INSERT OR IGNORE INTO {table} SELECT * FROM backup.{table}")).execute(&mut *tx).await?;
         }
+        // voiceprints 的 participant_id 指向來源庫的 saved_participants.id；合併時
+        // saved_participants 依 name 去重（見上方 upsert），來源與目的的 id 可能不同，
+        // 故須先將備份中的 participant_id 轉換為目的庫中同名參與者的 id 再寫入
+        sqlx::query("UPDATE backup.voiceprints SET participant_id = (SELECT saved_participants.id FROM saved_participants JOIN backup.saved_participants source ON source.name = saved_participants.name WHERE source.id = backup.voiceprints.participant_id) WHERE participant_id IS NOT NULL").execute(&mut *tx).await?;
+        sqlx::query("INSERT OR IGNORE INTO voiceprints SELECT * FROM backup.voiceprints").execute(&mut *tx).await?;
         let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM meetings").fetch_one(&mut *tx).await?;
         tx.commit().await?;
         Ok::<_, sqlx::Error>(((after - before) as u64, (reused_categories + reused_tags + reused_participants) as u64))
@@ -904,12 +910,14 @@ mod tests {
              CREATE TABLE speaker_mappings (id TEXT PRIMARY KEY, meeting_id TEXT, recording_id TEXT, speaker_label TEXT, participant_name TEXT, created_at TEXT, updated_at TEXT);
              CREATE TABLE transcripts (id TEXT PRIMARY KEY);
              CREATE TABLE summaries (id TEXT PRIMARY KEY);
-             CREATE TABLE recordings (id TEXT PRIMARY KEY, meeting_id TEXT, file_path TEXT);
+             CREATE TABLE recordings (id TEXT PRIMARY KEY, meeting_id TEXT, file_path TEXT, diarization_degraded INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE recording_speaker_mappings (id TEXT PRIMARY KEY);
              CREATE TABLE saved_participants (id TEXT PRIMARY KEY, name TEXT UNIQUE, usage_count INTEGER, created_at TEXT);
              CREATE TABLE meeting_templates (id TEXT PRIMARY KEY, name TEXT, title TEXT, category_id TEXT, participants_json TEXT, created_at TEXT);
              CREATE TABLE tags (id TEXT PRIMARY KEY, name TEXT UNIQUE, color TEXT, created_at TEXT);
-             CREATE TABLE meeting_tags (meeting_id TEXT, tag_id TEXT);",
+             CREATE TABLE meeting_tags (meeting_id TEXT, tag_id TEXT);
+             CREATE TABLE voiceprints (id TEXT PRIMARY KEY, participant_id TEXT, model TEXT, vector TEXT, created_at TEXT);
+             CREATE TABLE recording_speaker_embeddings (id TEXT PRIMARY KEY, meeting_id TEXT, recording_id TEXT, speaker_label TEXT, model TEXT, vector TEXT, created_at TEXT);",
         )
         .execute(&pool)
         .await
@@ -1023,7 +1031,7 @@ mod tests {
         let directory = test_directory();
         let database_path = directory.join("source.sqlite");
         let source = create_test_database(&database_path).await;
-        sqlx::query("INSERT INTO recordings VALUES ('recording-1', 'meeting-1', 'C:/old-user/audio.wav')")
+        sqlx::query("INSERT INTO recordings (id, meeting_id, file_path) VALUES ('recording-1', 'meeting-1', 'C:/old-user/audio.wav')")
             .execute(&source)
             .await
             .unwrap();

@@ -11,6 +11,7 @@ const NAV_ITEMS: NavItem[] = [
   { icon: '⌂', label: '首頁', route: '#home' },
   { icon: '◉', label: '錄音', route: '#record' },
   { icon: '▦', label: '管理', route: '#manage' },
+  { icon: '▤', label: '即時字幕', route: '#live-caption' },
   { icon: '⚙', label: '設定', route: '#settings' },
 ];
 

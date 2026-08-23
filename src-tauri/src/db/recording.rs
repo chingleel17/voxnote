@@ -6,7 +6,7 @@ use uuid::Uuid;
 use super::models::Recording;
 
 const SELECT_COLS: &str =
-    "id, meeting_id, file_path, original_file_name, duration_seconds, source_mode, sort_order, segment_transcript, segment_proofread, no_break_before, created_at";
+    "id, meeting_id, file_path, original_file_name, duration_seconds, source_mode, sort_order, segment_transcript, segment_proofread, diarization_degraded, no_break_before, created_at";
 
 pub async fn get_recording(pool: &SqlitePool, meeting_id: &str) -> Result<Option<Recording>> {
     let sql = format!("SELECT {SELECT_COLS} FROM recordings WHERE meeting_id = ? ORDER BY sort_order ASC, created_at ASC LIMIT 1");
@@ -91,11 +91,13 @@ pub async fn update_segment_transcript(
     pool: &SqlitePool,
     recording_id: &str,
     content: &str,
+    diarization_degraded: bool,
 ) -> Result<()> {
     sqlx::query(
-        "UPDATE recordings SET segment_transcript = ?, segment_proofread = NULL WHERE id = ?",
+        "UPDATE recordings SET segment_transcript = ?, segment_proofread = NULL, diarization_degraded = ? WHERE id = ?",
     )
     .bind(content)
+    .bind(diarization_degraded)
     .bind(recording_id)
     .execute(pool)
     .await?;

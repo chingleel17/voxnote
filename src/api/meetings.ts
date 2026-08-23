@@ -1,8 +1,33 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { MeetingWithDetails, Category, CreateMeetingRequest, UpdateMeetingRequest } from '../types';
 
-export const getMeetings = () => invoke<MeetingWithDetails[]>('get_meetings');
-export const getArchivedMeetings = () => invoke<MeetingWithDetails[]>('get_archived_meetings');
+const STARTUP_RETRY_DELAYS_MS = [80, 160, 320, 640, 1000];
+
+function isPoolStateStartupError(error: unknown): boolean {
+  const message = String(error);
+  return message.includes('state not managed') && message.includes('pool');
+}
+
+function waitForStartupRetry(delayMs: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, delayMs));
+}
+
+async function invokeWithPoolStartupRetry<T>(command: string): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await invoke<T>(command);
+    } catch (error) {
+      const retryDelay = STARTUP_RETRY_DELAYS_MS[attempt];
+      if (!isPoolStateStartupError(error) || retryDelay === undefined) throw error;
+      await waitForStartupRetry(retryDelay);
+    }
+  }
+}
+
+export const getMeetings = () =>
+  invokeWithPoolStartupRetry<MeetingWithDetails[]>('get_meetings');
+export const getArchivedMeetings = () =>
+  invokeWithPoolStartupRetry<MeetingWithDetails[]>('get_archived_meetings');
 export const getMeeting = (id: string) => invoke<MeetingWithDetails | null>('get_meeting', { id });
 export const createMeeting = (request: CreateMeetingRequest) => invoke<MeetingWithDetails>('create_meeting', { request });
 export const updateMeeting = (id: string, request: UpdateMeetingRequest) => invoke<MeetingWithDetails>('update_meeting', { id, request });

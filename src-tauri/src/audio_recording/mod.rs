@@ -4,8 +4,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc,
-        Arc, Mutex,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, Instant, SystemTime},
@@ -165,14 +164,18 @@ pub fn list_recording_devices() -> Result<RecordingDeviceList> {
     }
 
     #[cfg(target_os = "windows")]
-    let system_outputs = list_windows_system_outputs()?;
+    let (system_outputs, system_audio_supported) = match list_windows_system_outputs() {
+        Ok(outputs) => (outputs, true),
+        // 沒有預設播放裝置時，WASAPI 會回傳 0x80070490；麥克風列舉仍可正常使用。
+        Err(_) => (Vec::new(), false),
+    };
     #[cfg(not(target_os = "windows"))]
-    let system_outputs = Vec::new();
+    let (system_outputs, system_audio_supported) = (Vec::new(), false);
 
     Ok(RecordingDeviceList {
         microphones,
         system_outputs,
-        system_audio_supported: cfg!(target_os = "windows"),
+        system_audio_supported,
     })
 }
 
@@ -216,6 +219,14 @@ pub fn start_recording(
     });
 
     Ok(())
+}
+
+pub(crate) fn is_recording(manager: &DesktopRecordingManager) -> bool {
+    manager
+        .inner
+        .lock()
+        .map(|guard| guard.is_some())
+        .unwrap_or(true)
 }
 
 pub fn stop_recording(manager: &DesktopRecordingManager) -> Result<RecordingPreview> {
@@ -300,7 +311,9 @@ fn run_recording_session(
     };
 
     if let Some(stream) = &mic_stream {
-        stream.play().map_err(|e| anyhow!("無法啟動麥克風錄音：{e}"))?;
+        stream
+            .play()
+            .map_err(|e| anyhow!("無法啟動麥克風錄音：{e}"))?;
     }
 
     let spec = hound::WavSpec {
@@ -327,8 +340,8 @@ fn run_recording_session(
             break;
         }
 
-        let expected_samples = (started_at.elapsed().as_secs_f64() * f64::from(TARGET_SAMPLE_RATE))
-            .floor() as usize;
+        let expected_samples =
+            (started_at.elapsed().as_secs_f64() * f64::from(TARGET_SAMPLE_RATE)).floor() as usize;
 
         while written_samples < expected_samples {
             let mic_sample = if request.mode.needs_microphone() {
@@ -388,8 +401,7 @@ fn run_recording_session(
     }
 
     writer.finalize()?;
-    let duration_seconds =
-        ((written_samples as f64) / f64::from(TARGET_SAMPLE_RATE)).ceil() as i64;
+    let duration_seconds = ((written_samples as f64) / f64::from(TARGET_SAMPLE_RATE)).ceil() as i64;
 
     let _ = app.emit(
         RECORDING_LEVEL_EVENT,
@@ -431,9 +443,7 @@ pub(crate) fn select_input_device(device_id: Option<&str>) -> Result<SelectedInp
         let is_requested = !requested.is_empty() && (id == requested || name == requested);
         let is_default = requested.is_empty() && default_name.as_deref() == Some(name.as_str());
         if is_requested || is_default {
-            return Ok(SelectedInputDevice {
-                device,
-            });
+            return Ok(SelectedInputDevice { device });
         }
     }
 
@@ -454,14 +464,22 @@ pub(crate) fn start_microphone_stream(
     let sample_rate = config.sample_rate();
     let stream_config: cpal::StreamConfig = config.clone().into();
     let error_state_for_stream = error_state.clone();
-    let err_fn = move |err| set_error_message(&error_state_for_stream, format!("麥克風錄音失敗：{err}"));
+    let err_fn =
+        move |err| set_error_message(&error_state_for_stream, format!("麥克風錄音失敗：{err}"));
 
     match config.sample_format() {
         SampleFormat::F32 => device
             .build_input_stream(
                 &stream_config,
                 move |data: &[f32], _| {
-                    push_resampled_samples(data, channels, sample_rate, target_rate, &queue, &level_value)
+                    push_resampled_samples(
+                        data,
+                        channels,
+                        sample_rate,
+                        target_rate,
+                        &queue,
+                        &level_value,
+                    )
                 },
                 err_fn,
                 None,
@@ -475,7 +493,14 @@ pub(crate) fn start_microphone_stream(
                         .iter()
                         .map(|sample| f32::from(*sample) / f32::from(i16::MAX))
                         .collect();
-                    push_resampled_samples(&converted, channels, sample_rate, target_rate, &queue, &level_value);
+                    push_resampled_samples(
+                        &converted,
+                        channels,
+                        sample_rate,
+                        target_rate,
+                        &queue,
+                        &level_value,
+                    );
                 },
                 err_fn,
                 None,
@@ -489,7 +514,14 @@ pub(crate) fn start_microphone_stream(
                         .iter()
                         .map(|sample| (f32::from(*sample) / f32::from(u16::MAX)) * 2.0 - 1.0)
                         .collect();
-                    push_resampled_samples(&converted, channels, sample_rate, target_rate, &queue, &level_value);
+                    push_resampled_samples(
+                        &converted,
+                        channels,
+                        sample_rate,
+                        target_rate,
+                        &queue,
+                        &level_value,
+                    );
                 },
                 err_fn,
                 None,
@@ -520,7 +552,12 @@ fn push_resampled_samples(
     }
 }
 
-fn downmix_and_resample(samples: &[f32], channels: usize, input_rate: u32, target_rate: u32) -> Vec<f32> {
+fn downmix_and_resample(
+    samples: &[f32],
+    channels: usize,
+    input_rate: u32,
+    target_rate: u32,
+) -> Vec<f32> {
     if samples.is_empty() || channels == 0 {
         return Vec::new();
     }
@@ -593,90 +630,159 @@ fn list_windows_system_outputs() -> Result<Vec<RecordingDevice>> {
 
     let _ = wasapi::initialize_mta();
     let enumerator = DeviceEnumerator::new()?;
-    let device = enumerator.get_default_device(&Direction::Render)?;
-    let name = device
-        .get_friendlyname()
-        .unwrap_or_else(|_| "系統預設輸出裝置".into());
+    let default_id = enumerator
+        .get_default_device(&Direction::Render)
+        .ok()
+        .and_then(|device| device.get_id().ok());
+    let collection = enumerator.get_device_collection(&Direction::Render)?;
+    let mut outputs = Vec::new();
+    for device in &collection {
+        let device = device?;
+        let id = device.get_id()?;
+        let name = device
+            .get_friendlyname()
+            .unwrap_or_else(|_| "未命名系統輸出裝置".into());
+        outputs.push(RecordingDevice {
+            is_default: default_id.as_deref() == Some(id.as_str()),
+            id,
+            name,
+        });
+    }
 
-    Ok(vec![RecordingDevice {
-        id: "default".into(),
-        name,
-        is_default: true,
-    }])
+    if outputs.is_empty() {
+        return Err(anyhow!("找不到任何 Windows 系統輸出裝置"));
+    }
+    Ok(outputs)
 }
 
 #[cfg(target_os = "windows")]
 pub(crate) fn start_windows_loopback_capture(
     _system_device_id: Option<&str>,
     queue: SharedQueue,
-    _error_state: SharedError,
+    error_state: SharedError,
     running: Arc<AtomicBool>,
     level_value: Arc<Mutex<f32>>,
     target_rate: u32,
 ) -> Result<thread::JoinHandle<Result<()>>> {
+    let error_state_for_thread = error_state.clone();
+    let requested_device_id = _system_device_id.map(str::to_owned);
     Ok(thread::spawn(move || -> Result<()> {
-        use wasapi::{DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
+        let result = (|| -> Result<()> {
+            use wasapi::{DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
 
-        let _ = wasapi::initialize_mta();
-        let enumerator = DeviceEnumerator::new()?;
-        let device = enumerator.get_default_device(&Direction::Render)?;
-        let desired_format =
-            WaveFormat::new(32, 32, &SampleType::Float, target_rate as usize, 2, None);
-        let mut audio_client = device.get_iaudioclient()?;
-        let (_, min_time) = audio_client.get_device_period()?;
-        let stream_mode = StreamMode::EventsShared {
-            autoconvert: true,
-            buffer_duration_hns: min_time,
-        };
-        audio_client.initialize_client(&desired_format, &Direction::Capture, &stream_mode)?;
-
-        let actual_rate = audio_client.get_mixformat()?.get_samplespersec();
-
-        let capture_client = audio_client.get_audiocaptureclient()?;
-        let event_handle = audio_client.set_get_eventhandle()?;
-        audio_client.start_stream()?;
-
-        let mut sample_queue: VecDeque<u8> = VecDeque::new();
-        while running.load(Ordering::SeqCst) {
-            capture_client.read_from_device_to_deque(&mut sample_queue)?;
-            if !sample_queue.is_empty() {
-                let mut converted = Vec::new();
-                while sample_queue.len() >= 8 {
-                    let left = take_f32_le(&mut sample_queue)?;
-                    let right = take_f32_le(&mut sample_queue)?;
-                    converted.push((left + right) * 0.5);
+            let _ = wasapi::initialize_mta();
+            let enumerator = DeviceEnumerator::new()?;
+            let requested_id = requested_device_id
+                .as_deref()
+                .filter(|id| !id.is_empty() && *id != "default");
+            let device = if let Some(device_id) = requested_id {
+                enumerator.get_device(device_id)?
+            } else {
+                match enumerator.get_default_device(&Direction::Render) {
+                    Ok(device) => device,
+                    Err(_) => enumerator
+                        .get_device_collection(&Direction::Render)?
+                        .into_iter()
+                        .next()
+                        .transpose()?
+                        .ok_or_else(|| anyhow!("找不到任何 Windows 系統輸出裝置"))?,
                 }
-                let processed = if actual_rate == target_rate {
-                    converted
-                } else {
-                    downmix_and_resample(&converted, 1, actual_rate, target_rate)
-                };
-                let peak = processed
-                    .iter()
-                    .fold(0.0f32, |max, sample| max.max(sample.abs()));
-                if let Ok(mut level) = level_value.lock() {
-                    *level = peak;
+            };
+            let desired_format =
+                WaveFormat::new(32, 32, &SampleType::Float, target_rate as usize, 2, None);
+            let mut audio_client = device.get_iaudioclient()?;
+            let (_, min_time) = audio_client.get_device_period()?;
+            let stream_mode = StreamMode::EventsShared {
+                autoconvert: true,
+                buffer_duration_hns: min_time,
+            };
+            audio_client.initialize_client(&desired_format, &Direction::Capture, &stream_mode)?;
+
+            // `initialize_client` 若不接受所請求的格式會回傳 Err（其直接將格式交給
+            // IAudioClient::Initialize，並以該格式的 blockalign 設定 bytes_per_frame），
+            // 因此執行至此即代表 desired_format 已生效，擷取端交付的就是 target_rate。
+            //
+            // 不可改用 get_mixformat() 的取樣率：該方法回傳的是「音訊引擎」的共用模式
+            // 格式（例如 48 kHz），與本 client 經 autoconvert 後實際交付的格式無關。
+            // 曾以其回傳值判斷是否需要重採樣，導致已是 16 kHz 的音訊又被降取樣一次，
+            // 送入模型的音訊變成約 3 倍速（人耳聽起來為花栗鼠聲），字幕全數錯誤。
+            let mix_format = audio_client.get_mixformat()?;
+            println!(
+                "[loopback] 裝置={} 引擎混音格式: 取樣率={} 聲道={} 位元深度={}；\
+                 本 client 經 autoconvert 實際擷取取樣率={}",
+                device
+                    .get_friendlyname()
+                    .unwrap_or_else(|_| "未知裝置".into()),
+                mix_format.get_samplespersec(),
+                mix_format.get_nchannels(),
+                mix_format.get_bitspersample(),
+                target_rate,
+            );
+
+            let capture_client = audio_client.get_audiocaptureclient()?;
+            let event_handle = audio_client.set_get_eventhandle()?;
+            audio_client.start_stream()?;
+
+            let mut sample_queue: VecDeque<u8> = VecDeque::new();
+            // 每次事件僅讀到一個裝置週期的資料（約 3 毫秒），逐批推送會讓佇列鎖競爭
+            // 過於頻繁，故累積約 100 毫秒再一次推送。
+            // 擷取端交付的已是 target_rate（見上方 autoconvert 說明），此處不再重採樣。
+            let mut pending_mono: Vec<f32> = Vec::new();
+            let push_chunk = (target_rate as usize / 10).max(1); // 約 100 毫秒
+            while running.load(Ordering::SeqCst) {
+                capture_client.read_from_device_to_deque(&mut sample_queue)?;
+                if !sample_queue.is_empty() {
+                    // desired_format 為雙聲道 f32，故每個 frame 為 8 bytes。
+                    while sample_queue.len() >= 8 {
+                        let left = take_f32_le(&mut sample_queue)?;
+                        let right = take_f32_le(&mut sample_queue)?;
+                        pending_mono.push((left + right) * 0.5);
+                    }
                 }
-                if let Ok(mut target) = queue.lock() {
-                    target.extend(processed);
+                if pending_mono.len() >= push_chunk {
+                    let processed = std::mem::take(&mut pending_mono);
+                    let peak = processed
+                        .iter()
+                        .fold(0.0f32, |max, sample| max.max(sample.abs()));
+                    if let Ok(mut level) = level_value.lock() {
+                        *level = peak;
+                    }
+                    if let Ok(mut target) = queue.lock() {
+                        target.extend(processed);
+                    }
                 }
+                let _ = event_handle.wait_for_event(100);
             }
 
-            let _ = event_handle.wait_for_event(100);
-        }
+            audio_client.stop_stream()?;
+            Ok(())
+        })();
 
-        audio_client.stop_stream()?;
-        Ok(())
+        if let Err(error) = &result {
+            set_error_message(
+                &error_state_for_thread,
+                format!("系統音訊擷取失敗：{error}"),
+            );
+        }
+        result
     }))
 }
 
 #[cfg(target_os = "windows")]
 fn take_f32_le(queue: &mut VecDeque<u8>) -> Result<f32> {
     let bytes = [
-        queue.pop_front().ok_or_else(|| anyhow!("系統音訊樣本不足"))?,
-        queue.pop_front().ok_or_else(|| anyhow!("系統音訊樣本不足"))?,
-        queue.pop_front().ok_or_else(|| anyhow!("系統音訊樣本不足"))?,
-        queue.pop_front().ok_or_else(|| anyhow!("系統音訊樣本不足"))?,
+        queue
+            .pop_front()
+            .ok_or_else(|| anyhow!("系統音訊樣本不足"))?,
+        queue
+            .pop_front()
+            .ok_or_else(|| anyhow!("系統音訊樣本不足"))?,
+        queue
+            .pop_front()
+            .ok_or_else(|| anyhow!("系統音訊樣本不足"))?,
+        queue
+            .pop_front()
+            .ok_or_else(|| anyhow!("系統音訊樣本不足"))?,
     ];
     Ok(f32::from_le_bytes(bytes))
 }

@@ -34,6 +34,7 @@
 - [快速開始](#快速開始)
 - [AI 供應商設定](#ai-供應商設定)
 - [ASR 語音辨識設定](#asr-語音辨識設定)
+- [即時字幕](#即時字幕)
 - [貢獻指南](#貢獻指南)
 - [授權條款](#授權條款)
 
@@ -62,11 +63,22 @@ VoxNote 是一款以**本地優先**設計的桌面會議助理。所有資料�
 ### 錄音功能
 
 - 桌面錄音流程，支援停止後預覽再儲存
+- 關閉主視窗時會先完成進行中的字幕與錄音收尾，再結束應用程式
 - Windows 支援「僅麥克風 / 僅電腦音訊 / 麥克風 + 電腦音訊混音」錄音
 - 支援上傳音訊檔案（`.wav` / `.mp3` / `.m4a` / `.ogg` / `.aac` / `.flac`，最大 500MB）
 - 自訂音訊播放器（播放/暫停、進度條、靜音）
 
 > 電腦本地音訊錄音目前以 Windows 為優先支援平台，會擷取系統預設播放裝置的聲音。
+
+### 即時字幕
+
+- 以滑動音訊視窗逐段產生字幕，不必等待整段音訊結束
+- 可選擇增量字幕模式：以短解碼間隔重複分析較長視窗，透過連續結果的共同前綴
+  區分暫定與確定文字；延遲較低，但暫定文字可能在後續解碼時修正
+- 支援電腦系統音訊與麥克風來源，系統音訊擷取僅支援 Windows
+- 可選擇行程內本地 Whisper 或 VoxNote 自架 ASR 服務
+- 可將字幕翻譯成繁體中文台灣用語，並以獨立永遠置頂的浮動視窗顯示
+- 字幕僅存在於即時 session，不寫入資料庫、不產生錄音檔、不提供語者分離
 
 ### 語音轉文字（ASR）
 
@@ -122,6 +134,7 @@ src-tauri/src/          # Rust 後端
 ├── db/                 # SQLite CRUD + migration
 ├── ai/                 # LLM 統一呼叫入口（call_llm）
 ├── asr/                # 語音辨識（AssemblyAI + 自架服務 + 本地 Whisper）
+├── live_caption/       # 即時字幕 session、分段轉錄與事件推送
 └── config/             # AppConfig 讀寫
 ```
 
@@ -145,6 +158,39 @@ Windows 額外需要（C++ Build Tools）：
 ```
 winget install Microsoft.VisualStudio.2022.BuildTools
 ```
+
+即時字幕的行程內本地 Whisper 另外需要 LLVM（含 `libclang`）與 CMake，兩者是
+`whisper-rs-sys` 建置所需。若要啟用 CUDA GPU 加速，還需要 CUDA Toolkit 12.8
+或更新版本；預設建置不包含 CUDA，避免沒有 CUDA 的環境無法編譯或執行。
+
+```bash
+# 確認基本工具
+cmake --version
+
+# CPU 版本（預設）
+cargo build --manifest-path src-tauri/Cargo.toml
+
+# 選用：CUDA GPU 版本
+cargo build --manifest-path src-tauri/Cargo.toml --features live-caption-cuda
+```
+
+若編譯時 cmake 找不到目標顯卡的 CUDA 架構（例如新款顯卡未被預設架構清單涵蓋），
+需另外指定 `CMAKE_CUDA_ARCHITECTURES` 環境變數。可用 `nvidia-smi --query-gpu=compute_cap --format=csv`
+查詢顯卡的 compute capability（例如 `12.0` 對應 `120`）。
+
+打包 CUDA 版安裝檔請用：
+
+```bash
+bun run tauri:build:cuda
+```
+
+此指令固定以 `CMAKE_CUDA_ARCHITECTURES=120`（RTX 50 系列 / sm_120）建置；
+若目標顯卡架構不同，需修改 `package.json` 中 `tauri:build:cuda` script 的對應值。
+安裝完成後的應用程式名稱與 CPU 版相同（皆為 `VoxNote`），僅安裝檔檔名會加上
+`-CUDA` 後綴以便區分（如 `VoxNote-CUDA_x.x.x_x64-setup.exe`），
+與一般 CPU 版（`VoxNote_x.x.x_x64-setup.exe`）不會互相覆蓋建置產物。
+由於兩者的應用程式識別碼相同，同一台機器只能安裝其中一個版本，
+安裝其中一版會覆蓋另一版。
 
 ---
 
@@ -266,6 +312,60 @@ pip install faster-whisper
 ```
 
 VoxNote 啟動時會自動偵測已安裝的工具，在設定頁面中選取即可。
+
+---
+
+## 即時字幕
+
+即時字幕使用 `whisper-rs` 在應用程式內載入 GGML 模型，不使用外部
+`whisper` 執行檔，也不會將選用本地 Whisper 的音訊送往外部服務。
+
+### 下載模型
+
+請自行下載 Whisper GGML `.bin` 模型，建議先使用 `small`；若硬體記憶體足夠再使用
+`medium`。模型下載完成後，前往「設定」→「即時字幕」→「GGML 模型檔」選取檔案。
+
+模型檔可從 [whisper.cpp models](https://huggingface.co/ggerganov/whisper.cpp) 取得，
+例如 `ggml-small.bin` 或 `ggml-medium.bin`。模型權重不應提交至 Git 儲存庫。
+
+### 使用方式
+
+1. 在「設定」→「即時字幕」選擇轉錄後端、音訊來源、視窗長度與顯示模式。
+2. 開啟左側「即時字幕」頁面並按下「開始即時字幕」。
+3. 將出現的無邊框字幕視窗拖曳到影片或會議視窗上方；右下角控制點可調整大小。
+4. 即時字幕與一般桌面錄音互斥，停止其中一個後才能啟動另一個。
+
+翻譯功能會逐段呼叫目前的 LLM 設定。長時間使用雲端 LLM 可能累積費用；本地
+Ollama 翻譯與 Whisper 會共用系統記憶體／GPU VRAM，請避免同時載入過大的模型。
+
+### 即時字幕與批次逐字稿為獨立設定
+
+即時字幕的來源語言、遠端 ASR 端點與逾時秒數（「即時字幕」頁）與批次逐字稿的
+對應設定（「設定」頁）彼此獨立，互不共用：
+
+| 設定項 | 批次逐字稿 | 即時字幕 |
+| --- | --- | --- |
+| 來源語言 | `asr_language`（設定頁） | `live_caption_language`（即時字幕頁，預設 `auto`） |
+| 自架 ASR 端點 | `local_asr_base_url`（設定頁） | `live_caption_remote_base_url`（即時字幕頁；留空則回退沿用批次端點） |
+| 逾時策略 | 分鐘級（配合長錄音處理） | 秒級（`live_caption_remote_timeout_seconds`，預設 8 秒，避免卡住後續視窗） |
+
+此設計對應兩種典型情境可能同時存在、且語言相反的使用方式：
+
+- **批次中文會議**：以中文錄音檔跑批次逐字稿，`asr_language` 設為 `zh`。
+- **即時英文影片字幕**：即時字幕來源語言另設為 `en`（或 `auto`），指向另一個
+  以英文低延遲模型部署的自架 ASR 端點，與批次流程使用的中文模型分開。
+
+若僅部署單一自架 ASR 服務且兩種情境的語言相同，可將即時字幕端點留空，
+系統會自動回退沿用批次端點；`server/README.md` 另說明雙實例（批次／即時）
+部署的 gateway 分流方式。
+
+### 增量字幕參數
+
+即時字幕設定中的「增量字幕模式」預設關閉，以維持既有視窗式行為。啟用後，
+「視窗長度」代表每次送入 ASR 的上下文長度，「增量解碼間隔」代表多久重新解碼
+一次，兩者是獨立參數。解碼間隔必須小於視窗長度，例如 5 秒視窗搭配 800 毫秒
+間隔；視窗越長通常較有利於辨識準確度，間隔越短則較快看到暫定文字，但會提高
+CPU/GPU 負載。增量端點不可用時，系統會提示並回退至既有視窗式輸出。
 
 ---
 

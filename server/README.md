@@ -44,6 +44,21 @@ API、Docker 與部署契約已完成；`app.py` 的 Breeze-ASR-26 載入、Whis
 
   若想改用其他模型，設定 `ASR_MODEL` 環境變數即可（詳見下方「選擇 ASR 模型」）；使用 WhisperX 內建代號（如 `large-v3`）時可略過本步驟，模型會自動下載，無須轉檔。
 
+- [ ] **3b. 即時字幕的英文模型（僅雙實例部署需要）**
+  **無須任何操作**。`asr-live` 預設使用 WhisperX 內建代號 `distil-large-v3`，服務啟動時會自動下載（約 1.5 GB）至掛載的 HF 快取並載入 GPU，不需轉檔、不需事先放檔。後續啟動會沿用落盤快取，只需重新載入 RAM／VRAM。
+
+  此處與步驟 3 的差異在於：Breeze 以 safetensors 發布故須自行轉為 CTranslate2；而 Whisper 系列（含 distil）由 WhisperX 直接處理。
+
+  模型選擇建議（詳見「雙實例部署 > 即時字幕的模型選擇」）：
+
+  | 代號 | 相對速度 | 英文品質 | 大小 |
+  | --- | --- | --- | --- |
+  | `distil-large-v3`（預設） | 約 6× | 接近 large-v3 | ~1.5 GB |
+  | `large-v3` | 1× | 最佳 | ~3 GB |
+  | `medium.en` | 約 2× | 尚可 | ~1.5 GB |
+
+  改用其他模型時設定 `ASR_LIVE_MODEL` 即可，例如 `ASR_LIVE_MODEL=large-v3 docker compose up -d`。
+
 - [ ] **4. 啟動服務**
   ```bash
   cd server
@@ -54,12 +69,23 @@ API、Docker 與部署契約已完成；`app.py` 的 Breeze-ASR-26 載入、Whis
   ```bash
   curl http://localhost:8000/health
   ```
-  應回傳 `status` 為 `ok` 的 JSON。
+  應回傳 `status` 為 `ok` 的 JSON（此為 gateway 自身的檢查）。後端各實例的檢查見下方「雙實例部署」。
 
 - [ ] **6. 驗證轉錄品質**
   以一段實際會議錄音呼叫轉錄端點，確認繁體中文台灣用語、語者標籤正確性，並記錄處理速度（RTF）與 VRAM 用量，作為調整 `ASR_COMPUTE_TYPE`、`ASR_BATCH_SIZE` 的依據。
 
-> 模型權重與 Hugging Face 快取以 volume 掛載，重建容器不會重新下載。升級時重新執行 `docker compose up -d --build`，再以健康檢查確認狀態。
+> 模型權重、Hugging Face 快取與 Torch 對齊模型快取皆以 volume 掛載，重建容器不會重新下載。升級時重新執行 `docker compose up -d --build`，再以健康檢查確認狀態。
+
+### 關於 image 大小與 CUDA 來源
+
+image 約 12.8 GB，其中約 7.7 GB 為 Python 相依，最大宗是 torch wheel 自帶的 CUDA runtime（`site-packages/nvidia/*` 約 4.1 GB）與 torch 本身（約 1.7 GB）。
+
+base image 使用純 `ubuntu:22.04` 而非 `nvidia/cuda:*-cudnn-runtime`：PyPI 的 torch wheel 已自帶完整 CUDA 與 cuDNN，與 base image 內建者重複，且實際載入的是前者——換言之厚重的 CUDA base image 從未被真正使用。改用純 Ubuntu 後 image 由 18.2 GB 降至 12.8 GB，已實測 `ctranslate2` 與 `torch` 皆能正常使用 GPU（`int8` 與 `float16` 皆驗證通過，含 pyannote VAD 路徑）。
+
+兩點影響：
+
+- GPU 存取改由 NVIDIA Container Toolkit 於執行期注入驅動，故步驟 1 的驗證仍是必要前提。
+- **CUDA 版本完全由 torch wheel 決定**（目前為 cu128），升級 torch 等同升級 CUDA。若日後改以系統 CUDA 為準，需同時調整 base image 與 torch 的安裝索引。
 
 ## 不使用 Docker 的本機開發（uv）
 
@@ -83,15 +109,95 @@ torch 的 CUDA 版本請依 NVIDIA 官方索引安裝（對應主機 CUDA 版本
 
 注意：WhisperX 走 faster-whisper (CTranslate2) 後端，任何自訂 fine-tune 模型（如 Breeze）須先轉為 CTranslate2 格式才能載入；原版 Whisper 系列則由 WhisperX 自動處理。語者分離（pyannote）與所選 ASR 模型無關，兩者皆可搭配。
 
+## 雙實例部署（批次中文 ／ 即時英文）
+
+批次會議逐字稿與即時字幕的最佳模型並不相同：Breeze-ASR-26 是台灣中文與中英混用的 fine-tune，**不適合英文影片**；而同尺寸下其速度與原版 Whisper 相當，故若要降低即時延遲，應調整模型尺寸與 `ASR_COMPUTE_TYPE`，而非更換 fine-tune。
+
+`docker compose` 因此定義兩個 ASR 實例，**共用同一份 image 與同一套 `app.py`**，僅環境變數不同：
+
+| 服務 | 用途 | 模型變數 | 語者分離 |
+| --- | --- | --- | --- |
+| `asr-batch` | 中文會議逐字稿 | `ASR_MODEL` | 使用 |
+| `asr-live` | 英文即時字幕 | `ASR_LIVE_MODEL` | 不使用 |
+
+`asr-live` 不啟用語者分離，故不會載入 pyannote 模型，VRAM 用量低於 `asr-batch`。即時模型會在服務啟動階段預載；批次模型仍於首次轉錄時載入。
+
+### 即時字幕的模型選擇
+
+即時字幕的瓶頸是**延遲**而非絕對準確度——每數秒的音訊視窗都要在下一個視窗到來前完成轉錄。故預設採 `distil-large-v3`：Whisper large-v3 的英文蒸餾版，速度約 6 倍而英文品質接近原版。
+
+| `ASR_LIVE_MODEL` | 相對速度 | 英文品質 | 下載大小 | 適用 |
+| --- | --- | --- | --- | --- |
+| `distil-large-v3`（預設） | 約 6× | 接近 large-v3 | ~1.5 GB | 一般情境；速度與品質平衡 |
+| `large-v3` | 1× | 最佳 | ~3 GB | GPU 充裕、可接受較高延遲 |
+| `medium.en` | 約 2× | 尚可 | ~1.5 GB | VRAM 吃緊 |
+
+三者皆為 WhisperX 內建代號，**首次載入時自動下載，無須事先準備或轉檔**。
+
+注意：`distil-large-v3` 與 `medium.en` 皆為**英文專用**，不適合中文或多語內容——即時字幕若要轉錄其他語言，應改用 `large-v3`。批次中文會議不受影響（走 `asr-batch` 的 Breeze-ASR-26）。
+
+延遲仍不足時，優先調整 `ASR_COMPUTE_TYPE`（`int8` 較快、`float16` 較準）而非再換更小的模型。
+
+### 為何用 gateway 而非各自開埠
+
+兩個實例皆**不對外開埠**，一律經 `gateway`（nginx）於單一埠分流：
+
+```
+http://<host>:8000/live/...   ->  asr-live:8000
+http://<host>:8000/...        ->  asr-batch:8000（預設路由）
+```
+
+**批次為預設路由**：不帶路徑前綴的請求一律轉給批次實例，故既有設定（如 `http://host:8000`）升級 gateway 後無須修改。`/batch` 前綴仍可使用，供明確指定時用。只有即時字幕需填 `/live`。
+
+如此對外只佔用一個埠。兩者仍為獨立 process、各有各的序列化鎖，故長會議轉錄**不會**讓即時字幕排隊等待——但兩者同時執行時會爭用 GPU 算力，即時字幕的延遲仍會惡化，此為物理限制。
+
+若改以「單一 process 依請求參數切換模型」實作，會因 `app.py` 的 ASR 模型為單一欄位且無卸載路徑，退化為兩個模型同時常駐（VRAM 與雙實例相同），卻多背共用鎖導致的排隊問題，故不採用。
+
+### 端點對照
+
+| 用途 | URL |
+| --- | --- |
+| 批次健康檢查（預設路由） | `http://<host>:8000/health` |
+| 批次轉錄（預設路由） | `http://<host>:8000/v1/audio/transcriptions` |
+| 批次健康檢查（明確前綴） | `http://<host>:8000/batch/health` |
+| 即時健康檢查 | `http://<host>:8000/live/health` |
+| 即時轉錄 | `http://<host>:8000/live/v1/audio/transcriptions` |
+| gateway 自身存活檢查 | `http://<host>:8000/gateway-health` |
+
+> `/health` 轉發至批次後端而非由 gateway 自行回答。這是刻意的：若 gateway 自答 `/health`，未帶前綴的設定會在「測試連線」時假性通過，實際打轉錄端點才失敗。要確認 gateway 本身是否就緒請用 `/gateway-health`。
+
+### 只想跑單一實例
+
+```bash
+docker compose up -d --build asr-batch gateway
+```
+
+此時 `/live/` 路徑會回 502，`/batch/` 正常。
+
+### 逾時設定
+
+`nginx.conf` 的 `proxy_read_timeout` 對批次設為 3600 秒，須與客戶端的 `LOCAL_ASR_TIMEOUT_SECS` 一致——否則長錄音會在 gateway 這層先被切斷，客戶端只看到連線中斷而非真正原因。即時路徑設為 120 秒，僅作為兜底（首次請求需惰性載入模型），實際的即時節奏把關由客戶端自身的秒級逾時負責。
+
+上傳大小上限為 2048 MB（`client_max_body_size`），長會議錄音可達數百 MB，預設的 1 MB 會被擋下。
+
 ## 環境變數
 
 | 變數 | 說明 | 預設 |
 | --- | --- | --- |
+| `ASR_LIVE_MODEL` | 即時字幕實例的模型；WhisperX 代號（自動下載）或容器內路徑 | `distil-large-v3` |
+| `ASR_LIVE_MODEL_PATH` | 即時字幕模型的 host 端目錄；僅在 `ASR_LIVE_MODEL` 指向本地目錄時需要 | `./models/asr-live-model` |
+| `ASR_LIVE_PRELOAD_MODE` | 即時服務預載路徑；一般字幕用 `full`，App 啟用增量字幕時改用 `incremental` | `full` |
+| `ASR_LIVE_PRELOAD_LANGUAGE` | `full` 模式啟動時一併預載的詞級對齊語言；空字串代表延後至辨識後載入 | `en` |
+| `ASR_LIVE_BATCH_SIZE` | 即時字幕實例的批次大小；以延遲為先故預設較小 | `4` |
+| `ASR_PORT` | gateway 對外埠 | `8000` |
+| `HF_CACHE_DIR` | host 端 Hugging Face 模型快取目錄 | `./cache/huggingface` |
+| `TORCH_CACHE_DIR` | host 端 Torch／torchaudio 對齊模型快取目錄 | `./cache/torch` |
 | `ASR_MODEL` | ASR 模型：CTranslate2 目錄、HF repo 名稱，或 WhisperX 內建代號（如 `large-v3`）。相容別名 `BREEZE_MODEL_DIR` | `MediaTek-Research/Breeze-ASR-26` |
 | `ASR_DEVICE` | 推論裝置 | `cuda` |
 | `ASR_COMPUTE_TYPE` | 運算精度；VRAM 較小建議 `int8`，較充裕可用 `float16` | `int8` |
 | `ASR_BATCH_SIZE` | 批次大小；VRAM 較小時調降 | `8` |
 | `DIARIZATION_MODEL` | 語者分離模型（明確指定，不依賴 WhisperX 會變動的預設值） | `pyannote-community/speaker-diarization-community-1` |
+| `DIARIZATION_CLUSTERING_THRESHOLD` | pyannote AHC 分群門檻（cosine 距離，範圍 0–2）；設為空字串則採模型預設值（`0.6`） | `0.8` |
 | `HF_TOKEN` / `HF_TOKEN_FILE` | Hugging Face token（語者分離所需），可直接給值或指向檔案 | 無 |
 | `UPLOAD_DIR` | 上傳音訊暫存目錄 | 系統暫存目錄 |
 | `AUDIO_PREPROCESS` | 音訊前處理總開關；設為 `0` 可停用以比對效果 | `1` |
@@ -114,11 +220,98 @@ torch 的 CUDA 版本請依 NVIDIA 官方索引安裝（對應主機 CUDA 版本
 
 比對前處理是否有效的方式：對同一段實際會議錄音，分別以 `AUDIO_PREPROCESS=0` 與 `1` 轉錄，比較語者標籤的正確性。
 
+### 分群門檻
+
+pyannote 以 AHC（凝聚式階層分群）依聲紋 embedding 的 cosine 距離決定講者身分。同一人在音量、語氣、麥克風距離變化，或長時間間隔後再發言時，embedding 距離可能超過分群門檻而未被合併，導致一人被判為多個講者；反之門檻太高則可能把不同人合併為同一講者。
+
+`DIARIZATION_CLUSTERING_THRESHOLD` 可覆寫此門檻，範圍為 cosine 距離 0–2：
+
+- **調低**：分群更嚴格，傾向將講者拆得更細（可能加劇「一人被拆成多人」）。
+- **調高**：分群更寬鬆，傾向合併相近的聲紋（可能導致「不同人被合併」）。
+
+`docker-compose.yml` 預設帶入 `0.8`。要改回模型預設值 `0.6`，於 `server/.env` 寫入空值即可：
+
+```dotenv
+DIARIZATION_CLUSTERING_THRESHOLD=
+```
+
+（compose 使用 `${VAR-0.8}` 單破折號語法，故 `.env` 中的空字串會照實傳入而不被預設值取代。）
+
+取用底層 pyannote pipeline 參數失敗時（版本升級可能變動未公開介面），服務會記錄 log 並安全降級為模型預設值，不中斷轉錄。
+
+#### 實測結果與建議值
+
+以一段 43 分鐘、實際三人（主要為兩人對談）的中文會議錄音實測（`pyannote-community/speaker-diarization-community-1`，模型預設門檻為 `0.6`）：
+
+| 門檻 | 分段數 | 講者分佈 | 判讀 |
+| --- | --- | --- | --- |
+| `0.6`（模型預設） | 522 | A:231、B:240、C:50 | 出現第三位講者 C，實為 A/B 被誤拆 |
+| `0.8` | 514 | A:229、B:240、C:44 | 幾乎無改善，C 仍在 |
+| **`1.0`（建議）** | 525 | A:260、B:264 | **C 消失，收斂為正確的兩人** |
+| `1.2` | 91 | A:91 | 過度合併，全部併為同一人（等同未分離） |
+
+過去三人會議的實測建議值為 `1.0`，但多人會議可能因此過度合併；目前預設採 `0.8` 作為折衷值。不同錄音環境（麥克風距離、人數、環境噪音）的最佳值可能不同，建議以自身錄音比對後再定案。
+
+需注意：**調高門檻只能解決分群階段的誤拆，無法消除字級切分本身的碎片化**。上表中 `0.6` 與 `1.0` 的分段數同為 5 百多段，因為分段數主要由字級講者標籤的跳動決定，而非講者總數；門檻影響的是「這些分段被歸給幾個講者」。
+
 ## app 端設定
 
-在 VoxNote 的「設定 > 語音轉錄」選擇「VoxNote 轉錄服務」，Base URL 填入服務位址（例如 `http://192.168.0.10:8000`）。設定頁的「測試連線」會呼叫 `/health`。本服務預設無驗證機制，請部署於受信任的網路環境。
+在 VoxNote 的「設定 > 語音轉錄」選擇「VoxNote 轉錄服務」，Base URL 填入**含路徑前綴**的位址。設定頁的「測試連線」會呼叫該位址下的 `/health`。本服務預設無驗證機制，請部署於受信任的網路環境。
 
-`POST /v1/audio/transcriptions` 使用 multipart：`file` 為音訊檔；可選 `language`、`diarize`、`min_speakers` 與 `max_speakers`。回應的 `segments` 陣列含秒數 `start`、`end`、`text` 與啟用語者分離時的 `speaker`。
+| 設定位置 | Base URL 範例 |
+| --- | --- |
+| 設定頁 > 批次逐字稿 | `http://192.168.0.10:8000`（不需前綴） |
+| 即時字幕頁 > 遠端端點 | 可留空（見下方自動偵測） |
+
+兩者為各自獨立的設定（即時字幕的來源語言與端點與批次流程分離）。
+
+**即時字幕端點會自動偵測**：該欄位留空時，app 於**啟動 session 時探測一次** `{批次位址}/live/health`——
+
+- 回應成功（gateway 雙實例部署）→ 本次 session 採用 `{批次位址}/live`，即英文模型實例
+- 回應失敗（舊版單一容器部署，實測回 404）→ 沿用批次位址
+
+探測僅在啟動時進行一次，session 期間不重複，故不影響即時字幕每個音訊視窗的延遲。
+
+若欄位已填寫則**直接採用、不進行探測**——自動偵測是未設定時的預設行為，不覆蓋明確設定。需要指向其他主機或強制使用特定實例時填入完整位址即可。
+
+> 未經 gateway 的舊部署（單一容器直接開埠）同樣不需前綴，設定完全相容。
+
+### 低延遲增量端點
+
+`POST /v1/audio/transcriptions/incremental` 是即時字幕專用端點，使用 multipart
+上傳 `file`，可選 `language`，並直接以 faster-whisper 模型轉錄後回傳：
+
+```json
+{"text":"...","language":"en"}
+```
+
+此端點不建立背景任務、不執行 WhisperX 詞級對齊或 pyannote 語者分離，適合 app
+以短於分析視窗的間隔重複送出重疊音訊。連續回應的 `text` 格式一致，LocalAgreement
+由 VoxNote app 呼叫端負責判定暫定與確定文字。模型載入失敗會回傳 HTTP 503 與明確
+錯誤，不會在服務內靜默改走批次端點。
+
+批次端點 `POST /v1/audio/transcriptions` 與 `sync=true` 契約不變，仍使用 WhisperX
+對齊與可選的語者分離。兩條路徑目前各自持有 faster-whisper/WhisperX 模型實例，
+避免批次後處理阻塞低延遲請求；代價是需要較多 VRAM，部署時應依 GPU 餘裕調整模型
+與 `ASR_INCREMENTAL_COMPUTE_TYPE`。
+
+### 轉錄 API
+
+`POST /v1/audio/transcriptions` 使用 multipart：`file` 為音訊檔；可選 `language`、`diarize`、`min_speakers` 與 `max_speakers`。預設為非同步模式，服務會立即回傳：
+
+```json
+{"task_id":"<uuid>","status":"queued","progress":0}
+```
+
+客戶端接著輪詢 `GET /v1/tasks/<task_id>`。任務狀態為 `queued`、`processing`、`done` 或 `failed`，`progress` 會依轉錄、對齊、語者分離三階段回報 `0`、`33`、`66`、`100`。完成時回應的 `result` 內容包含 `text`、`segments`、`language` 與 `diarization_enabled`；`segments` 含秒數 `start`、`end`、`text`，啟用語者分離時另含 `speaker`。失敗時回應 `error` 繁體中文錯誤訊息。
+
+```json
+{"task_id":"<uuid>","status":"done","progress":100,"result":{"text":"...","segments":[]}}
+```
+
+即時字幕可在同一個 multipart 請求加入 `sync=true`，直接取得上述 `result` 格式，不建立任務，也不經背景佇列。批次流程不要帶 `sync`，避免長音訊請求被同步等待。任務只保留一小時，或保留最多 1000 筆已完成任務；服務重啟後記憶體中的任務會清除。
+
+gateway 的 `/batch/v1/tasks/<task_id>` 會依既有 `/batch/` 前綴轉發至批次實例，未帶前綴的 `/v1/tasks/<task_id>` 也會轉發至批次實例；兩者都是短輪詢請求，不會等待整段轉錄，因此不受批次長連線逾時影響。
 
 ## 小 VRAM 機器的冒煙測試
 

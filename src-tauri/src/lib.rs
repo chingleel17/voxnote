@@ -1,17 +1,19 @@
-use tauri::Manager;
+use tauri::{Manager, WindowEvent};
 
-mod audio_recording;
 mod ai;
 mod asr;
+mod audio_recording;
 mod backup;
 mod commands;
 mod config;
 mod db;
+mod live_caption;
+mod voiceprint;
 
 use commands::{
-    ai_cmds::*, asr_cmds::*, backup_cmds::*, meeting_cmds::*, meeting_export_cmds::*,
-    recording_cmds::*, settings_cmds::*, speaker_mapping_cmds::*, summary_cmds::*, tag_cmds::*,
-    template_cmds::*, transcript_cmds::*,
+    ai_cmds::*, asr_cmds::*, backup_cmds::*, live_caption_cmds::*, meeting_cmds::*,
+    meeting_export_cmds::*, recording_cmds::*, settings_cmds::*, speaker_mapping_cmds::*,
+    summary_cmds::*, tag_cmds::*, template_cmds::*, transcript_cmds::*, voiceprint_cmds::*,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -21,6 +23,32 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_notification::init())
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let app_handle = window.app_handle().clone();
+                let live_caption_manager = app_handle.state::<live_caption::LiveCaptionManager>();
+                if live_caption_manager.status().active {
+                    if let Err(error) = live_caption_manager.stop(&app_handle) {
+                        println!("[shutdown] 停止即時字幕失敗：{error}");
+                    }
+                }
+
+                let recording_manager =
+                    app_handle.state::<audio_recording::DesktopRecordingManager>();
+                if audio_recording::is_recording(&recording_manager) {
+                    if let Err(error) = audio_recording::stop_recording(&recording_manager) {
+                        println!("[shutdown] 停止桌面錄音失敗：{error}");
+                    }
+                }
+
+                app_handle.exit(0);
+            }
+        })
         .setup(|app| {
             let app_handle = app.handle().clone();
             tauri::async_runtime::block_on(async move {
@@ -28,8 +56,17 @@ pub fn run() {
                 app_handle.manage(pool);
                 app_handle.manage(backup::DataOperationLock::default());
                 app_handle.manage(audio_recording::DesktopRecordingManager::default());
-                audio_recording::cleanup_stale_temp_files(&app_handle)
-                    .expect("暫存錄音清理失敗");
+                app_handle.manage(live_caption::LiveCaptionManager::default());
+            });
+            if let Some(main_window) = app.get_webview_window("main") {
+                main_window.show().expect("主視窗顯示失敗");
+            }
+
+            let cleanup_app_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                if let Err(error) = audio_recording::cleanup_stale_temp_files(&cleanup_app_handle) {
+                    eprintln!("[startup] 暫存錄音清理失敗：{error}");
+                }
             });
             Ok(())
         })
@@ -68,6 +105,7 @@ pub fn run() {
             get_recordings,
             save_recording,
             import_recording_file,
+            import_recording_files,
             list_recording_devices,
             start_desktop_recording,
             stop_desktop_recording,
@@ -92,6 +130,13 @@ pub fn run() {
             // asr
             detect_local_asr_tools,
             start_transcription,
+            // live caption
+            start_live_caption,
+            stop_live_caption,
+            get_live_caption_status,
+            list_live_caption_audio_sources,
+            get_live_caption_build_info,
+            set_live_caption_click_through,
             // templates & saved participants
             get_saved_participants,
             upsert_saved_participant,
@@ -111,6 +156,11 @@ pub fn run() {
             export_full_backup,
             preflight_full_backup,
             import_full_backup,
+            // speaker voiceprint matching
+            get_within_recording_merge_proposals,
+            get_cross_recording_link_proposals,
+            get_cross_meeting_identity_proposals,
+            confirm_speaker_voiceprint,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
