@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -26,7 +27,18 @@ ASR_SAMPLE_RATE = 16000
 # int16 轉 float32 的正規化係數，與 whisperx.load_audio 相同
 INT16_MAX_ABS = 32768.0
 
-app = FastAPI(title="VoxNote Local ASR", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """依服務角色預載模型，完成前不接受請求。"""
+    preload_mode = os.getenv("ASR_PRELOAD_MODE", "off").strip().lower()
+    preload_language = os.getenv("ASR_PRELOAD_LANGUAGE", "").strip().lower()
+    if preload_mode != "off":
+        await run_in_threadpool(_preload_models, preload_mode, preload_language or None)
+    yield
+
+
+app = FastAPI(title="VoxNote Local ASR", version="0.1.0", lifespan=lifespan)
 opencc = OpenCC("s2twp")
 
 TASK_RETENTION_SECONDS = 60 * 60
@@ -716,6 +728,22 @@ class IncrementalTranscriber:
 
 transcriber = WhisperXTranscriber()
 incremental_transcriber = IncrementalTranscriber()
+
+
+def _preload_models(mode: str, language: str | None) -> None:
+    """在服務啟動階段將指定推論路徑的模型載入 RAM／VRAM。"""
+    logger.info("開始預載 ASR 模型：mode=%s, language=%s", mode, language or "auto")
+    if mode == "full":
+        transcriber._ensure_asr_model()
+        if language:
+            transcriber._ensure_align_model(language)
+    elif mode == "incremental":
+        incremental_transcriber._ensure_model()
+    else:
+        raise RuntimeError(
+            f"ASR_PRELOAD_MODE 不支援 {mode!r}，僅可使用 off、full 或 incremental"
+        )
+    logger.info("ASR 模型預載完成：mode=%s", mode)
 
 
 def read_hf_token() -> str | None:

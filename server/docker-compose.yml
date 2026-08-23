@@ -10,6 +10,7 @@ x-asr-common: &asr-common
   build: .
   environment: &asr-common-env
     HF_HOME: /root/.cache/huggingface
+    TORCH_HOME: /root/.cache/torch
     HF_TOKEN_FILE: /run/secrets/hf_token
     # 音訊前處理：設為 0 可停用，用於比對前處理對轉錄與語者分離的實際影響
     AUDIO_PREPROCESS: ${AUDIO_PREPROCESS:-1}
@@ -40,6 +41,7 @@ services:
       # host 端模型目錄（預設放 Breeze-ASR-26；可用 .env 的 ASR_MODEL_PATH 覆寫）
       - ${ASR_MODEL_PATH:-./models/asr-model}:/models/asr-model:ro
       - ${HF_CACHE_DIR:-./cache/huggingface}:/root/.cache/huggingface
+      - ${TORCH_CACHE_DIR:-./cache/torch}:/root/.cache/torch
       - ${HF_TOKEN_FILE:-./secrets/hf_token}:/run/secrets/hf_token:ro
 
   # 即時字幕：英文影片，不使用語者分離（故不會載入 pyannote，較批次實例省 VRAM）
@@ -52,6 +54,10 @@ services:
       # 下載至掛載的 HF 快取，無須事先轉檔（不同於 Breeze 需 ct2 轉換）。
       # 追求最佳品質可改 large-v3；VRAM 吃緊可改 medium.en。
       ASR_MODEL: ${ASR_LIVE_MODEL:-distil-large-v3}
+      # 啟動完成前載入模型與英文對齊模型，避免第一段字幕承擔下載及初始化延遲。
+      # App 若改用增量字幕，這裡也應改成 incremental，避免常駐兩份模型。
+      ASR_PRELOAD_MODE: ${ASR_LIVE_PRELOAD_MODE:-full}
+      ASR_PRELOAD_LANGUAGE: ${ASR_LIVE_PRELOAD_LANGUAGE:-en}
       # 即時情境以延遲為先，預設較小的 batch size
       ASR_BATCH_SIZE: ${ASR_LIVE_BATCH_SIZE:-4}
     volumes:
@@ -59,6 +65,7 @@ services:
       # 存於下方的 HF 快取，此掛載不影響運作。
       - ${ASR_LIVE_MODEL_PATH:-./models/asr-live-model}:/models/asr-live-model:ro
       - ${HF_CACHE_DIR:-./cache/huggingface}:/root/.cache/huggingface
+      - ${TORCH_CACHE_DIR:-./cache/torch}:/root/.cache/torch
       - ${HF_TOKEN_FILE:-./secrets/hf_token}:/run/secrets/hf_token:ro
 
   # 對外唯一入口：/batch/ 與 /live/ 分流至上述兩個實例

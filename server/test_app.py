@@ -330,6 +330,33 @@ class TestTranscriptionApi(unittest.TestCase):
         ):
             self.run_async(scenario())
 
+    def test_full_preload_loads_asr_and_configured_alignment(self):
+        with (
+            patch.object(app.transcriber, "_ensure_asr_model") as ensure_asr,
+            patch.object(app.transcriber, "_ensure_align_model") as ensure_align,
+            patch.object(
+                app.incremental_transcriber, "_ensure_model"
+            ) as ensure_incremental,
+        ):
+            app._preload_models("full", "en")
+
+        ensure_asr.assert_called_once_with()
+        ensure_align.assert_called_once_with("en")
+        ensure_incremental.assert_not_called()
+
+    def test_incremental_preload_does_not_load_full_pipeline(self):
+        with patch.object(app.transcriber, "_ensure_asr_model") as ensure_asr, patch.object(
+            app.incremental_transcriber, "_ensure_model"
+        ) as ensure_incremental:
+            app._preload_models("incremental", None)
+
+        ensure_asr.assert_not_called()
+        ensure_incremental.assert_called_once_with()
+
+    def test_preload_rejects_unknown_mode(self):
+        with self.assertRaisesRegex(RuntimeError, "ASR_PRELOAD_MODE"):
+            app._preload_models("unknown", None)
+
 
 class TestToSegments(unittest.TestCase):
     """`_to_segments` 的字級講者切分行為（tasks.md 第 2 節）。"""

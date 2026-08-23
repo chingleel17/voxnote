@@ -45,7 +45,7 @@ API、Docker 與部署契約已完成；`app.py` 的 Breeze-ASR-26 載入、Whis
   若想改用其他模型，設定 `ASR_MODEL` 環境變數即可（詳見下方「選擇 ASR 模型」）；使用 WhisperX 內建代號（如 `large-v3`）時可略過本步驟，模型會自動下載，無須轉檔。
 
 - [ ] **3b. 即時字幕的英文模型（僅雙實例部署需要）**
-  **無須任何操作**。`asr-live` 預設使用 WhisperX 內建代號 `distil-large-v3`，首次收到請求時自動下載（約 1.5 GB）至掛載的 HF 快取，不需轉檔、不需事先放檔。
+  **無須任何操作**。`asr-live` 預設使用 WhisperX 內建代號 `distil-large-v3`，服務啟動時會自動下載（約 1.5 GB）至掛載的 HF 快取並載入 GPU，不需轉檔、不需事先放檔。後續啟動會沿用落盤快取，只需重新載入 RAM／VRAM。
 
   此處與步驟 3 的差異在於：Breeze 以 safetensors 發布故須自行轉為 CTranslate2；而 Whisper 系列（含 distil）由 WhisperX 直接處理。
 
@@ -74,7 +74,7 @@ API、Docker 與部署契約已完成；`app.py` 的 Breeze-ASR-26 載入、Whis
 - [ ] **6. 驗證轉錄品質**
   以一段實際會議錄音呼叫轉錄端點，確認繁體中文台灣用語、語者標籤正確性，並記錄處理速度（RTF）與 VRAM 用量，作為調整 `ASR_COMPUTE_TYPE`、`ASR_BATCH_SIZE` 的依據。
 
-> 模型權重與 Hugging Face 快取以 volume 掛載，重建容器不會重新下載。升級時重新執行 `docker compose up -d --build`，再以健康檢查確認狀態。
+> 模型權重、Hugging Face 快取與 Torch 對齊模型快取皆以 volume 掛載，重建容器不會重新下載。升級時重新執行 `docker compose up -d --build`，再以健康檢查確認狀態。
 
 ### 關於 image 大小與 CUDA 來源
 
@@ -120,7 +120,7 @@ torch 的 CUDA 版本請依 NVIDIA 官方索引安裝（對應主機 CUDA 版本
 | `asr-batch` | 中文會議逐字稿 | `ASR_MODEL` | 使用 |
 | `asr-live` | 英文即時字幕 | `ASR_LIVE_MODEL` | 不使用 |
 
-`asr-live` 不啟用語者分離，故不會載入 pyannote 模型，VRAM 用量低於 `asr-batch`（模型皆為惰性載入）。
+`asr-live` 不啟用語者分離，故不會載入 pyannote 模型，VRAM 用量低於 `asr-batch`。即時模型會在服務啟動階段預載；批次模型仍於首次轉錄時載入。
 
 ### 即時字幕的模型選擇
 
@@ -186,8 +186,12 @@ docker compose up -d --build asr-batch gateway
 | --- | --- | --- |
 | `ASR_LIVE_MODEL` | 即時字幕實例的模型；WhisperX 代號（自動下載）或容器內路徑 | `distil-large-v3` |
 | `ASR_LIVE_MODEL_PATH` | 即時字幕模型的 host 端目錄；僅在 `ASR_LIVE_MODEL` 指向本地目錄時需要 | `./models/asr-live-model` |
+| `ASR_LIVE_PRELOAD_MODE` | 即時服務預載路徑；一般字幕用 `full`，App 啟用增量字幕時改用 `incremental` | `full` |
+| `ASR_LIVE_PRELOAD_LANGUAGE` | `full` 模式啟動時一併預載的詞級對齊語言；空字串代表延後至辨識後載入 | `en` |
 | `ASR_LIVE_BATCH_SIZE` | 即時字幕實例的批次大小；以延遲為先故預設較小 | `4` |
 | `ASR_PORT` | gateway 對外埠 | `8000` |
+| `HF_CACHE_DIR` | host 端 Hugging Face 模型快取目錄 | `./cache/huggingface` |
+| `TORCH_CACHE_DIR` | host 端 Torch／torchaudio 對齊模型快取目錄 | `./cache/torch` |
 | `ASR_MODEL` | ASR 模型：CTranslate2 目錄、HF repo 名稱，或 WhisperX 內建代號（如 `large-v3`）。相容別名 `BREEZE_MODEL_DIR` | `MediaTek-Research/Breeze-ASR-26` |
 | `ASR_DEVICE` | 推論裝置 | `cuda` |
 | `ASR_COMPUTE_TYPE` | 運算精度；VRAM 較小建議 `int8`，較充裕可用 `float16` | `int8` |
