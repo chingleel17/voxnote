@@ -1,7 +1,7 @@
 import type { AppConfig } from '../types';
 import {
   saveSettings,
-  testLlmConnection, testOllamaConnection, getOllamaModels,
+  testLlmConnection, testOllamaConnection, getOllamaModels, listProviderModels,
   detectLocalAsrTools, testLocalAsrConnection,
   type LocalAsrInfo,
 } from '../api/settings';
@@ -12,7 +12,9 @@ import { initConfigStore, setCurrentConfig } from '../utils/configStore';
 import { sendTestNotification } from '../utils/notifications';
 
 // ─────────────────────────────────────────────
-// 預設模型選項（來源：各供應商官方文件，2026-04-29）
+// 備援模型選項（來源：各供應商官方文件，2026-04-29）
+// 正常情況下改由 list_provider_models 向供應商 API 取得即時清單，
+// 僅在未設定 API Key 或查詢失敗時採用以下靜態清單，確保離線仍可選擇。
 // ─────────────────────────────────────────────
 const OPENAI_MODELS = [
   'gpt-5.5',
@@ -42,6 +44,12 @@ const GEMINI_MODELS = [
   'gemini-2.5-flash',
   'gemini-2.5-flash-lite',
   'gemini-2.0-flash',
+];
+const OPENROUTER_MODELS = [
+  'openai/gpt-4o-mini',
+  'openai/gpt-4o',
+  'anthropic/claude-sonnet-4.5',
+  'google/gemini-2.5-flash',
 ];
 const ASSEMBLYAI_SPEECH_MODELS: Array<{
   value: AppConfig['assembly_ai_speech_model'];
@@ -901,48 +909,69 @@ function buildLlmSection(
   );
   section.appendChild(providerGroup);
 
+  // 雲端供應商共用同一種結構：API Key + 可重新載入的模型清單
+  const mergeCloudFields = (updated: AppConfig, fields: Array<keyof AppConfig>): void => {
+    const patch: Partial<AppConfig> = {};
+    for (const f of fields) Object.assign(patch, { [f]: updated[f] });
+    config = { ...config, ...patch };
+    onChange(config);
+  };
+
   // ── OpenAI ──
-  const openaiSection = buildProviderSection([
-    buildInputGroup('OpenAI API Key', 'password', config.openai_key, (v) => {
-      config = { ...config, openai_key: v }; onChange(config);
-    }),
-    buildSelectGroup('模型', OPENAI_MODELS.map((m) => ({ value: m, label: m })), config.openai_model, (v) => {
-      config = { ...config, openai_model: v }; onChange(config);
-    }),
-  ]);
+  const openaiSection = buildCloudProviderSection(
+    {
+      provider: 'openai',
+      keyLabel: 'OpenAI API Key',
+      keyField: 'openai_key',
+      modelField: 'openai_model',
+      fallbackModels: OPENAI_MODELS,
+    },
+    config,
+    (updated) => mergeCloudFields(updated, ['openai_key', 'openai_model'])
+  );
   section.appendChild(openaiSection);
 
   // ── Claude ──
-  const claudeSection = buildProviderSection([
-    buildInputGroup('Claude API Key', 'password', config.claude_key, (v) => {
-      config = { ...config, claude_key: v }; onChange(config);
-    }),
-    buildSelectGroup('模型', CLAUDE_MODELS.map((m) => ({ value: m, label: m })), config.claude_model, (v) => {
-      config = { ...config, claude_model: v }; onChange(config);
-    }),
-  ]);
+  const claudeSection = buildCloudProviderSection(
+    {
+      provider: 'claude',
+      keyLabel: 'Claude API Key',
+      keyField: 'claude_key',
+      modelField: 'claude_model',
+      fallbackModels: CLAUDE_MODELS,
+    },
+    config,
+    (updated) => mergeCloudFields(updated, ['claude_key', 'claude_model'])
+  );
   section.appendChild(claudeSection);
 
   // ── Gemini ──
-  const geminiSection = buildProviderSection([
-    buildInputGroup('Gemini API Key', 'password', config.gemini_key, (v) => {
-      config = { ...config, gemini_key: v }; onChange(config);
-    }),
-    buildSelectGroup('模型', GEMINI_MODELS.map((m) => ({ value: m, label: m })), config.gemini_model, (v) => {
-      config = { ...config, gemini_model: v }; onChange(config);
-    }),
-  ]);
+  const geminiSection = buildCloudProviderSection(
+    {
+      provider: 'gemini',
+      keyLabel: 'Gemini API Key',
+      keyField: 'gemini_key',
+      modelField: 'gemini_model',
+      fallbackModels: GEMINI_MODELS,
+    },
+    config,
+    (updated) => mergeCloudFields(updated, ['gemini_key', 'gemini_model'])
+  );
   section.appendChild(geminiSection);
 
   // ── OpenRouter ──
-  const openrouterSection = buildProviderSection([
-    buildInputGroup('OpenRouter API Key', 'password', config.openrouter_key, (v) => {
-      config = { ...config, openrouter_key: v }; onChange(config);
-    }),
-    buildInputGroup('模型（例如：openai/gpt-4o-mini）', 'text', config.openrouter_model, (v) => {
-      config = { ...config, openrouter_model: v }; onChange(config);
-    }),
-  ]);
+  // 模型清單為公開端點，未填 API Key 亦可載入
+  const openrouterSection = buildCloudProviderSection(
+    {
+      provider: 'openrouter',
+      keyLabel: 'OpenRouter API Key',
+      keyField: 'openrouter_key',
+      modelField: 'openrouter_model',
+      fallbackModels: OPENROUTER_MODELS,
+    },
+    config,
+    (updated) => mergeCloudFields(updated, ['openrouter_key', 'openrouter_model'])
+  );
   section.appendChild(openrouterSection);
 
   // ── Ollama ──
@@ -966,9 +995,9 @@ function buildLlmSection(
     buildInputGroup('API Key（可留空）', 'password', config.custom_api_key, (v) => {
       config = { ...config, custom_api_key: v }; onChange(config);
     }),
-    buildInputGroup('模型名稱', 'text', config.custom_model, (v) => {
+    buildCustomModelGroup(config, (v) => {
       config = { ...config, custom_model: v }; onChange(config);
-    }),
+    }, () => config),
   ]);
   section.appendChild(customSection);
 
@@ -1233,6 +1262,153 @@ function buildAiPromptSection(
 // ─────────────────────────────────────────────
 // 工具函式
 // ─────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// 自訂端點模型欄位
+// 端點未必實作 /models，因此維持自由輸入，僅以 datalist 提供建議選項
+// ─────────────────────────────────────────────
+function buildCustomModelGroup(
+  config: AppConfig,
+  onChange: (v: string) => void,
+  getConfig: () => AppConfig
+): HTMLElement {
+  const group = document.createElement('div');
+  group.className = 'form-group';
+  const label = document.createElement('label');
+  label.textContent = '模型名稱';
+
+  const row = document.createElement('div');
+  row.className = 'input-row';
+
+  const listId = 'custom-model-options';
+  const datalist = document.createElement('datalist');
+  datalist.id = listId;
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'form-control';
+  input.value = config.custom_model;
+  input.setAttribute('list', listId);
+  input.addEventListener('input', () => onChange(input.value));
+
+  const loadBtn = document.createElement('button');
+  loadBtn.className = 'btn btn-secondary btn-sm';
+  loadBtn.textContent = '載入模型';
+  loadBtn.addEventListener('click', async () => {
+    loadBtn.disabled = true;
+    loadBtn.textContent = '載入中...';
+    try {
+      await saveSettings(getConfig());
+      const models = await listProviderModels('custom');
+      datalist.innerHTML = '';
+      for (const m of models) {
+        const opt = document.createElement('option');
+        opt.value = m;
+        datalist.appendChild(opt);
+      }
+      showToast(
+        models.length > 0 ? `已載入 ${models.length} 個模型建議` : '端點未回傳模型清單',
+        models.length > 0 ? 'success' : 'error'
+      );
+    } catch (err) {
+      showToast(`無法取得模型列表：${String(err)}`, 'error');
+    } finally {
+      loadBtn.disabled = false;
+      loadBtn.textContent = '載入模型';
+    }
+  });
+
+  row.appendChild(input);
+  row.appendChild(loadBtn);
+  group.appendChild(label);
+  group.appendChild(row);
+  group.appendChild(datalist);
+  return group;
+}
+
+// ─────────────────────────────────────────────
+// 雲端供應商子區塊（API Key + 可重新載入的模型清單）
+// ─────────────────────────────────────────────
+function buildCloudProviderSection(
+  options: {
+    provider: string;
+    keyLabel: string;
+    keyField: keyof AppConfig;
+    modelField: keyof AppConfig;
+    fallbackModels: string[];
+  },
+  config: AppConfig,
+  onChange: (c: AppConfig) => void
+): HTMLElement {
+  const { provider, keyLabel, keyField, modelField, fallbackModels } = options;
+
+  const keyGroup = buildInputGroup(keyLabel, 'password', String(config[keyField] ?? ''), (v) => {
+    config = { ...config, [keyField]: v };
+    onChange(config);
+  });
+
+  const modelGroup = document.createElement('div');
+  modelGroup.className = 'form-group';
+  const modelLabel = document.createElement('label');
+  modelLabel.textContent = '模型';
+  const modelRow = document.createElement('div');
+  modelRow.className = 'input-row';
+
+  const modelSelect = document.createElement('select');
+  modelSelect.className = 'form-control';
+  modelSelect.addEventListener('change', () => {
+    config = { ...config, [modelField]: modelSelect.value };
+    onChange(config);
+  });
+
+  // 以現有設定值與備援清單填入選項，確保未查詢前也有可用選擇
+  const populate = (models: string[]): void => {
+    const saved = String(config[modelField] ?? '');
+    // 保留目前設定值，避免供應商清單不含自訂或較舊的模型時遺失設定
+    const merged = saved && !models.includes(saved) ? [saved, ...models] : models;
+    modelSelect.innerHTML = '';
+    for (const m of merged) {
+      const opt = document.createElement('option');
+      opt.value = m;
+      opt.textContent = m;
+      opt.selected = m === saved;
+      modelSelect.appendChild(opt);
+    }
+  };
+  populate(fallbackModels);
+
+  const reloadBtn = document.createElement('button');
+  reloadBtn.className = 'btn btn-secondary btn-sm';
+  reloadBtn.textContent = '重新載入模型';
+  reloadBtn.addEventListener('click', async () => {
+    reloadBtn.disabled = true;
+    reloadBtn.textContent = '載入中...';
+    try {
+      // 後端從設定檔讀取 API Key，需先儲存目前輸入內容
+      await saveSettings(config);
+      const models = await listProviderModels(provider);
+      if (models.length > 0) {
+        populate(models);
+        showToast(`已載入 ${models.length} 個模型`, 'success');
+      } else {
+        showToast('供應商未回傳可用模型，維持現有清單', 'error');
+      }
+    } catch (err) {
+      // 失敗時保留現有選項，不清空使用者已設定的模型
+      showToast(`無法取得模型列表：${String(err)}`, 'error');
+    } finally {
+      reloadBtn.disabled = false;
+      reloadBtn.textContent = '重新載入模型';
+    }
+  });
+
+  modelRow.appendChild(modelSelect);
+  modelRow.appendChild(reloadBtn);
+  modelGroup.appendChild(modelLabel);
+  modelGroup.appendChild(modelRow);
+
+  return buildProviderSection([keyGroup, modelGroup]);
+}
+
 function buildProviderSection(children: HTMLElement[]): HTMLElement {
   const div = document.createElement('div');
   div.className = 'provider-config';

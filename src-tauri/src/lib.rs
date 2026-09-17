@@ -122,6 +122,7 @@ pub fn run() {
             test_ollama_connection,
             test_local_asr_connection,
             get_ollama_models,
+            list_provider_models,
             test_llm_connection_cmd,
             // ai
             proofread_transcript,
