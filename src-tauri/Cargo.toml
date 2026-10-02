@@ -34,6 +34,7 @@ wasapi = "0.23.0"
 zip = { version = "2", features = ["deflate"] }
 fs4 = "1.1.0"
 whisper-rs = { version = "0.16", default-features = false }
+opencc-fmmseg = "0.12.1"
 
 [features]
 live-caption-cuda = ["whisper-rs/cuda"]

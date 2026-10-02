@@ -24,6 +24,8 @@ export const saveRecording = (
 ) => invoke<Recording>('save_recording', { meetingId, filePath, originalFileName, durationSeconds });
 export const deleteRecording = (recordingId: string) => invoke<void>('delete_recording', { recordingId });
 export const setNoBreakBefore = (recordingId: string, noBreakBefore: boolean) => invoke<void>('set_no_break_before', { recordingId, noBreakBefore });
+export const setRecordingSpeakerCount = (recordingId: string, speakerCount: number | null) =>
+  invoke<void>('set_recording_speaker_count', { recordingId, speakerCount });
 export const reorderRecordings = (meetingId: string, recordingIds: string[]) =>
   invoke<Recording[]>('reorder_recordings', { meetingId, recordingIds });
 export const remergeSegments = (meetingId: string) => invoke<string>('remerge_segments', { meetingId });

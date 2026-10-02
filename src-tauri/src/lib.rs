@@ -114,6 +114,7 @@ pub fn run() {
             commit_temporary_recording,
             delete_recording,
             set_no_break_before,
+            set_recording_speaker_count,
             reorder_recordings,
             remerge_segments,
             // settings

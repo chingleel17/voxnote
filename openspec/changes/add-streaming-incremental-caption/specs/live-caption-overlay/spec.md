@@ -2,11 +2,11 @@
 
 ### Requirement: System produces captions incrementally from a continuous audio stream
 
-系統 MUST 將持續的音訊串流切分為時間視窗並逐段轉錄，使字幕在聆聽過程中陸續出現，而非等待音訊結束。相鄰視窗之間 MUST 有重疊，以降低邊界處語句被切斷造成的漏字。
+系統 MUST 在聆聽過程中陸續產生字幕，而非等待音訊結束。本地／自架後端 MUST 將持續音訊切分為重疊時間視窗，以降低語句邊界漏字。
 
-增量模式啟用時，系統 MUST NOT 以「視窗填滿」作為輸出字幕的前提；字幕的輸出時機改由 `streaming-caption-decoding` 的一致性判定決定，使延遲不受視窗長度限制。增量模式關閉時，系統 MUST 以完整視窗為單位輸出字幕。
+本地／自架增量模式啟用時，系統 MUST NOT 以「視窗填滿」作為輸出前提，改由 `streaming-caption-decoding` 的一致性判定決定；增量模式關閉時 MUST 以完整視窗輸出。該兩類後端 MUST 略過音量低於靜音門檻的視窗，不對其發出轉錄請求。
 
-系統 MUST 略過音量低於靜音門檻的視窗，不對其發出轉錄請求。
+AssemblyAI 串流 MUST 直接傳送連續、不重疊音訊，並依服務端 Turn 更新字幕，MUST NOT 等待視窗填滿、套用 LocalAgreement 或因本地增量開關而退回 HTTP 視窗路徑。串流可持續傳送靜音樣本，但空白事件 MUST 不產生字幕。
 
 #### Scenario: Captions appear while audio is still playing
 
@@ -16,42 +16,48 @@
 #### Scenario: Audio contains a silent passage
 
 - **WHEN** 音訊進入無語音的靜音片段
-- **THEN** 系統 MUST 不對該片段發出轉錄請求，且 MUST 不產生空白或無意義的字幕
+- **THEN** 本地／自架後端 MUST 不對該靜音視窗發出轉錄請求；AssemblyAI 可繼續傳送靜音樣本，但所有後端 MUST 不產生空白或無意義字幕
 
 #### Scenario: Caption appears before its window has filled
 
-- **WHEN** 增量模式啟用且某段語音所屬的視窗尚未填滿
+- **WHEN** 本地／自架增量模式啟用且某段語音所屬的視窗尚未填滿
 - **THEN** 系統 MUST 在視窗填滿之前即輸出該語音中已穩定的文字，MUST NOT 等待視窗填滿
+
+#### Scenario: AssemblyAI streams independently of the local incremental switch
+
+- **WHEN** 使用者選擇 AssemblyAI 串流，不論本地增量開關原值為何
+- **THEN** 系統 MUST 依服務端暫定及完成事件持續更新，不重複解碼音訊視窗
 
 ### Requirement: System deduplicates overlapping caption results by similarity
 
-相鄰的轉錄視窗因重疊而可能對同一段語音產生內容相同但字面不完全一致的結果。系統 MUST 以相似度比對判定重複，MUST NOT 僅依賴前後綴的精確字串比對。
+本地／自架非增量視窗因重疊而可能產生字面略異但相同的語音結果。系統 MUST 以相似度比對最近數筆結果判定重複，MUST NOT 僅依前後綴精確比對或僅比對前一筆，並 MUST 避免誤刪過短文字。
 
-系統 MUST 對最近數筆已輸出的字幕結果進行比對，而非僅比對前一筆。
-
-系統 MUST 避免對過短的文字誤判為重複。
-
-**適用範圍**：本需求適用於增量模式關閉時的視窗式輸出路徑。增量模式啟用時，重疊內容改由 `streaming-caption-decoding` 的一致性判定處理——該路徑以連續解碼結果的共同部分判定文字是否穩定，本需求的整段相似度比對 MUST NOT 於該路徑重複套用，以免已確定的文字因與先前輸出相似而被誤刪。
+本地／自架增量模式的重疊由 `streaming-caption-decoding` 一致性判定處理，整段相似度去重 MUST NOT 重複套用。AssemblyAI 串流以 session 及 turn 識別覆寫／去重，MUST NOT 套用 LocalAgreement 或全文相似度，避免不同 turn 的相同發言被刪除。
 
 #### Scenario: Same speech is recognized slightly differently across windows
 
-- **WHEN** 增量模式關閉，且相鄰視窗對同一段語音產生字面略有差異但內容相同的轉錄結果
-- **THEN** 系統 MUST 判定為重複並且 MUST NOT 重複輸出該內容
+- **WHEN** 本地／自架增量模式關閉，且相鄰視窗對同語音產生字面略異但內容相同的結果
+- **THEN** 系統 MUST 判定重複且不重複輸出
 
 #### Scenario: Duplicate content matches an earlier result rather than the immediately previous one
 
-- **WHEN** 增量模式關閉，且某段字幕與前數筆（非緊鄰前一筆）已輸出的字幕內容重複
-- **THEN** 系統 MUST 判定為重複並且 MUST NOT 重複輸出
+- **WHEN** 本地／自架增量模式關閉，某字幕與前數筆而非緊鄰前一筆內容重複
+- **THEN** 系統 MUST 判定重複且不重複輸出
 
 #### Scenario: Two short phrases differ only slightly but are genuinely different
 
-- **WHEN** 兩段極短的文字字面相近但實為不同內容
-- **THEN** 系統 MUST NOT 將其誤判為重複，兩者 MUST 皆被輸出
+- **WHEN** 兩段極短文字字面相近但實為不同內容
+- **THEN** 系統 MUST 不誤判重複，兩者 MUST 皆輸出
 
 #### Scenario: Incremental mode handles overlap without similarity deduplication
 
-- **WHEN** 增量模式啟用，且連續解碼對同一段語音產生重疊的結果
-- **THEN** 重疊 MUST 由一致性判定處理，且整段相似度去重 MUST NOT 額外套用於已確定的文字
+- **WHEN** 本地／自架增量模式啟用且連續解碼有重疊結果
+- **THEN** 重疊 MUST 由一致性判定處理，整段相似度 MUST NOT 額外套用於確定文字
+
+#### Scenario: AssemblyAI turns replace rather than append
+
+- **WHEN** 同一 AssemblyAI turn 更新文字
+- **THEN** 系統 MUST 覆寫同段；不同 turn 即使文字相同也 MUST 不被去重
 
 ### Requirement: System displays captions in an always-on-top floating window
 
@@ -67,7 +73,7 @@
 
 增量模式啟用時，字幕視窗 MUST 使暫定文字與確定文字在視覺上可被使用者區分。暫定文字被後續解碼修正時，視窗 MUST 就地更新該文字，MUST NOT 將修正後的內容視為新的一段而佔用額外的保留段數。
 
-增量模式的當前段 MUST 每 4 秒完成並成為歷史段，後續文字 MUST 使用新的 `sequence` 顯示於新的當前段。LocalAgreement 的確定狀態 MUST NOT 使同一列無限存活。最小視窗下，完成段成為歷史段後 MUST 至少保持可見一個完整顯示週期（4 秒），直到下一段完成後才可被更舊段落取代。
+本地／自架增量模式的當前段 MUST 每 4 秒完成並成為歷史段，後續文字 MUST 使用新的 `sequence` 顯示於新的當前段。LocalAgreement 的確定狀態 MUST NOT 使同一列無限存活。最小視窗下，完成段成為歷史段後 MUST 至少保持可見一個完整顯示週期（4 秒），直到下一段完成後才可被更舊段落取代。AssemblyAI 串流的完成由服務端 turn 決定，MUST NOT 以此本地計時器強制完成；暫定文字的視覺區分及就地更新仍適用於該後端。
 
 當距離最後一段字幕超過使用者設定的秒數仍未產生新字幕時，字幕視窗 MUST 清空既有內容，避免舊字幕長時間停留在畫面上。該秒數 MUST 可由使用者設定，且 MUST 支援設為零以停用自動清空。
 
@@ -98,7 +104,7 @@
 
 #### Scenario: New caption appears while the previous one is still readable
 
-- **WHEN** 目前段完成並建立新的當前段
+- **WHEN** 本地／自架增量模式的目前段完成並建立新的當前段
 - **THEN** 前一完成段 MUST 作為歷史段與新當前段並存，且在最小視窗下 MUST 至少持續可見 4 秒，MUST NOT 被新段立即取代消失
 
 #### Scenario: Window is too small to fully show the retained captions

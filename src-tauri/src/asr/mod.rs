@@ -1,8 +1,11 @@
+use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::time::Instant;
+
 use anyhow::{anyhow, Result};
+use opencc_fmmseg::OpenCC;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::time::Instant;
 
 // 整體請求逾時。長會議錄音的處理時間可觀：實測 158 分鐘的錄音，僅音訊前處理即需
 // 約 90 秒，加上轉錄與語者分離總計可達數十分鐘，故放寬至 60 分鐘。
@@ -10,6 +13,23 @@ const LOCAL_ASR_TIMEOUT_SECS: u64 = 3600;
 // 讀取閒置逾時。整體逾時僅涵蓋至回應標頭送達，此值另外限制傳輸期間的無資料時間，
 // 避免伺服器已回 200 卻送不完內容時，前端永久停在「轉譯中」。
 const LOCAL_ASR_READ_IDLE_TIMEOUT_SECS: u64 = 300;
+
+/// 將 ASR 中文文字統一為台灣繁體，保留英文、數字及標點。
+/// 字典內嵌於應用程式，初始化一次供各轉錄路徑共用。
+pub(crate) fn to_taiwan_traditional(text: &str) -> Result<String> {
+    static CONVERTER: OnceLock<std::result::Result<OpenCC, String>> = OnceLock::new();
+    let converter = CONVERTER.get_or_init(|| {
+        let converter = OpenCC::new();
+        match OpenCC::get_last_error() {
+            Some(error) => Err(error),
+            None => Ok(converter),
+        }
+    });
+    match converter {
+        Ok(converter) => Ok(converter.s2twp(text, false)),
+        Err(error) => Err(anyhow!("無法初始化繁體中文轉換器：{}", error)),
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct LocalServerSegment {
@@ -105,7 +125,7 @@ pub async fn transcribe_assemblyai(
     language: &str,
     speech_model: &str,
     speaker_detection: bool,
-    // 預期講者人數，取自會議與會人員數；0 代表未知，不帶入 API
+    // 本段明確指定的發言人數；0 代表自動判斷，不帶入 API。
     speakers_expected: u32,
     progress_cb: impl Fn(String),
 ) -> Result<String> {
@@ -139,21 +159,13 @@ pub async fn transcribe_assemblyai(
 
     // 2. 建立轉錄任務
     progress_cb("建立轉錄任務...".into());
-    let mut req_body = json!({
-        "audio_url": upload_url,
-        "speech_models": build_speech_models(speech_model),
-    });
-    if !language.is_empty() && language != "auto" {
-        req_body["language_code"] = json!(language);
-    }
-    if speaker_detection {
-        req_body["speaker_labels"] = json!(true);
-        // 已知確切人數時帶入，可提升語者分離準確度；AssemblyAI 支援 1 至 20 人
-        // 註：音檔短於 2 分鐘時此參數會被 AssemblyAI 忽略
-        if (1..=20).contains(&speakers_expected) {
-            req_body["speakers_expected"] = json!(speakers_expected);
-        }
-    }
+    let req_body = build_assemblyai_request(
+        &upload_url,
+        language,
+        speech_model,
+        speaker_detection,
+        speakers_expected,
+    );
 
     let task_resp = client
         .post("https://api.assemblyai.com/v2/transcript")
@@ -199,21 +211,20 @@ pub async fn transcribe_assemblyai(
                                 .map(|u| {
                                     let start_ms = u["start"].as_u64().unwrap_or(0);
                                     let speaker = u["speaker"].as_str().unwrap_or("?");
-                                    let text = u["text"].as_str().unwrap_or("");
+                                    let text = to_taiwan_traditional(u["text"].as_str().unwrap_or(""))?;
                                     let mm = start_ms / 60000;
                                     let ss = (start_ms % 60000) / 1000;
-                                    format!("[{:02}:{:02} 講者{}] {}", mm, ss, speaker, text)
+                                    Ok(format!("[{:02}:{:02} 講者{}] {}", mm, ss, speaker, text))
                                 })
-                                .collect();
+                                .collect::<Result<_>>()?;
                             return Ok(lines.join("\n"));
                         }
                     }
                 }
                 let text = poll_json["text"]
                     .as_str()
-                    .ok_or_else(|| anyhow!("轉錄結果為空"))?
-                    .to_string();
-                return Ok(text);
+                    .ok_or_else(|| anyhow!("轉錄結果為空"))?;
+                return to_taiwan_traditional(text);
             }
             "error" => {
                 let err = poll_json["error"].as_str().unwrap_or("未知錯誤");
@@ -226,10 +237,144 @@ pub async fn transcribe_assemblyai(
     }
 }
 
-fn build_speech_models(selected_model: &str) -> Vec<&'static str> {
-    match selected_model {
-        "universal-3-pro" => vec!["universal-3-pro", "universal-2"],
-        _ => vec!["universal-2", "universal-3-pro"],
+fn build_speech_models(selected_model: &str) -> Vec<&str> {
+    let model = match selected_model.trim() {
+        "universal-3-pro" => "universal-3-5-pro",
+        "" => "universal-2",
+        model => model,
+    };
+    if model == "universal-2" {
+        vec![model, "universal-3-5-pro"]
+    } else {
+        vec![model, "universal-2"]
+    }
+}
+
+fn build_assemblyai_request(
+    upload_url: &str,
+    language: &str,
+    speech_model: &str,
+    speaker_detection: bool,
+    speakers_expected: u32,
+) -> Value {
+    let mut body = json!({
+        "audio_url": upload_url,
+        "speech_models": build_speech_models(speech_model),
+    });
+    let language = language.trim();
+    if language.is_empty() || language == "auto" {
+        body["language_detection"] = json!(true);
+    } else {
+        body["language_code"] = json!(language);
+    }
+    if speaker_detection {
+        body["speaker_labels"] = json!(true);
+        // 人數僅在 AssemblyAI 支援範圍內帶入。
+        if (1..=20).contains(&speakers_expected) {
+            body["speakers_expected"] = json!(speakers_expected);
+        }
+    }
+    body
+}
+
+#[cfg(test)]
+mod assemblyai_tests {
+    use super::*;
+
+    #[test]
+    fn automatic_language_explicitly_enables_detection() {
+        for language in ["auto", "", "  "] {
+            let body = build_assemblyai_request("audio", language, "universal-2", false, 3);
+            assert_eq!(body["language_detection"], true);
+            assert!(body.get("language_code").is_none());
+            assert!(body.get("speakers_expected").is_none());
+        }
+    }
+
+    #[test]
+    fn explicit_chinese_preserves_speaker_settings() {
+        let body = build_assemblyai_request("audio", "zh", "universal-2", true, 3);
+        assert_eq!(body["language_code"], "zh");
+        assert!(body.get("language_detection").is_none());
+        assert_eq!(body["speaker_labels"], true);
+        assert_eq!(body["speakers_expected"], 3);
+        for count in [0, 21] {
+            assert!(
+                build_assemblyai_request("audio", "zh", "universal-2", true, count)
+                    .get("speakers_expected")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_speaker_count_omits_exact_count() {
+        let auto = build_assemblyai_request("audio", "zh", "universal-3-5-pro", true, 0);
+        assert_eq!(auto["speaker_labels"], true);
+        assert!(auto.get("speakers_expected").is_none());
+        for count in [1, 3, 8] {
+            let explicit = build_assemblyai_request("audio", "zh", "universal-3-5-pro", true, count);
+            assert_eq!(explicit["speakers_expected"], count);
+        }
+    }
+
+    #[tokio::test]
+    async fn self_hosted_count_is_exact_only_when_explicit() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (enabled, count) in [(true, 0), (true, 1), (true, 3), (false, 3)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await?;
+                let mut data = Vec::new();
+                let mut byte = [0u8; 1];
+                while !data.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).await?;
+                    data.push(byte[0]);
+                }
+                let headers = String::from_utf8_lossy(&data).to_lowercase();
+                let length: usize = headers.lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .ok_or_else(|| anyhow!("測試請求缺少 Content-Length"))?.parse()?;
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).await?;
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+                Ok::<_, anyhow::Error>(String::from_utf8(body)?)
+            });
+            reqwest::Client::new().post(format!("http://{address}"))
+                .timeout(std::time::Duration::from_secs(5))
+                .multipart(build_local_asr_form("test.wav", vec![], "zh", enabled, count, false))
+                .send().await?.error_for_status()?;
+            let body = server.await??;
+            for name in ["min_speakers", "max_speakers"] {
+                if enabled && count > 0 {
+                    assert!(body.contains(&format!("name=\"{name}\"\r\n\r\n{count}\r\n")));
+                } else {
+                    assert!(!body.contains(name));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn models_support_legacy_and_manual_ids() {
+        assert_eq!(
+            build_speech_models("universal-3-pro"),
+            ["universal-3-5-pro", "universal-2"]
+        );
+        assert_eq!(
+            build_speech_models("universal-3-5-pro"),
+            ["universal-3-5-pro", "universal-2"]
+        );
+        assert_eq!(
+            build_speech_models("future-model"),
+            ["future-model", "universal-2"]
+        );
+        assert_eq!(
+            build_speech_models("universal-2"),
+            ["universal-2", "universal-3-5-pro"]
+        );
     }
 }
 
@@ -239,7 +384,7 @@ pub async fn transcribe_voxnote_asr(
     file_path: &str,
     language: &str,
     speaker_detection: bool,
-    // 預期講者人數，取自會議與會人員數；0 代表未知，交由 pyannote 自動偵測
+    // 本段明確指定的發言人數；0 代表交由 pyannote 自動偵測。
     speakers_expected: u32,
     progress_cb: impl Fn(String),
 ) -> Result<VoxnoteAsrResult> {
@@ -375,10 +520,10 @@ pub async fn transcribe_live_caption_remote_incremental(
         .json()
         .await
         .map_err(|error| anyhow!("無法解析即時字幕低延遲回應：{}", error))?;
-    result["text"]
+    let text = result["text"]
         .as_str()
-        .map(|text| text.trim().to_string())
-        .ok_or_else(|| anyhow!("即時字幕低延遲回應缺少 text 欄位"))
+        .ok_or_else(|| anyhow!("即時字幕低延遲回應缺少 text 欄位"))?;
+    to_taiwan_traditional(text.trim())
 }
 
 async fn transcribe_voxnote_asr_bytes(
@@ -515,11 +660,11 @@ fn build_local_asr_form(
         form = form.text("language", language.to_string());
     }
     form = form.text("diarize", speaker_detection.to_string());
-    // 與會人員數僅作為上限：單次請求處理的是單一錄音段落，該段未必所有人都發言，
-    // 若以 min=max 鎖死會迫使 pyannote 把少數幾人硬拆成與會人數，反而破壞分離結果。
-    // 與會名單只有 1 人時多半是尚未填寫完整，此時不設上限以免整段被判為單一語者。
-    if speaker_detection && speakers_expected > 1 {
-        form = form.text("max_speakers", speakers_expected.to_string());
+    // 只有使用者明確設定本段人數時才鎖定，不能由整場與會名單推算。
+    if speaker_detection && speakers_expected > 0 {
+        form = form
+            .text("min_speakers", speakers_expected.to_string())
+            .text("max_speakers", speakers_expected.to_string());
     }
     if sync {
         form = form.text("sync", "true");
@@ -564,21 +709,71 @@ fn format_local_asr_result(
                 let start_seconds = segment.start.max(0.0) as u64;
                 let mm = start_seconds / 60;
                 let ss = start_seconds % 60;
-                match segment.speaker.as_deref() {
+                let text = to_taiwan_traditional(&segment.text)?;
+                Ok(match segment.speaker.as_deref() {
                     Some(speaker) if !speaker.is_empty() => {
-                        format!("[{:02}:{:02} 講者{}] {}", mm, ss, speaker, segment.text)
+                        format!("[{:02}:{:02} 講者{}] {}", mm, ss, speaker, text)
                     }
-                    _ => format!("[{:02}:{:02}] {}", mm, ss, segment.text),
-                }
+                    _ => format!("[{:02}:{:02}] {}", mm, ss, text),
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
         return Ok(lines.join("\n"));
     }
 
     if result.text.trim().is_empty() {
         return Err(anyhow!("本地 ASR 伺服器未回傳逐字稿"));
     }
-    Ok(result.text.clone())
+    to_taiwan_traditional(&result.text)
+}
+
+#[cfg(test)]
+mod chinese_conversion_tests {
+    use super::*;
+
+    #[test]
+    fn converts_simplified_text_and_taiwan_terms() {
+        assert_eq!(
+            to_taiwan_traditional("这个软件使用内存。").expect("應可轉換"),
+            "這個軟體使用記憶體。"
+        );
+    }
+
+    #[test]
+    fn preserves_english_timestamps_and_punctuation() {
+        assert_eq!(
+            to_taiwan_traditional("[01:23 講者A] 软件 API v3.5, hello!\n[02:00 講者B] English only.")
+                .expect("應可轉換"),
+            "[01:23 講者A] 軟體 API v3.5, hello!\n[02:00 講者B] English only."
+        );
+    }
+
+    #[test]
+    fn already_normalized_text_is_stable() {
+        let text = "這個軟體使用記憶體。OpenAI 3.5";
+        assert_eq!(to_taiwan_traditional(text).expect("應可轉換"), text);
+        assert_eq!(to_taiwan_traditional("").expect("空字串應可轉換"), "");
+    }
+
+    #[test]
+    fn normalizes_self_hosted_plain_and_speaker_results() {
+        let result = LocalServerTranscription {
+            text: "软件 API".into(),
+            segments: vec![LocalServerSegment {
+                start: 83.0,
+                text: "软件 API".into(),
+                speaker: Some("A".into()),
+            }],
+            speaker_embeddings: None,
+            diarization_model: None,
+            diarization_degraded: false,
+        };
+        assert_eq!(format_local_asr_result(&result, false).expect("應可格式化"), "軟體 API");
+        assert_eq!(
+            format_local_asr_result(&result, true).expect("應可格式化"),
+            "[01:23 講者A] 軟體 API"
+        );
+    }
 }
 
 fn encode_pcm_wav(samples: &[f32]) -> Vec<u8> {

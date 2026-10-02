@@ -360,6 +360,19 @@ pub async fn set_no_break_before(
 }
 
 #[tauri::command]
+pub async fn set_recording_speaker_count(
+    recording_id: String,
+    speaker_count: Option<i64>,
+    pool: State<'_, SqlitePool>,
+    data_lock: State<'_, DataOperationLock>,
+) -> Result<(), String> {
+    let _guard = data_lock.try_begin_write()?;
+    recording::set_speaker_count(&pool, &recording_id, speaker_count)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn reorder_recordings(
     meeting_id: String,
     recording_ids: Vec<String>,

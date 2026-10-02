@@ -489,7 +489,12 @@ async fn replace_database(pool: &SqlitePool, database: &Path) -> Result<()> {
             "recordings", "recording_speaker_mappings", "recording_speaker_embeddings",
             "saved_participants", "voiceprints", "meeting_templates", "tags", "meeting_tags",
         ] {
-            sqlx::query(&format!("INSERT INTO {table} SELECT * FROM backup.{table}"))
+            let query = if table == "recordings" {
+                recording_import_query(&mut tx, false).await?
+            } else {
+                format!("INSERT INTO {table} SELECT * FROM backup.{table}")
+            };
+            sqlx::query(&query)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -518,7 +523,12 @@ async fn merge_database(pool: &SqlitePool, database: &Path) -> Result<(u64, u64)
         sqlx::query("UPDATE backup.meeting_templates SET category_id = (SELECT categories.id FROM categories JOIN backup.categories source ON source.name = categories.name WHERE source.id = backup.meeting_templates.category_id) WHERE category_id IS NOT NULL").execute(&mut *tx).await?;
         sqlx::query("UPDATE backup.meeting_tags SET tag_id = (SELECT tags.id FROM tags JOIN backup.tags source ON source.name = tags.name WHERE source.id = backup.meeting_tags.tag_id)").execute(&mut *tx).await?;
         for table in ["meetings", "participants", "speaker_mappings", "transcripts", "summaries", "recordings", "recording_speaker_mappings", "recording_speaker_embeddings", "meeting_templates", "meeting_tags"] {
-            sqlx::query(&format!("INSERT OR IGNORE INTO {table} SELECT * FROM backup.{table}")).execute(&mut *tx).await?;
+            let query = if table == "recordings" {
+                recording_import_query(&mut tx, true).await?
+            } else {
+                format!("INSERT OR IGNORE INTO {table} SELECT * FROM backup.{table}")
+            };
+            sqlx::query(&query).execute(&mut *tx).await?;
         }
         // voiceprints 的 participant_id 指向來源庫的 saved_participants.id；合併時
         // saved_participants 依 name 去重（見上方 upsert），來源與目的的 id 可能不同，
@@ -533,6 +543,32 @@ async fn merge_database(pool: &SqlitePool, database: &Path) -> Result<(u64, u64)
     let result = result?;
     detach_result?;
     Ok(result)
+}
+
+/// 明確對應錄音欄位，兼容舊備份缺少本段人數及新舊資料庫欄位順序不同。
+async fn recording_import_query(
+    connection: &mut SqliteConnection,
+    ignore_existing: bool,
+) -> Result<String, sqlx::Error> {
+    let target = sqlx::query("PRAGMA main.table_info(recordings)")
+        .fetch_all(&mut *connection)
+        .await?;
+    let source = sqlx::query("PRAGMA backup.table_info(recordings)")
+        .fetch_all(&mut *connection)
+        .await?;
+    let has_speaker_count = source.iter().any(|row| row.get::<String, _>("name") == "speaker_count");
+    let columns: Vec<String> = target.iter().map(|row| row.get("name")).collect();
+    let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+    let destination = columns.iter().map(|name| quote(name)).collect::<Vec<_>>().join(", ");
+    let projection = columns.iter().map(|name| {
+        if name == "speaker_count" && !has_speaker_count {
+            "NULL".to_string()
+        } else {
+            format!("source.{}", quote(name))
+        }
+    }).collect::<Vec<_>>().join(", ");
+    let mode = if ignore_existing { " OR IGNORE" } else { "" };
+    Ok(format!("INSERT{mode} INTO recordings ({destination}) SELECT {projection} FROM backup.recordings AS source"))
 }
 
 async fn attach_database(connection: &mut SqliteConnection, database: &Path) -> Result<()> {
@@ -988,6 +1024,46 @@ mod tests {
         assert_eq!(ids, vec!["new"]);
         target.close().await;
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn speaker_counts_survive_import_and_old_backups_default_to_auto() -> Result<()> {
+        for merge in [false, true] {
+            for old_backup in [false, true] {
+                let directory = test_directory();
+                let target_path = directory.join("target.sqlite");
+                let source_path = directory.join("source.sqlite");
+                let target = create_test_database(&target_path).await;
+                let source = create_test_database(&source_path).await;
+                sqlx::query("ALTER TABLE recordings ADD COLUMN speaker_count INTEGER DEFAULT NULL")
+                    .execute(&target).await?;
+                if !old_backup {
+                    // 故意讓來源與目的欄位順序不同，確保不是 SELECT * 依位置複製。
+                    sqlx::query("ALTER TABLE recordings RENAME TO old_recordings").execute(&source).await?;
+                    sqlx::query("CREATE TABLE recordings (speaker_count INTEGER, id TEXT PRIMARY KEY, meeting_id TEXT, file_path TEXT, diarization_degraded INTEGER NOT NULL DEFAULT 0)")
+                        .execute(&source).await?;
+                    sqlx::query("DROP TABLE old_recordings").execute(&source).await?;
+                }
+                sqlx::query("INSERT INTO recordings (id, meeting_id, file_path) VALUES ('segment', 'meeting', 'audio.wav')")
+                    .execute(&source).await?;
+                if !old_backup {
+                    sqlx::query("UPDATE recordings SET speaker_count = 3").execute(&source).await?;
+                }
+                source.close().await;
+                if merge {
+                    merge_database(&target, &source_path).await?;
+                } else {
+                    replace_database(&target, &source_path).await?;
+                }
+                let (count, path): (Option<i64>, String) = sqlx::query_as("SELECT speaker_count, file_path FROM recordings WHERE id = 'segment'")
+                    .fetch_one(&target).await?;
+                assert_eq!(count, if old_backup { None } else { Some(3) });
+                assert_eq!(path, "audio.wav");
+                target.close().await;
+                fs::remove_dir_all(directory)?;
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]

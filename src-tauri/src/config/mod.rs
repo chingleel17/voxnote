@@ -8,7 +8,7 @@ pub struct AppConfig {
     // ASR 供應商："assemblyai" | "local" | "voxnote_asr"
     pub asr_provider: String,
     pub assembly_ai_key: String,
-    pub assembly_ai_speech_model: String, // "universal-2" | "universal-3-pro"
+    pub assembly_ai_speech_model: String, // 官方模型識別，亦允許手動指定
     pub recording_storage_dir: String,
     pub archive_storage_dir: String,
     pub recording_source_mode: String,

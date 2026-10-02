@@ -1,15 +1,18 @@
 import type { AppConfig } from '../types';
 import {
   saveSettings,
-  testLlmConnection, testOllamaConnection, getOllamaModels, listProviderModels,
+  testLlmConnection, testOllamaConnection, listProviderModels,
   detectLocalAsrTools, testLocalAsrConnection,
   type LocalAsrInfo,
 } from '../api/settings';
 import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
 import { exportFullBackup, importFullBackup, preflightFullBackup } from '../api/backup';
 import { showToast } from '../components/toast';
-import { initConfigStore, setCurrentConfig } from '../utils/configStore';
+import { initConfigStore, setCurrentConfig, getCurrentConfig } from '../utils/configStore';
 import { sendTestNotification } from '../utils/notifications';
+
+const ICON_SEARCH = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg>';
+const ICON_REFRESH = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5"/><path d="M20 12a8 8 0 1 0-2.3 5.7"/></svg>';
 
 // ─────────────────────────────────────────────
 // 備援模型選項（來源：各供應商官方文件，2026-04-29）
@@ -51,13 +54,7 @@ const OPENROUTER_MODELS = [
   'anthropic/claude-sonnet-4.5',
   'google/gemini-2.5-flash',
 ];
-const ASSEMBLYAI_SPEECH_MODELS: Array<{
-  value: AppConfig['assembly_ai_speech_model'];
-  label: string;
-}> = [
-    { value: 'universal-2', label: 'Universal-2' },
-    { value: 'universal-3-pro', label: 'Universal-3 Pro' },
-  ];
+const ASSEMBLYAI_SPEECH_MODELS = ['universal-2', 'universal-3-5-pro'];
 const LOCAL_ASR_MODELS = ['tiny', 'base', 'small', 'medium', 'large'];
 const OLLAMA_THINK_LEVELS: Array<{ value: AppConfig['ollama_think_level']; label: string }> = [
   { value: 'off', label: '關閉思考' },
@@ -322,13 +319,19 @@ function buildAsrSection(
     })
   );
   assemblySection.appendChild(
-    buildSelectGroup(
-      'AssemblyAI 模型',
-      ASSEMBLYAI_SPEECH_MODELS,
-      config.assembly_ai_speech_model || 'universal-2',
+    buildModelSelectGroup(
+      config,
       (v) => {
-        config = { ...config, assembly_ai_speech_model: v as AppConfig['assembly_ai_speech_model'] };
+        config = { ...config, assembly_ai_speech_model: v };
         onChange(config);
+      },
+      () => config,
+      {
+        provider: 'assemblyai',
+        label: 'AssemblyAI 模型',
+        initialSuggestions: ASSEMBLYAI_SPEECH_MODELS,
+        value: config.assembly_ai_speech_model || 'universal-2',
+        remote: false,
       }
     )
   );
@@ -495,7 +498,7 @@ function buildAsrSection(
   speakerToggle.appendChild(speakerSlider);
   const speakerHint = document.createElement('small');
   speakerHint.className = 'form-hint';
-  speakerHint.textContent = 'AssemblyAI 與本地伺服器啟用後，逐字稿將包含時間軸與講者標籤；預期人數會自動取自會議的與會人員。';
+  speakerHint.textContent = 'AssemblyAI 與本地伺服器啟用後，逐字稿將包含時間軸與講者標籤；可在各錄音段落設定發言人數，未指定時自動判斷。';
   speakerGroup.appendChild(speakerLabel);
   speakerGroup.appendChild(speakerToggle);
   speakerGroup.appendChild(speakerHint);
@@ -960,18 +963,24 @@ function buildLlmSection(
   section.appendChild(geminiSection);
 
   // ── OpenRouter ──
+  // 大量模型可使用共用下拉選單的篩選功能。
   // 模型清單為公開端點，未填 API Key 亦可載入
-  const openrouterSection = buildCloudProviderSection(
-    {
-      provider: 'openrouter',
-      keyLabel: 'OpenRouter API Key',
-      keyField: 'openrouter_key',
-      modelField: 'openrouter_model',
-      fallbackModels: OPENROUTER_MODELS,
-    },
-    config,
-    (updated) => mergeCloudFields(updated, ['openrouter_key', 'openrouter_model'])
-  );
+  const openrouterSection = buildProviderSection([
+    buildInputGroup('OpenRouter API Key', 'password', config.openrouter_key, (v) => {
+      config = { ...config, openrouter_key: v }; onChange(config);
+    }),
+    buildModelSelectGroup(
+      config,
+      (v) => { config = { ...config, openrouter_model: v }; onChange(config); },
+      () => config,
+      {
+        provider: 'openrouter',
+        label: '模型（例如：openai/gpt-4o-mini）',
+        initialSuggestions: OPENROUTER_MODELS,
+        value: config.openrouter_model,
+      }
+    ),
+  ]);
   section.appendChild(openrouterSection);
 
   // ── Ollama ──
@@ -995,9 +1004,9 @@ function buildLlmSection(
     buildInputGroup('API Key（可留空）', 'password', config.custom_api_key, (v) => {
       config = { ...config, custom_api_key: v }; onChange(config);
     }),
-    buildCustomModelGroup(config, (v) => {
+    buildModelSelectGroup(config, (v) => {
       config = { ...config, custom_model: v }; onChange(config);
-    }, () => config),
+    }, () => config, { provider: 'custom', value: config.custom_model }),
   ]);
   section.appendChild(customSection);
 
@@ -1087,7 +1096,7 @@ function buildOllamaSection(
         showToast('Ollama 連線成功', 'success');
         testBtn.disabled = false;
         testBtn.textContent = '測試連線';
-        void loadOllamaModels();
+        modelGroup.querySelector<HTMLButtonElement>('[data-model-refresh]')?.click();
       } else {
         showToast('Ollama 連線失敗', 'error');
       }
@@ -1108,27 +1117,10 @@ function buildOllamaSection(
   wrapper.appendChild(endpointGroup);
 
   // 模型列表
-  const modelGroup = document.createElement('div');
-  modelGroup.className = 'form-group';
-  const modelLabel = document.createElement('label');
-  modelLabel.textContent = 'LLM 模型';
-  const modelSelect = document.createElement('select');
-  modelSelect.className = 'form-control';
-
-  if (config.ollama_model) {
-    const opt = document.createElement('option');
-    opt.value = config.ollama_model;
-    opt.textContent = config.ollama_model;
-    opt.selected = true;
-    modelSelect.appendChild(opt);
-  }
-  modelSelect.addEventListener('change', () => {
-    config = { ...config, ollama_model: modelSelect.value };
+  const modelGroup = buildModelSelectGroup(config, (v) => {
+    config = { ...config, ollama_model: v };
     onChange(config);
-  });
-
-  modelGroup.appendChild(modelLabel);
-  modelGroup.appendChild(modelSelect);
+  }, () => config, { provider: 'ollama', label: 'LLM 模型', value: config.ollama_model });
   wrapper.appendChild(modelGroup);
 
   const thinkGroup = document.createElement('div');
@@ -1158,26 +1150,6 @@ function buildOllamaSection(
   thinkGroup.appendChild(thinkSelect);
   thinkGroup.appendChild(thinkHint);
   wrapper.appendChild(thinkGroup);
-
-  const loadOllamaModels = async (): Promise<void> => {
-    try {
-      const models = await getOllamaModels(endpointInput.value);
-      modelSelect.innerHTML = '';
-      for (const m of models) {
-        const opt = document.createElement('option');
-        opt.value = m;
-        opt.textContent = m;
-        opt.selected = m === config.ollama_model;
-        modelSelect.appendChild(opt);
-      }
-      if (models.length > 0) {
-        config = { ...config, ollama_model: modelSelect.value };
-        onChange(config);
-      }
-    } catch (err) {
-      showToast(`無法取得 Ollama 模型列表：${String(err)}`, 'error');
-    }
-  };
 
   return wrapper;
 }
@@ -1262,66 +1234,83 @@ function buildAiPromptSection(
 // ─────────────────────────────────────────────
 // 工具函式
 // ─────────────────────────────────────────────
+// 產生頁面內唯一的元素 id 序號
+let elementIdSeq = 0;
+function nextElementId(): number {
+  elementIdSeq += 1;
+  return elementIdSeq;
+}
+
 // ─────────────────────────────────────────────
-// 自訂端點模型欄位
-// 端點未必實作 /models，因此維持自由輸入，僅以 datalist 提供建議選項
+// 模型欄位沿用共用下拉選單，篩選、手動輸入與清單更新分開操作。
 // ─────────────────────────────────────────────
-function buildCustomModelGroup(
+function buildModelSelectGroup(
   config: AppConfig,
   onChange: (v: string) => void,
-  getConfig: () => AppConfig
+  getConfig: () => AppConfig,
+  options?: {
+    provider?: string;
+    label?: string;
+    initialSuggestions?: string[];
+    value?: string;
+    remote?: boolean;
+  }
 ): HTMLElement {
-  const group = document.createElement('div');
-  group.className = 'form-group';
-  const label = document.createElement('label');
-  label.textContent = '模型名稱';
-
-  const row = document.createElement('div');
-  row.className = 'input-row';
-
-  const listId = 'custom-model-options';
-  const datalist = document.createElement('datalist');
-  datalist.id = listId;
-
-  const input = document.createElement('input');
-  input.type = 'text';
-  input.className = 'form-control';
-  input.value = config.custom_model;
-  input.setAttribute('list', listId);
-  input.addEventListener('input', () => onChange(input.value));
+  const provider = options?.provider ?? 'custom';
+  const group = buildSelectGroup(
+    options?.label ?? '模型名稱',
+    (options?.initialSuggestions ?? []).map((model) => ({ value: model, label: model })),
+    options?.value ?? config.custom_model,
+    onChange,
+    { filterable: true, allowCustom: true }
+  );
+  const select = group.querySelector('select')!;
+  const row = select.parentElement!;
 
   const loadBtn = document.createElement('button');
-  loadBtn.className = 'btn btn-secondary btn-sm';
-  loadBtn.textContent = '載入模型';
-  loadBtn.addEventListener('click', async () => {
+  loadBtn.type = 'button';
+  loadBtn.dataset.modelRefresh = '';
+  loadBtn.className = 'btn btn-secondary btn-sm settings-icon-btn';
+  loadBtn.innerHTML = ICON_REFRESH;
+  loadBtn.title = '重新整理模型列表';
+  loadBtn.setAttribute('aria-label', `重新整理 ${provider} 模型列表`);
+  const status = document.createElement('small');
+  status.className = 'form-hint';
+  status.setAttribute('role', 'status');
+  status.hidden = true;
+  let loaded = false;
+  const loadModels = async (): Promise<void> => {
+    if (loadBtn.disabled) return;
     loadBtn.disabled = true;
-    loadBtn.textContent = '載入中...';
+    loadBtn.setAttribute('aria-busy', 'true');
+    loadBtn.title = '正在更新模型列表';
+    status.hidden = false;
+    status.textContent = '正在取得供應商模型列表…';
     try {
-      await saveSettings(getConfig());
-      const models = await listProviderModels('custom');
-      datalist.innerHTML = '';
-      for (const m of models) {
-        const opt = document.createElement('option');
-        opt.value = m;
-        datalist.appendChild(opt);
+      await saveSettings(getCurrentConfig() ?? getConfig());
+      const models = await listProviderModels(provider);
+      if (models.length > 0) {
+        group.setOptions(models.map((model) => ({ value: model, label: model })));
+        loaded = true;
+        status.textContent = `已更新 ${models.length} 個模型；目前設定不變。`;
+      } else {
+        status.textContent = '未取得模型清單，保留現有建議；可手動輸入或重新整理。';
       }
-      showToast(
-        models.length > 0 ? `已載入 ${models.length} 個模型建議` : '端點未回傳模型清單',
-        models.length > 0 ? 'success' : 'error'
-      );
     } catch (err) {
-      showToast(`無法取得模型列表：${String(err)}`, 'error');
+      status.textContent = `無法取得模型列表：${String(err)}。可手動輸入或重新整理。`;
     } finally {
       loadBtn.disabled = false;
-      loadBtn.textContent = '載入模型';
+      loadBtn.removeAttribute('aria-busy');
+      loadBtn.title = '重新整理模型列表';
     }
-  });
+  };
+  if (options?.remote !== false) {
+    loadBtn.addEventListener('click', () => void loadModels());
+    select.addEventListener('focus', () => { if (!loaded) void loadModels(); });
+  }
 
-  row.appendChild(input);
-  row.appendChild(loadBtn);
-  group.appendChild(label);
-  group.appendChild(row);
-  group.appendChild(datalist);
+  if (options?.remote !== false) row.appendChild(loadBtn);
+  if (options?.remote !== false) group.appendChild(status);
   return group;
 }
 
@@ -1346,65 +1335,13 @@ function buildCloudProviderSection(
     onChange(config);
   });
 
-  const modelGroup = document.createElement('div');
-  modelGroup.className = 'form-group';
-  const modelLabel = document.createElement('label');
-  modelLabel.textContent = '模型';
-  const modelRow = document.createElement('div');
-  modelRow.className = 'input-row';
-
-  const modelSelect = document.createElement('select');
-  modelSelect.className = 'form-control';
-  modelSelect.addEventListener('change', () => {
-    config = { ...config, [modelField]: modelSelect.value };
+  const modelGroup = buildModelSelectGroup(config, (v) => {
+    config = { ...config, [modelField]: v };
     onChange(config);
+  }, () => config, {
+    provider, label: '模型', value: String(config[modelField] ?? ''),
+    initialSuggestions: fallbackModels,
   });
-
-  // 以現有設定值與備援清單填入選項，確保未查詢前也有可用選擇
-  const populate = (models: string[]): void => {
-    const saved = String(config[modelField] ?? '');
-    // 保留目前設定值，避免供應商清單不含自訂或較舊的模型時遺失設定
-    const merged = saved && !models.includes(saved) ? [saved, ...models] : models;
-    modelSelect.innerHTML = '';
-    for (const m of merged) {
-      const opt = document.createElement('option');
-      opt.value = m;
-      opt.textContent = m;
-      opt.selected = m === saved;
-      modelSelect.appendChild(opt);
-    }
-  };
-  populate(fallbackModels);
-
-  const reloadBtn = document.createElement('button');
-  reloadBtn.className = 'btn btn-secondary btn-sm';
-  reloadBtn.textContent = '重新載入模型';
-  reloadBtn.addEventListener('click', async () => {
-    reloadBtn.disabled = true;
-    reloadBtn.textContent = '載入中...';
-    try {
-      // 後端從設定檔讀取 API Key，需先儲存目前輸入內容
-      await saveSettings(config);
-      const models = await listProviderModels(provider);
-      if (models.length > 0) {
-        populate(models);
-        showToast(`已載入 ${models.length} 個模型`, 'success');
-      } else {
-        showToast('供應商未回傳可用模型，維持現有清單', 'error');
-      }
-    } catch (err) {
-      // 失敗時保留現有選項，不清空使用者已設定的模型
-      showToast(`無法取得模型列表：${String(err)}`, 'error');
-    } finally {
-      reloadBtn.disabled = false;
-      reloadBtn.textContent = '重新載入模型';
-    }
-  });
-
-  modelRow.appendChild(modelSelect);
-  modelRow.appendChild(reloadBtn);
-  modelGroup.appendChild(modelLabel);
-  modelGroup.appendChild(modelRow);
 
   return buildProviderSection([keyGroup, modelGroup]);
 }
@@ -1440,25 +1377,129 @@ function buildSelectGroup(
   labelText: string,
   options: Array<{ value: string; label: string }>,
   selected: string,
-  onChange: (v: string) => void
-): HTMLElement {
+  onChange: (v: string) => void,
+  settings: { filterable?: boolean; allowCustom?: boolean } = {}
+): HTMLElement & { setOptions: (options: Array<{ value: string; label: string }>) => void } {
   const group = document.createElement('div');
   group.className = 'form-group';
   const label = document.createElement('label');
   label.textContent = labelText;
   const select = document.createElement('select');
   select.className = 'form-control';
-  for (const opt of options) {
-    const el = document.createElement('option');
-    el.value = opt.value;
-    el.textContent = opt.label;
-    el.selected = opt.value === selected;
-    select.appendChild(el);
-  }
-  select.addEventListener('change', () => onChange(select.value));
+  select.id = `settings-select-${nextElementId()}`;
+  label.htmlFor = select.id;
+
+  // 篩選字串與已選值獨立，開啟選單不會以目前模型名稱限制選項。
+  const filter = document.createElement('input');
+  filter.type = 'search';
+  filter.className = 'form-control';
+  filter.placeholder = '輸入關鍵字篩選模型（不會變更已選模型）';
+  filter.setAttribute('aria-label', `篩選${labelText}`);
+  filter.id = `${select.id}-filter`;
+  filter.hidden = true;
+  filter.style.marginTop = '8px';
+
+  const custom = document.createElement('input');
+  custom.type = 'text';
+  custom.className = 'form-control';
+  custom.placeholder = '輸入模型 ID';
+  custom.setAttribute('aria-label', `手動輸入${labelText}`);
+  custom.hidden = true;
+  custom.style.marginTop = '8px';
+  custom.value = selected;
+  const customValue = '__manual_model__';
+  let manual = false;
+
+  const renderOptions = (): void => {
+    const query = filter.value.trim().toLowerCase();
+    const visible = options.filter((opt) => !query ||
+      opt.value.toLowerCase().includes(query) || opt.label.toLowerCase().includes(query));
+    // 保留已選值，避免篩選或清單更新讓瀏覽器自動改選第一個模型。
+    if (selected && !visible.some((opt) => opt.value === selected)) {
+      visible.unshift(options.find((opt) => opt.value === selected) ?? { value: selected, label: selected });
+    }
+    select.replaceChildren();
+    if (!selected) {
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = `請選擇${labelText}`;
+      placeholder.disabled = true;
+      select.appendChild(placeholder);
+    }
+    for (const opt of visible) {
+      const el = document.createElement('option');
+      el.value = opt.value;
+      el.textContent = opt.label;
+      select.appendChild(el);
+    }
+    if (settings.allowCustom) {
+      const el = document.createElement('option');
+      el.value = customValue;
+      el.textContent = '手動輸入模型 ID…';
+      select.appendChild(el);
+    }
+    select.value = manual ? customValue : selected;
+  };
+  select.addEventListener('change', () => {
+    manual = settings.allowCustom === true && select.value === customValue;
+    custom.hidden = !manual;
+    if (manual) {
+      custom.value = selected;
+      custom.focus();
+      custom.select();
+    } else {
+      selected = select.value;
+      onChange(selected);
+    }
+  });
+  custom.addEventListener('input', () => {
+    selected = custom.value;
+    onChange(selected);
+  });
+  filter.addEventListener('input', renderOptions);
+
   group.appendChild(label);
-  group.appendChild(select);
-  return group;
+  if (settings.filterable || settings.allowCustom) {
+    const row = document.createElement('div');
+    row.className = 'input-row';
+    row.appendChild(select);
+    if (settings.filterable) {
+      const filterBtn = document.createElement('button');
+      filterBtn.type = 'button';
+      filterBtn.className = 'btn btn-secondary btn-sm settings-icon-btn';
+      filterBtn.innerHTML = ICON_SEARCH;
+      filterBtn.title = '篩選模型';
+      filterBtn.setAttribute('aria-label', `篩選${labelText}`);
+      filterBtn.setAttribute('aria-controls', filter.id);
+      filterBtn.setAttribute('aria-expanded', 'false');
+      filterBtn.addEventListener('click', () => {
+        filter.hidden = !filter.hidden;
+        filterBtn.setAttribute('aria-expanded', String(!filter.hidden));
+        filterBtn.title = filter.hidden ? '篩選模型' : '取消篩選';
+        filterBtn.setAttribute('aria-label', filter.hidden ? `篩選${labelText}` : `取消篩選${labelText}`);
+        filterBtn.setAttribute('aria-pressed', String(!filter.hidden));
+        if (filter.hidden) {
+          filter.value = '';
+          renderOptions();
+        } else {
+          filter.focus();
+        }
+      });
+      row.appendChild(filterBtn);
+    }
+    group.appendChild(row);
+    if (settings.filterable) group.appendChild(filter);
+    if (settings.allowCustom) group.appendChild(custom);
+  } else {
+    group.appendChild(select);
+  }
+  renderOptions();
+  return Object.assign(group, {
+    setOptions: (nextOptions: Array<{ value: string; label: string }>): void => {
+      options = nextOptions;
+      renderOptions();
+    },
+  });
 }
 
 function buildDirectoryPickerGroup(

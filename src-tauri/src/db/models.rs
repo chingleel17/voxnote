@@ -77,6 +77,8 @@ pub struct Recording {
     pub segment_proofread: Option<String>,
     pub diarization_degraded: i64,
     pub no_break_before: i64,
+    #[serde(default)]
+    pub speaker_count: Option<i64>,
     pub created_at: String,
 }
 

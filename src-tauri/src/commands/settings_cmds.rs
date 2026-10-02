@@ -7,6 +7,7 @@ const OLLAMA_HTTP_TIMEOUT_SECS: u64 = 10;
 const LOCAL_ASR_HTTP_TIMEOUT_SECS: u64 = 10;
 const MODEL_LIST_HTTP_TIMEOUT_SECS: u64 = 15;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+const MODEL_LIST_MAX_PAGES: usize = 20;
 
 #[tauri::command]
 pub async fn get_settings(app: AppHandle) -> Result<AppConfig, String> {
@@ -183,49 +184,78 @@ pub async fn list_provider_models(app: AppHandle, provider: String) -> Result<Ve
             if config.claude_key.is_empty() {
                 return Err("Claude API Key 未設定".into());
             }
-            // 預設每頁僅 20 筆，明確指定上限以一次取回完整清單
-            let json = fetch_json(
-                client
-                    .get("https://api.anthropic.com/v1/models?limit=1000")
+            let mut models = Vec::new();
+            let mut cursor = String::new();
+            for _ in 0..MODEL_LIST_MAX_PAGES {
+                let mut request = client
+                    .get("https://api.anthropic.com/v1/models")
+                    .query(&[("limit", "1000")])
                     .header("x-api-key", &config.claude_key)
-                    .header("anthropic-version", ANTHROPIC_VERSION),
-                "Claude",
-            )
-            .await?;
-            Ok(extract_openai_style_ids(&json))
+                    .header("anthropic-version", ANTHROPIC_VERSION);
+                if !cursor.is_empty() {
+                    request = request.query(&[("after_id", &cursor)]);
+                }
+                let json = fetch_json(request, "Claude").await?;
+                models.extend(extract_openai_style_ids(&json));
+                if json["has_more"].as_bool() != Some(true) {
+                    models.sort();
+                    models.dedup();
+                    return Ok(models);
+                }
+                let next = json["last_id"].as_str().unwrap_or_default();
+                if next.is_empty() || next == cursor {
+                    return Err("Claude 模型清單分頁游標異常，保留既有清單".into());
+                }
+                cursor = next.to_string();
+            }
+            Err("Claude 模型清單超過分頁上限，保留既有清單".into())
         }
         "gemini" => {
             if config.gemini_key.is_empty() {
                 return Err("Gemini API Key 未設定".into());
             }
-            let json = fetch_json(
-                client.get(format!(
-                    "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000&key={}",
-                    config.gemini_key
-                )),
-                "Gemini",
-            )
-            .await?;
-            let mut models: Vec<String> = json["models"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        // 僅保留支援 generateContent 的模型，濾除 embedding、TTS 等
-                        .filter(|m| {
-                            m["supportedGenerationMethods"]
-                                .as_array()
-                                .map(|methods| {
-                                    methods.iter().any(|x| x.as_str() == Some("generateContent"))
-                                })
-                                .unwrap_or(false)
-                        })
-                        .filter_map(|m| m["name"].as_str())
-                        .map(|name| name.trim_start_matches("models/").to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
-            models.sort();
-            Ok(models)
+            let mut models = Vec::new();
+            let mut cursor = String::new();
+            for _ in 0..MODEL_LIST_MAX_PAGES {
+                let mut request = client
+                    .get("https://generativelanguage.googleapis.com/v1beta/models")
+                    .header("x-goog-api-key", &config.gemini_key)
+                    .query(&[("pageSize", "1000")]);
+                if !cursor.is_empty() {
+                    request = request.query(&[("pageToken", &cursor)]);
+                }
+                let json = fetch_json(request, "Gemini").await?;
+                let page: Vec<String> = json["models"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            // 僅保留支援 generateContent 的模型。
+                            .filter(|m| {
+                                m["supportedGenerationMethods"]
+                                    .as_array()
+                                    .map(|methods| {
+                                        methods.iter().any(|x| x.as_str() == Some("generateContent"))
+                                    })
+                                    .unwrap_or(false)
+                            })
+                            .filter_map(|m| m["name"].as_str())
+                            .map(|name| name.trim_start_matches("models/").to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                models.extend(page);
+                let next = json["nextPageToken"].as_str().unwrap_or_default();
+                if next.is_empty() {
+                    models.sort();
+                    models.dedup();
+                    return Ok(models);
+                }
+                if next == cursor {
+                    return Err("Gemini 模型清單分頁游標異常，保留既有清單".into());
+                }
+                cursor = next.to_string();
+            }
+            Err("Gemini 模型清單超過分頁上限，保留既有清單".into())
         }
         "openrouter" => {
             // OpenRouter 模型清單為公開端點，無 API Key 亦可查詢
