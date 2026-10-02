@@ -98,11 +98,12 @@ body {
   display: flex;
   flex: 1;
   flex-direction: column;
-   /* 貼齊底部並裁切最舊歷史段；前端會依實際高度決定保留幾段。 */
+  /* 貼齊底部並依實際高度顯示歷史段；超長段落保留全文並在內容區捲動。 */
   justify-content: flex-end;
   gap: 5px;
   min-height: 0;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
   padding-top: 4px;
 }
 

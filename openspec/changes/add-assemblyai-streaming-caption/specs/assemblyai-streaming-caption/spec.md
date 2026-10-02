@@ -6,7 +6,9 @@
 
 ### Requirement: AssemblyAI streaming has independent model and language settings
 
-系統 SHALL 提供 `assemblyai_streaming` 即時字幕後端，重用已設定的 AssemblyAI API Key，並使用獨立於批次的串流模型設定，預設 `universal-3-6-pro`。既有設定檔缺少新欄位時 SHALL 正常載入，原預設後端 SHALL NOT 改變。
+系統 SHALL 提供 `assemblyai_streaming` 即時字幕後端，由所選共用供應商設定取得 AssemblyAI API Key，並使用獨立於批次的串流模型設定，預設 `universal-3-6-pro`。既有設定檔缺少新欄位時 SHALL 正常載入，原預設後端 SHALL NOT 改變。
+
+系統 SHALL 在設定頁提供可新增多組的語音辨識供應商設定，包含 AssemblyAI、自架 ASR 與本地 Whisper，可建立同類多個具名稱的設定。API Key、URL 與本地模型路徑 SHALL 僅在此處管理；批次 ASR 與即時字幕 SHALL 各自選擇供應商設定及可選模型，並使用同一共用下拉元件。舊金鑰／URL／模型路徑 SHALL 相容遷移，失效的供應商 ID SHALL 明確回報而非靜默切換。
 
 系統 SHALL 使用即時字幕來源語言；auto 時不限制 `language_codes`，明確語言時以 JSON 陣列傳入對應代碼。系統 SHALL 啟用語言資訊回報，SHALL NOT 將批次 API 的自動語言參數語意誤套於串流。即時模型 SHALL 提供建議與手動輸入入口，供應商拒絕或不相容時 SHALL 明確回報，不自動換模型。
 
@@ -17,6 +19,14 @@
 #### Scenario: Automatic and explicit Chinese language
 - **WHEN** 使用者分別以 auto 與中文啟動串流
 - **THEN** auto 不傳語言限制，中文使用包含 zh 的語言陣列，兩者都不修改批次語言
+
+#### Scenario: Two services reuse one provider configuration
+- **WHEN** 批次 ASR 與即時字幕選取同一 AssemblyAI 設定
+- **THEN** 兩服務使用同一金鑰，各自保留所選模型與來源語言，字幕頁不提供重複的金鑰編輯欄
+
+#### Scenario: Multiple self-hosted provider configurations coexist
+- **WHEN** 使用者在設定頁新增不同 URL 的自架 ASR 設定，分別供批次與即時字幕選用
+- **THEN** 系統保存並按設定 ID 使用正確 URL，不覆寫另一服務的選擇或 URL
 
 #### Scenario: Key or model is invalid
 - **WHEN** 金鑰未設定、認證失敗或模型不支援

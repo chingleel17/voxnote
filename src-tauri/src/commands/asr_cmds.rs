@@ -35,7 +35,9 @@ pub async fn start_transcription(
     data_lock: State<'_, DataOperationLock>,
 ) -> Result<String, String> {
     let _guard = data_lock.try_begin_write()?;
-    let config = load_config(&app).map_err(|e| e.to_string())?;
+    let config = load_config(&app)
+        .and_then(|config| config.resolve_batch_provider())
+        .map_err(|e| e.to_string())?;
 
     // 整場與會名單不代表每段實際發言人數；未指定時交由供應商自動判斷。
     let segment = recording::get_recording_by_id(&pool, &recording_id)

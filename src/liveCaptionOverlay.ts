@@ -4,6 +4,7 @@ import {
   listenLiveCaption,
   listenLiveCaptionInteractive,
   listenLiveCaptionSettings,
+  listenLiveCaptionStatus,
   setLiveCaptionClickThrough,
   stopLiveCaption,
 } from './api/liveCaption';
@@ -29,6 +30,7 @@ let captions: LiveCaptionPayload[] = [];
 let clearSeconds = 8;
 let lastCaptionAt = 0;
 let locked = false;
+let activeSessionId: string | null = null;
 
 function renderLockButton(): void {
   if (!lockButton) return;
@@ -62,8 +64,9 @@ function renderCaptions(): void {
     } else {
       line.textContent = caption.display_text;
     }
-    captionList.appendChild(line);
+      captionList.appendChild(line);
     }
+    captionList.scrollTop = captionList.scrollHeight;
   };
 
   const retained = captions.slice(-MAX_RETAINED_CAPTIONS);
@@ -85,15 +88,41 @@ function renderCaptions(): void {
 }
 
 void listenLiveCaption((payload) => {
+  if (!activeSessionId || payload.session_id !== activeSessionId) return;
   const existingIndex = captions.findIndex((caption) => caption.sequence === payload.sequence);
+  let speechChanged = false;
   if (existingIndex >= 0) {
+    const existing = captions[existingIndex];
+    if (payload.revision <= existing.revision) return;
+    if (existing.phase !== 'partial' && payload.phase === 'partial') return;
+    speechChanged =
+      payload.phase !== 'postprocessed' &&
+      (payload.original !== existing.original || payload.phase !== existing.phase);
     captions[existingIndex] = payload;
   } else {
+    if (payload.phase === 'postprocessed') return;
     const latestSequence = captions[captions.length - 1]?.sequence ?? 0;
     if (payload.sequence < latestSequence) return;
     captions = [...captions, payload].slice(-MAX_RETAINED_CAPTIONS);
+    speechChanged = true;
   }
-  lastCaptionAt = Date.now();
+  if (speechChanged) lastCaptionAt = Date.now();
+  renderCaptions();
+});
+
+void listenLiveCaptionStatus((status) => {
+  if (status.active) {
+    if (status.session_id === activeSessionId) return;
+    activeSessionId = status.session_id;
+    captions = [];
+    lastCaptionAt = 0;
+    renderCaptions();
+    return;
+  }
+  if (status.session_id && activeSessionId && status.session_id !== activeSessionId) return;
+  activeSessionId = null;
+  captions = [];
+  lastCaptionAt = 0;
   renderCaptions();
 });
 

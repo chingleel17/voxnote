@@ -25,6 +25,7 @@ use crate::{
 };
 
 mod agreement;
+mod assemblyai;
 use agreement::LocalAgreement;
 
 pub const LIVE_CAPTION_EVENT: &str = "live-caption";
@@ -83,7 +84,10 @@ pub struct StartLiveCaptionRequest {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LiveCaptionPayload {
+    pub session_id: String,
     pub sequence: u64,
+    pub revision: u64,
+    pub phase: String,
     pub original: String,
     pub translation: Option<String>,
     pub display_text: String,
@@ -102,6 +106,7 @@ pub struct LiveCaptionStatus {
     pub active: bool,
     pub backend: Option<String>,
     pub audio_source: Option<String>,
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -157,10 +162,12 @@ pub struct LiveCaptionManager {
 
 struct ActiveLiveCaptionSession {
     stop_tx: mpsc::Sender<()>,
+    finished_rx: mpsc::Receiver<()>,
     running: Arc<AtomicBool>,
     handle: thread::JoinHandle<()>,
     backend: String,
     audio_source: String,
+    session_id: String,
     // 「鎖定」＝穿透模式是否開啟。開啟時字幕視窗預設穿透（不可拖曳／調整大小），
     // 但游標移到標題列或邊框感應區時仍由 watcher 動態恢復互動，供關閉鈕、拖曳與調整大小使用；
     // 關閉時視窗恆為可互動，不穿透。由主控制面板的鎖定按鈕切換此旗標。
@@ -183,9 +190,15 @@ impl LiveCaptionManager {
             .and_then(|request| request.audio_source)
             .unwrap_or_else(|| config.live_caption_audio_source.clone());
         validate_audio_source(&audio_source)?;
-        validate_caption_window(&config)?;
 
         let backend = normalize_backend(&config.live_caption_backend)?;
+        if backend != "assemblyai_streaming" {
+            validate_caption_window(&config)?;
+        } else if config.assembly_ai_key.trim().is_empty() {
+            return Err(anyhow!("AssemblyAI API Key 未設定"));
+        } else if config.live_caption_assemblyai_model.trim().is_empty() {
+            return Err(anyhow!("AssemblyAI 即時串流模型未設定"));
+        }
         if backend == "local_whisper" {
             let model_path = config.live_caption_model_path.trim();
             if model_path.is_empty() {
@@ -219,11 +232,14 @@ impl LiveCaptionManager {
         let error_state: SharedError = Arc::new(Mutex::new(None));
         let running = Arc::new(AtomicBool::new(true));
         let (stop_tx, stop_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let session_id = uuid::Uuid::new_v4().to_string();
         let app_handle = app.clone();
         let thread_config = config.clone();
         let thread_source = audio_source.clone();
         let thread_backend = backend.clone();
+        let thread_session_id = session_id.clone();
         let thread_running = running.clone();
         let thread_queue = queue.clone();
         let thread_error = error_state.clone();
@@ -235,6 +251,7 @@ impl LiveCaptionManager {
                 app_handle,
                 thread_config,
                 thread_backend,
+                thread_session_id,
                 thread_source,
                 thread_queue,
                 thread_error,
@@ -243,13 +260,14 @@ impl LiveCaptionManager {
                 ready_tx,
             );
             thread_running.store(false, Ordering::SeqCst);
+            let _ = finished_tx.send(());
             if let Err(error) = result {
                 let _ = startup_tx.send(Err(anyhow!(error.to_string())));
                 emit_error(&error_app, error.to_string());
             }
         });
 
-        match ready_rx.recv() {
+        match ready_rx.recv_timeout(Duration::from_secs(11)) {
             Ok(Ok(())) => {
                 let overlay = match app.get_webview_window(LIVE_CAPTION_OVERLAY_LABEL) {
                     Some(overlay) => overlay,
@@ -300,14 +318,17 @@ impl LiveCaptionManager {
                         active: true,
                         backend: Some(backend.clone()),
                         audio_source: Some(audio_source.clone()),
+                        session_id: Some(session_id.clone()),
                     },
                 );
                 *guard = Some(ActiveLiveCaptionSession {
                     stop_tx,
+                    finished_rx,
                     running,
                     handle,
                     backend,
                     audio_source,
+                    session_id,
                     click_through_enabled,
                 });
                 Ok(())
@@ -321,8 +342,7 @@ impl LiveCaptionManager {
             Err(_) => {
                 running.store(false, Ordering::SeqCst);
                 let _ = stop_tx.send(());
-                let _ = handle.join();
-                Err(anyhow!("即時字幕啟動執行緒未回報結果"))
+                Err(anyhow!("即時字幕啟動逾時或執行緒未回報結果"))
             }
         }
     }
@@ -336,13 +356,22 @@ impl LiveCaptionManager {
             .ok_or_else(|| anyhow!("目前沒有進行中的即時字幕"))?;
         session.running.store(false, Ordering::SeqCst);
         let _ = session.stop_tx.send(());
-        let _ = session.handle.join();
+        if session
+            .finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .is_ok()
+        {
+            let _ = session.handle.join();
+        } else {
+            return Err(anyhow!("即時字幕停止逾時，背景工作已要求取消"));
+        }
         let _ = app.emit(
             LIVE_CAPTION_STATUS_EVENT,
             LiveCaptionStatus {
                 active: false,
                 backend: Some(session.backend),
                 audio_source: Some(session.audio_source),
+                session_id: Some(session.session_id),
             },
         );
         Ok(())
@@ -356,6 +385,7 @@ impl LiveCaptionManager {
                     active: false,
                     backend: None,
                     audio_source: None,
+                    session_id: None,
                 }
             }
         };
@@ -365,11 +395,13 @@ impl LiveCaptionManager {
                 active: session.running.load(Ordering::SeqCst),
                 backend: Some(session.backend.clone()),
                 audio_source: Some(session.audio_source.clone()),
+                session_id: Some(session.session_id.clone()),
             })
             .unwrap_or(LiveCaptionStatus {
                 active: false,
                 backend: None,
                 audio_source: None,
+                session_id: None,
             })
     }
 
@@ -411,6 +443,7 @@ fn normalize_backend(backend: &str) -> Result<String> {
     match backend {
         "local_whisper" | "local" => Ok("local_whisper".into()),
         "voxnote_asr" => Ok("voxnote_asr".into()),
+        "assemblyai_streaming" => Ok("assemblyai_streaming".into()),
         other => Err(anyhow!("不支援的即時字幕轉錄後端：{}", other)),
     }
 }
@@ -469,6 +502,7 @@ fn run_live_caption_session(
     app: AppHandle,
     config: AppConfig,
     backend: String,
+    session_id: String,
     audio_source: String,
     queue: SharedQueue,
     error_state: SharedError,
@@ -533,21 +567,43 @@ fn run_live_caption_session(
         None
     };
 
-    ready_tx
-        .send(Ok(()))
-        .map_err(|_| anyhow!("即時字幕啟動狀態無法回傳"))?;
-
-    let result = process_caption_windows(
-        &app,
-        &config,
-        &backend,
-        whisper_context.as_ref(),
-        remote_client.as_ref(),
-        &queue,
-        &error_state,
-        &running,
-        stop_rx,
-    );
+    let result = if backend == "assemblyai_streaming" {
+        tauri::async_runtime::block_on(assemblyai::run_stream_session(
+            app.clone(),
+            config.clone(),
+            session_id.clone(),
+            audio_source.clone(),
+            queue.clone(),
+            running.clone(),
+            stop_rx,
+            ready_tx,
+        ))
+    } else {
+        let _ = app.emit(
+            LIVE_CAPTION_STATUS_EVENT,
+            LiveCaptionStatus {
+                active: true,
+                backend: Some(backend.clone()),
+                audio_source: Some(audio_source.clone()),
+                session_id: Some(session_id.clone()),
+            },
+        );
+        ready_tx
+            .send(Ok(()))
+            .map_err(|_| anyhow!("即時字幕啟動狀態無法回傳"))?;
+        process_caption_windows(
+            &app,
+            &config,
+            &backend,
+            &session_id,
+            whisper_context.as_ref(),
+            remote_client.as_ref(),
+            &queue,
+            &error_state,
+            &running,
+            stop_rx,
+        )
+    };
 
     running.store(false, Ordering::SeqCst);
     drop(mic_stream);
@@ -568,6 +624,7 @@ fn run_live_caption_session(
             active: false,
             backend: Some(backend),
             audio_source: Some(audio_source),
+            session_id: Some(session_id),
         },
     );
     result
@@ -577,6 +634,7 @@ fn process_caption_windows(
     app: &AppHandle,
     config: &AppConfig,
     backend: &str,
+    session_id: &str,
     whisper_context: Option<&WhisperContext>,
     remote_client: Option<&reqwest::Client>,
     queue: &SharedQueue,
@@ -598,6 +656,7 @@ fn process_caption_windows(
     let mut captured_sample_offset = 0usize;
     let translation_failure_reported = Arc::new(AtomicBool::new(false));
     let mut sequence = 0u64;
+    let mut revision = 0u64;
     let mut last_drop_notice: Option<Instant> = None;
 
     while running.load(Ordering::SeqCst) {
@@ -635,6 +694,9 @@ fn process_caption_windows(
                 &mut samples,
                 captured_sample_offset,
                 &translation_failure_reported,
+                session_id,
+                &mut revision,
+                running,
             );
         }
         let interval_elapsed = last_decode_at
@@ -792,6 +854,9 @@ fn process_caption_windows(
         } else {
             text.clone()
         };
+        if !running.load(Ordering::SeqCst) {
+            continue;
+        }
         if incremental {
             incremental_segment.text = emitted_text.clone();
             let segment_samples =
@@ -803,10 +868,14 @@ fn process_caption_windows(
         }
         let display_text =
             build_display_text(&emitted_text, None, &config.live_caption_display_mode);
+        revision = revision.saturating_add(1);
         let _ = app.emit(
             LIVE_CAPTION_EVENT,
             LiveCaptionPayload {
+                session_id: session_id.to_string(),
                 sequence: event_sequence,
+                revision,
+                phase: if is_tentative { "partial" } else { "final" }.into(),
                 original: emitted_text.clone(),
                 translation: None,
                 display_text,
@@ -828,8 +897,11 @@ fn process_caption_windows(
             let translation_config = config.clone();
             let translation_text = emitted_text.clone();
             let translation_sequence = event_sequence;
+            let translation_revision = revision.saturating_add(1);
+            let translation_session_id = session_id.to_string();
             let translation_mode = config.live_caption_display_mode.clone();
             let translation_failure_reported = translation_failure_reported.clone();
+            let translation_running = running.clone();
             // 翻譯不得阻塞下一段 ASR；完成後用相同 sequence 更新已顯示的字幕。
             thread::spawn(move || {
                 match tauri::async_runtime::block_on(call_llm(
@@ -838,12 +910,18 @@ fn process_caption_windows(
                     &translation_text,
                 )) {
                     Ok(value) if !value.trim().is_empty() => {
+                        if !translation_running.load(Ordering::SeqCst) {
+                            return;
+                        }
                         let value = value.trim().to_string();
                         translation_failure_reported.store(false, Ordering::SeqCst);
                         let _ = translation_app.emit(
                             LIVE_CAPTION_EVENT,
                             LiveCaptionPayload {
+                                session_id: translation_session_id,
                                 sequence: translation_sequence,
+                                revision: translation_revision,
+                                phase: "postprocessed".into(),
                                 original: translation_text.clone(),
                                 display_text: build_display_text(
                                     &translation_text,
@@ -873,7 +951,10 @@ fn process_caption_windows(
             let proofread_config = config.clone();
             let proofread_text = emitted_text.clone();
             let proofread_sequence = event_sequence;
+            let proofread_revision = revision.saturating_add(1);
+            let proofread_session_id = session_id.to_string();
             let proofread_failure_reported = translation_failure_reported.clone();
+            let proofread_running = running.clone();
             // 校稿是「修正原文」而非另一種呈現，故以校正後文字取代 original／
             // display_text，translation 欄位維持 None——與翻譯的語意區分開來。
             thread::spawn(move || {
@@ -883,12 +964,18 @@ fn process_caption_windows(
                     &proofread_text,
                 )) {
                     Ok(value) if !value.trim().is_empty() => {
+                        if !proofread_running.load(Ordering::SeqCst) {
+                            return;
+                        }
                         let value = value.trim().to_string();
                         proofread_failure_reported.store(false, Ordering::SeqCst);
                         let _ = proofread_app.emit(
                             LIVE_CAPTION_EVENT,
                             LiveCaptionPayload {
+                                session_id: proofread_session_id,
                                 sequence: proofread_sequence,
+                                revision: proofread_revision,
+                                phase: "postprocessed".into(),
                                 original: value.clone(),
                                 // 不透過 build_display_text：該函式依 mode 在原文／譯文間選擇，
                                 // 但此處沒有「譯文」，三種 mode 目前都恰好收斂回 value，純屬巧合
@@ -917,15 +1004,23 @@ fn process_caption_windows(
     }
 
     if incremental && (agreement.has_text() || incremental_segment.sequence.is_some()) {
-        complete_incremental_segment(
-            app,
-            config,
-            &mut agreement,
-            &mut incremental_segment,
-            &mut samples,
-            captured_sample_offset,
-            &translation_failure_reported,
-        );
+        if running.load(Ordering::SeqCst) {
+            complete_incremental_segment(
+                app,
+                config,
+                &mut agreement,
+                &mut incremental_segment,
+                &mut samples,
+                captured_sample_offset,
+                &translation_failure_reported,
+                session_id,
+                &mut revision,
+                running,
+            );
+        } else {
+            let _ = agreement.finish();
+            let _ = incremental_segment.complete(captured_sample_offset);
+        }
     }
 
     Ok(())
@@ -1078,6 +1173,9 @@ fn complete_incremental_segment(
     samples: &mut VecDeque<f32>,
     captured_sample_offset: usize,
     translation_failure_reported: &Arc<AtomicBool>,
+    session_id: &str,
+    revision: &mut u64,
+    running: &Arc<AtomicBool>,
 ) {
     let final_text = if agreement.has_text() {
         agreement.finish().confirmed
@@ -1087,10 +1185,19 @@ fn complete_incremental_segment(
     let completed = segment.complete(captured_sample_offset);
     if let Some((event_sequence, _)) = completed {
         if !final_text.is_empty() {
+            if !running.load(Ordering::SeqCst) {
+                *agreement = LocalAgreement::default();
+                samples.clear();
+                return;
+            }
+            *revision = revision.saturating_add(1);
             let _ = app.emit(
                 LIVE_CAPTION_EVENT,
                 LiveCaptionPayload {
+                    session_id: session_id.to_string(),
                     sequence: event_sequence,
+                    revision: *revision,
+                    phase: "final".into(),
                     original: final_text.clone(),
                     translation: None,
                     display_text: build_display_text(
@@ -1109,6 +1216,9 @@ fn complete_incremental_segment(
                 event_sequence,
                 final_text,
                 translation_failure_reported,
+                session_id,
+                revision.saturating_add(1),
+                running,
             );
         }
     }
@@ -1122,6 +1232,9 @@ fn spawn_caption_postprocessing(
     sequence: u64,
     text: String,
     failure_reported: &Arc<AtomicBool>,
+    session_id: &str,
+    revision: u64,
+    running: &Arc<AtomicBool>,
 ) {
     let (should_translate, should_proofread) = resolve_translate_or_proofread(
         config.live_caption_translate,
@@ -1137,6 +1250,8 @@ fn spawn_caption_postprocessing(
     let config = config.clone();
     let mode = config.live_caption_display_mode.clone();
     let failure_reported = failure_reported.clone();
+    let session_id = session_id.to_string();
+    let running = running.clone();
     thread::spawn(move || {
         let result = if should_translate {
             tauri::async_runtime::block_on(call_llm(
@@ -1150,11 +1265,17 @@ fn spawn_caption_postprocessing(
 
         match result {
             Ok(value) if !value.trim().is_empty() => {
+                if !running.load(Ordering::SeqCst) {
+                    return;
+                }
                 let value = value.trim().to_string();
                 failure_reported.store(false, Ordering::SeqCst);
                 let payload = if should_translate {
                     LiveCaptionPayload {
+                        session_id: session_id.clone(),
                         sequence,
+                        revision,
+                        phase: "postprocessed".into(),
                         original: text.clone(),
                         display_text: build_display_text(&text, Some(&value), &mode),
                         translation: Some(value),
@@ -1164,7 +1285,10 @@ fn spawn_caption_postprocessing(
                     }
                 } else {
                     LiveCaptionPayload {
+                        session_id,
                         sequence,
+                        revision,
+                        phase: "postprocessed".into(),
                         original: value.clone(),
                         display_text: value.clone(),
                         translation: None,
@@ -1448,6 +1572,12 @@ fn close_overlay(app: &AppHandle) {
     if let Some(window) = app.get_webview_window(LIVE_CAPTION_OVERLAY_LABEL) {
         // 靜態宣告的視窗需保留，下一次 session 才能再次顯示。
         let _ = window.hide();
+    }
+}
+
+pub fn close_overlay_on_app_exit(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window(LIVE_CAPTION_OVERLAY_LABEL) {
+        let _ = window.close();
     }
 }
 

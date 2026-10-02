@@ -9,8 +9,10 @@ import {
 import type { AppConfig, LiveCaptionStatus, RecordingDeviceList } from '../types';
 import { showToast } from '../components/toast';
 import { buildLiveCaptionSettings } from '../components/liveCaptionSettings';
+import { buildSelectGroup } from '../components/selectGroup';
 import { getSettings, saveSettings } from '../api/settings';
-import { initConfigStore, setCurrentConfig } from '../utils/configStore';
+import { getCurrentConfig, initConfigStore, setCurrentConfig } from '../utils/configStore';
+import { mergeLiveCaptionSettings } from '../utils/liveCaptionConfig';
 
 let pageCleanup: (() => void) | null = null;
 
@@ -46,25 +48,11 @@ export async function renderLiveCaptionPage(container: HTMLElement): Promise<voi
   intro.textContent = '將字幕視窗拖到影片或會議畫面上方。字幕只在本次 session 中保留，不會寫入錄音或逐字稿。';
   card.appendChild(intro);
 
-  const sourceGroup = document.createElement('div');
-  sourceGroup.className = 'form-group';
-  const sourceLabel = document.createElement('label');
-  sourceLabel.textContent = '音訊來源';
-  const sourceSelect = document.createElement('select');
-  sourceSelect.className = 'form-control';
-  const systemOption = document.createElement('option');
-  systemOption.value = 'system';
-  systemOption.textContent = '電腦音訊（系統播放聲音）';
-  systemOption.disabled = !devices.system_audio_supported;
-  sourceSelect.appendChild(systemOption);
-  const microphoneOption = document.createElement('option');
-  microphoneOption.value = 'microphone';
-  microphoneOption.textContent = '麥克風';
-  sourceSelect.appendChild(microphoneOption);
-  sourceSelect.value = devices.system_audio_supported
-    ? (config.live_caption_audio_source || 'system')
-    : 'microphone';
-  sourceGroup.append(sourceLabel, sourceSelect);
+  const sourceGroup = buildSelectGroup('音訊來源', [
+    { value: 'system', label: '電腦音訊（系統播放聲音）', disabled: !devices.system_audio_supported },
+    { value: 'microphone', label: '麥克風' },
+  ], devices.system_audio_supported ? config.live_caption_audio_source : 'microphone', () => {});
+  const sourceSelect = sourceGroup.select;
   card.appendChild(sourceGroup);
 
   const deviceHint = document.createElement('small');
@@ -89,26 +77,7 @@ export async function renderLiveCaptionPage(container: HTMLElement): Promise<voi
   // 僅取出即時字幕欄位：設定元件持有的是頁面載入當下的完整快照，
   // 整包覆寫會把其他頁面在這之後所做的變更一併回退。
   const settingsPanel = buildLiveCaptionSettings(config, (updated) => {
-    pendingConfig = {
-      ...pendingConfig,
-      live_caption_backend: updated.live_caption_backend,
-      live_caption_model_path: updated.live_caption_model_path,
-      live_caption_language: updated.live_caption_language,
-      live_caption_remote_base_url: updated.live_caption_remote_base_url,
-      live_caption_remote_model: updated.live_caption_remote_model,
-      live_caption_remote_timeout_seconds: updated.live_caption_remote_timeout_seconds,
-      live_caption_window_seconds: updated.live_caption_window_seconds,
-      live_caption_step_seconds: updated.live_caption_step_seconds,
-      live_caption_incremental_enabled: updated.live_caption_incremental_enabled,
-      live_caption_decode_interval_ms: updated.live_caption_decode_interval_ms,
-      live_caption_silence_threshold: updated.live_caption_silence_threshold,
-      live_caption_translate: updated.live_caption_translate,
-      live_caption_proofread: updated.live_caption_proofread,
-      live_caption_display_mode: updated.live_caption_display_mode,
-      live_caption_font_size: updated.live_caption_font_size,
-      live_caption_clear_seconds: updated.live_caption_clear_seconds,
-      live_caption_click_through: updated.live_caption_click_through,
-    };
+    pendingConfig = mergeLiveCaptionSettings(getCurrentConfig() ?? pendingConfig, updated);
     setCurrentConfig(pendingConfig);
     dirty = true;
     restartHint.hidden = !currentActive;
@@ -188,32 +157,13 @@ export async function renderLiveCaptionPage(container: HTMLElement): Promise<voi
     try {
       // 後端在啟動時才讀取設定檔，故必須先確定變更已落盤，否則本次啟動會沿用舊值。
       const source = sourceSelect.value as 'microphone' | 'system';
-      pendingConfig = { ...pendingConfig, live_caption_audio_source: source };
+      pendingConfig = mergeLiveCaptionSettings(getCurrentConfig() ?? pendingConfig, {
+        ...pendingConfig, live_caption_audio_source: source,
+      });
       setCurrentConfig(pendingConfig);
       if (dirty || pendingConfig.live_caption_audio_source !== config.live_caption_audio_source) {
-        // 以最新的設定檔為底再套上本頁的即時字幕欄位，避免覆寫其他頁面的變更。
-        const latest = await getSettings();
-        const merged: AppConfig = {
-          ...latest,
-          live_caption_backend: pendingConfig.live_caption_backend,
-          live_caption_model_path: pendingConfig.live_caption_model_path,
-          live_caption_language: pendingConfig.live_caption_language,
-          live_caption_remote_base_url: pendingConfig.live_caption_remote_base_url,
-          live_caption_remote_model: pendingConfig.live_caption_remote_model,
-          live_caption_remote_timeout_seconds: pendingConfig.live_caption_remote_timeout_seconds,
-          live_caption_audio_source: pendingConfig.live_caption_audio_source,
-          live_caption_window_seconds: pendingConfig.live_caption_window_seconds,
-           live_caption_step_seconds: pendingConfig.live_caption_step_seconds,
-           live_caption_incremental_enabled: pendingConfig.live_caption_incremental_enabled,
-           live_caption_decode_interval_ms: pendingConfig.live_caption_decode_interval_ms,
-          live_caption_silence_threshold: pendingConfig.live_caption_silence_threshold,
-          live_caption_translate: pendingConfig.live_caption_translate,
-          live_caption_proofread: pendingConfig.live_caption_proofread,
-          live_caption_display_mode: pendingConfig.live_caption_display_mode,
-          live_caption_font_size: pendingConfig.live_caption_font_size,
-          live_caption_clear_seconds: pendingConfig.live_caption_clear_seconds,
-          live_caption_click_through: pendingConfig.live_caption_click_through,
-        };
+        const latest = getCurrentConfig() ?? await getSettings();
+        const merged = mergeLiveCaptionSettings(latest, pendingConfig);
         await saveSettings(merged);
         pendingConfig = merged;
         config = merged;

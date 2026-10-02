@@ -133,12 +133,16 @@ export interface RecordingPreview {
 
 export interface LiveCaptionStatus {
   active: boolean;
-  backend: 'local_whisper' | 'voxnote_asr' | null;
+  backend: 'local_whisper' | 'voxnote_asr' | 'assemblyai_streaming' | null;
   audio_source: 'microphone' | 'system' | null;
+  session_id: string | null;
 }
 
 export interface LiveCaptionPayload {
+  session_id: string;
   sequence: number;
+  revision: number;
+  phase: 'partial' | 'final' | 'postprocessed';
   original: string;
   translation: string | null;
   display_text: string;
@@ -161,9 +165,40 @@ export interface LiveCaptionBuildInfo {
   cuda_enabled: boolean;
 }
 
+export type AsrProviderKind = 'assemblyai' | 'voxnote_asr' | 'local';
+
+export interface AsrProviderConfig {
+  id: string;
+  name: string;
+  kind: AsrProviderKind;
+  api_key: string;
+  base_url: string;
+  live_base_url: string;
+  local_model_path: string;
+}
+
+export interface SelectOption {
+  value: string;
+  label: string;
+  disabled?: boolean;
+}
+
+export interface SelectGroup extends HTMLElement {
+  select: HTMLSelectElement;
+  setOptions: (options: SelectOption[]) => void;
+  setValue: (value: string) => void;
+}
+
+export interface AsrProviderSelection extends HTMLElement {
+  updateProviders: (providers: AsrProviderConfig[]) => void;
+}
+
 export interface AppConfig {
   // ASR
   asr_provider: 'assemblyai' | 'local' | 'voxnote_asr';
+  asr_provider_configs: AsrProviderConfig[];
+  asr_provider_id: string;
+  live_caption_provider_id: string;
   assembly_ai_key: string;
   assembly_ai_speech_model: string;
   recording_storage_dir: string;
@@ -178,7 +213,8 @@ export interface AppConfig {
   auto_proofread_after_transcription: boolean; // 逐段轉譯完成後自動 AI 校稿
 
   // 即時字幕
-  live_caption_backend: 'local_whisper' | 'voxnote_asr';
+  live_caption_backend: 'local_whisper' | 'voxnote_asr' | 'assemblyai_streaming';
+  live_caption_assemblyai_model: string;
   live_caption_model_path: string;
   live_caption_audio_source: 'microphone' | 'system';
   live_caption_window_seconds: number;

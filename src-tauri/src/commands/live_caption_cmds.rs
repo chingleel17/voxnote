@@ -20,7 +20,9 @@ pub async fn start_live_caption(
     manager: State<'_, LiveCaptionManager>,
     recording_manager: State<'_, DesktopRecordingManager>,
 ) -> Result<LiveCaptionStatus, String> {
-    let mut config = load_config(&app_handle).map_err(|error| error.to_string())?;
+    let mut config = load_config(&app_handle)
+        .and_then(|config| config.resolve_live_provider())
+        .map_err(|error| error.to_string())?;
     if matches!(config.live_caption_backend.as_str(), "voxnote_asr") {
         let resolved = resolve_live_caption_endpoint(&config).await?;
         check_local_asr_health(&resolved).await?;
@@ -46,7 +48,9 @@ pub async fn start_live_caption(
 /// 探測失敗一律視為「無 /live」而回退至原位址：舊版單一容器部署對 `/live/health`
 /// 回 404（已實測），故此判斷可靠；網路異常時亦不應因探測失敗而阻斷啟動——
 /// 後續的健康檢查會對實際採用的位址再把關一次。
-async fn resolve_live_caption_endpoint(config: &crate::config::AppConfig) -> Result<String, String> {
+async fn resolve_live_caption_endpoint(
+    config: &crate::config::AppConfig,
+) -> Result<String, String> {
     let dedicated = config.live_caption_remote_base_url.trim();
     if !dedicated.is_empty() {
         return Ok(dedicated.to_string());
@@ -59,10 +63,16 @@ async fn resolve_live_caption_endpoint(config: &crate::config::AppConfig) -> Res
 
     let live_url = format!("{}/live", base);
     if probe_health(&live_url).await {
-        println!("[live-caption] 偵測到 {} 可用，本次 session 採用該位址", live_url);
+        println!(
+            "[live-caption] 偵測到 {} 可用，本次 session 採用該位址",
+            live_url
+        );
         Ok(live_url)
     } else {
-        println!("[live-caption] {} 不可用，回退沿用批次位址 {}", live_url, base);
+        println!(
+            "[live-caption] {} 不可用，回退沿用批次位址 {}",
+            live_url, base
+        );
         Ok(base.to_string())
     }
 }

@@ -37,6 +37,7 @@ pub fn run() {
                         println!("[shutdown] 停止即時字幕失敗：{error}");
                     }
                 }
+                live_caption::close_overlay_on_app_exit(&app_handle);
 
                 let recording_manager =
                     app_handle.state::<audio_recording::DesktopRecordingManager>();

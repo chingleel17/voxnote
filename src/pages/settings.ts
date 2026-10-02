@@ -1,17 +1,17 @@
-import type { AppConfig } from '../types';
+import type { AppConfig, AsrProviderSelection } from '../types';
 import {
   saveSettings,
   testLlmConnection, testOllamaConnection, listProviderModels,
-  detectLocalAsrTools, testLocalAsrConnection,
-  type LocalAsrInfo,
 } from '../api/settings';
 import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
 import { exportFullBackup, importFullBackup, preflightFullBackup } from '../api/backup';
 import { showToast } from '../components/toast';
+import { buildSelectGroup } from '../components/selectGroup';
+import { buildAsrProviderSettings, refreshAsrProviderUsage } from '../components/asrProviderSettings';
+import { buildAsrProviderSelection } from '../components/asrProviderSelection';
 import { initConfigStore, setCurrentConfig, getCurrentConfig } from '../utils/configStore';
 import { sendTestNotification } from '../utils/notifications';
 
-const ICON_SEARCH = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg>';
 const ICON_REFRESH = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5"/><path d="M20 12a8 8 0 1 0-2.3 5.7"/></svg>';
 
 // ─────────────────────────────────────────────
@@ -54,8 +54,6 @@ const OPENROUTER_MODELS = [
   'anthropic/claude-sonnet-4.5',
   'google/gemini-2.5-flash',
 ];
-const ASSEMBLYAI_SPEECH_MODELS = ['universal-2', 'universal-3-5-pro'];
-const LOCAL_ASR_MODELS = ['tiny', 'base', 'small', 'medium', 'large'];
 const OLLAMA_THINK_LEVELS: Array<{ value: AppConfig['ollama_think_level']; label: string }> = [
   { value: 'off', label: '關閉思考' },
   { value: 'low', label: '低' },
@@ -118,7 +116,7 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
 
   const persistSettings = async (mode: 'auto' | 'manual'): Promise<void> => {
     const requestId = ++latestSaveRequest;
-    const snapshot = { ...config };
+    const snapshot = { ...(getCurrentConfig() ?? config) };
     setSaveStatus(mode === 'auto' ? '正在自動儲存設定…' : '正在儲存設定…');
 
     try {
@@ -157,19 +155,28 @@ export async function renderSettingsPage(container: HTMLElement): Promise<void> 
     config = {
       ...config,
       asr_provider: updated.asr_provider,
-      assembly_ai_key: updated.assembly_ai_key,
+      asr_provider_id: updated.asr_provider_id,
       assembly_ai_speech_model: updated.assembly_ai_speech_model,
       local_asr_model: updated.local_asr_model,
-      local_asr_base_url: updated.local_asr_base_url,
       asr_language: updated.asr_language,
       speaker_detection: updated.speaker_detection,
       auto_proofread_after_transcription: updated.auto_proofread_after_transcription,
       voiceprint_similarity_threshold: updated.voiceprint_similarity_threshold,
     };
     setCurrentConfig(config);
+    refreshAsrProviderUsage(providerSection, config);
     scheduleAutoSave();
   });
   settingsGrid.appendChild(asrSection);
+
+  const providerSection = buildAsrProviderSettings(config, (providers) => {
+    config = { ...config, asr_provider_configs: providers };
+    setCurrentConfig(config);
+    const selection = asrSection.querySelector<AsrProviderSelection>('[data-asr-provider-selection="batch"]');
+    selection?.updateProviders(providers);
+    scheduleAutoSave();
+  });
+  settingsGrid.prepend(providerSection);
 
   // ── LLM 區塊 ──
   const llmSection = buildLlmSection(config, (updated) => {
@@ -283,21 +290,12 @@ function buildAsrSection(
   heading.textContent = '語音轉錄（ASR）';
   section.appendChild(heading);
 
-  // 供應商下拉
-  const providerGroup = buildSelectGroup(
-    '轉錄供應商',
-      [
-        { value: 'assemblyai', label: 'AssemblyAI（雲端）' },
-        { value: 'local', label: '本地 Whisper' },
-        { value: 'voxnote_asr', label: 'VoxNote 轉錄服務' },
-    ],
-    config.asr_provider,
-    (v) => {
-      config = { ...config, asr_provider: v as AppConfig['asr_provider'] };
-      onChange(config);
-      updateAsrVisibility(v);
-    }
-  );
+  const providerGroup = buildAsrProviderSelection(config, 'batch', (updated) => {
+    config = { ...config, asr_provider_id: updated.asr_provider_id, asr_provider: updated.asr_provider,
+      assembly_ai_speech_model: updated.assembly_ai_speech_model, local_asr_model: updated.local_asr_model };
+    onChange(config);
+    updateAsrVisibility(config.asr_provider);
+  });
   section.appendChild(providerGroup);
 
   const advancedDetails = document.createElement('details');
@@ -310,99 +308,7 @@ function buildAsrSection(
   advancedDetails.appendChild(advancedBody);
   section.appendChild(advancedDetails);
 
-  // AssemblyAI Key
-  const assemblySection = document.createElement('div');
-  assemblySection.appendChild(
-    buildInputGroup('AssemblyAI API Key', 'password', config.assembly_ai_key, (v) => {
-      config = { ...config, assembly_ai_key: v };
-      onChange(config);
-    })
-  );
-  assemblySection.appendChild(
-    buildModelSelectGroup(
-      config,
-      (v) => {
-        config = { ...config, assembly_ai_speech_model: v };
-        onChange(config);
-      },
-      () => config,
-      {
-        provider: 'assemblyai',
-        label: 'AssemblyAI 模型',
-        initialSuggestions: ASSEMBLYAI_SPEECH_MODELS,
-        value: config.assembly_ai_speech_model || 'universal-2',
-        remote: false,
-      }
-    )
-  );
-  advancedBody.appendChild(assemblySection);
-
-  // 本地 Whisper
-  const localSection = document.createElement('div');
-  const localStatus = document.createElement('div');
-  localStatus.className = 'form-group';
-  localStatus.innerHTML = '<label>偵測狀態</label><div class="asr-detect-result">正在偵測...</div>';
-  localSection.appendChild(localStatus);
-
-  const detectBtn = document.createElement('button');
-  detectBtn.className = 'btn btn-secondary btn-sm';
-  detectBtn.textContent = '重新偵測';
-  detectBtn.style.marginBottom = '12px';
-  localSection.appendChild(detectBtn);
-
-  localSection.appendChild(
-    buildSelectGroup(
-      '模型大小',
-      LOCAL_ASR_MODELS.map((m) => ({ value: m, label: m })),
-      config.local_asr_model,
-      (v) => {
-        config = { ...config, local_asr_model: v as AppConfig['local_asr_model'] };
-        onChange(config);
-      }
-    )
-  );
-  advancedBody.appendChild(localSection);
-
-  // 本地 ASR 伺服器
-  const localServerSection = document.createElement('div');
-  const endpointGroup = document.createElement('div');
-  endpointGroup.className = 'form-group';
-  const endpointLabel = document.createElement('label');
-  endpointLabel.textContent = 'Base URL';
-  const endpointRow = document.createElement('div');
-  endpointRow.className = 'input-row';
-  const endpointInput = document.createElement('input');
-  endpointInput.type = 'url';
-  endpointInput.className = 'form-control';
-  endpointInput.value = config.local_asr_base_url;
-  endpointInput.placeholder = 'http://localhost:8000';
-  endpointInput.addEventListener('input', () => {
-    config = { ...config, local_asr_base_url: endpointInput.value };
-    onChange(config);
-  });
-  const testServerBtn = document.createElement('button');
-  testServerBtn.type = 'button';
-  testServerBtn.className = 'btn btn-secondary btn-sm';
-  testServerBtn.textContent = '測試連線';
-  testServerBtn.addEventListener('click', async () => {
-    testServerBtn.disabled = true;
-    testServerBtn.textContent = '測試中...';
-    try {
-      const reachable = await testLocalAsrConnection(endpointInput.value);
-      showToast(reachable ? '本地 ASR 伺服器連線成功' : '本地 ASR 伺服器未通過健康檢查', reachable ? 'success' : 'error');
-    } catch (err) {
-      showToast(`本地 ASR 伺服器連線失敗：${String(err)}`, 'error');
-    } finally {
-      testServerBtn.disabled = false;
-      testServerBtn.textContent = '測試連線';
-    }
-  });
-  endpointRow.append(endpointInput, testServerBtn);
-  endpointGroup.append(endpointLabel, endpointRow);
-  localServerSection.appendChild(endpointGroup);
-
-  // 講者聲紋比對相似度門檻：僅本地 ASR 供應商可用（AssemblyAI 為黑箱 API，
-  // 不暴露嵌入向量），故置於 localServerSection 內，隨供應商切換一併顯示/隱藏。
+  // 聲紋門檻是批次服務選項，僅選取自架 ASR 時顯示。
   const voiceprintThresholdGroup = document.createElement('div');
   voiceprintThresholdGroup.className = 'form-group';
   const voiceprintThresholdLabel = document.createElement('label');
@@ -425,35 +331,7 @@ function buildAsrSection(
   voiceprintThresholdHint.textContent =
     '僅本地 ASR 供應商適用。數值為 cosine 距離（0–2，愈小代表愈相似），低於此門檻才會提議合併講者代號或跨會議候選人名；預設 0.25 為保守值，可依實際錄音調整。';
   voiceprintThresholdGroup.append(voiceprintThresholdLabel, voiceprintThresholdInput, voiceprintThresholdHint);
-  localServerSection.appendChild(voiceprintThresholdGroup);
-
-  advancedBody.appendChild(localServerSection);
-
-  // 偵測邏輯
-  const resultEl = localSection.querySelector('.asr-detect-result') as HTMLElement;
-  const runDetect = async (): Promise<void> => {
-    resultEl.textContent = '偵測中...';
-    detectBtn.disabled = true;
-    try {
-      const tools: LocalAsrInfo[] = await detectLocalAsrTools();
-      if (tools.length > 0) {
-        resultEl.innerHTML = tools
-          .map((t) => `<span class="badge badge-success">✓ ${t.engine} ${t.version}</span>`)
-          .join(' ');
-      } else {
-        resultEl.innerHTML = `
-          <span class="badge badge-warning">未偵測到 Whisper</span>
-          <div class="asr-install-hint">建議安裝：<code>pipx install openai-whisper</code>（不污染全域 Python）</div>
-        `;
-      }
-    } catch {
-      resultEl.textContent = '偵測失敗';
-    } finally {
-      detectBtn.disabled = false;
-    }
-  };
-  detectBtn.addEventListener('click', () => void runDetect());
-  void runDetect();
+  advancedBody.appendChild(voiceprintThresholdGroup);
 
   // 語言設定（僅供批次逐字稿使用）
   advancedBody.appendChild(
@@ -475,7 +353,7 @@ function buildAsrSection(
   );
   const asrLanguageHint = document.createElement('small');
   asrLanguageHint.className = 'form-hint';
-  asrLanguageHint.textContent = '此語言與遠端端點僅套用於批次逐字稿（會議錄音）。即時字幕的來源語言與遠端端點為獨立設定，請至「即時字幕」頁的字幕設定調整。';
+  asrLanguageHint.textContent = '此語言僅套用於批次逐字稿；即時字幕的來源語言獨立設定。連線資訊在「語音辨識供應商」共用管理。';
   advancedBody.appendChild(asrLanguageHint);
 
   // 語者分離（AssemblyAI 與本地伺服器支援）
@@ -531,9 +409,7 @@ function buildAsrSection(
 
   // 可見性控制
   const updateAsrVisibility = (provider: string): void => {
-    assemblySection.style.display = provider === 'assemblyai' ? '' : 'none';
-    localSection.style.display = provider === 'local' ? '' : 'none';
-    localServerSection.style.display = provider === 'voxnote_asr' ? '' : 'none';
+    voiceprintThresholdGroup.hidden = provider !== 'voxnote_asr';
   };
   updateAsrVisibility(config.asr_provider);
 
@@ -1123,31 +999,16 @@ function buildOllamaSection(
   }, () => config, { provider: 'ollama', label: 'LLM 模型', value: config.ollama_model });
   wrapper.appendChild(modelGroup);
 
-  const thinkGroup = document.createElement('div');
-  thinkGroup.className = 'form-group';
-  const thinkLabel = document.createElement('label');
-  thinkLabel.textContent = '思考強度';
-  const thinkSelect = document.createElement('select');
-  thinkSelect.className = 'form-control';
-  for (const option of OLLAMA_THINK_LEVELS) {
-    const el = document.createElement('option');
-    el.value = option.value;
-    el.textContent = option.label;
-    el.selected = option.value === (config.ollama_think_level ?? 'low');
-    thinkSelect.appendChild(el);
-  }
-  thinkSelect.addEventListener('change', () => {
+  const thinkGroup = buildSelectGroup('思考強度', OLLAMA_THINK_LEVELS, config.ollama_think_level ?? 'low', (value) => {
     config = {
       ...config,
-      ollama_think_level: thinkSelect.value as AppConfig['ollama_think_level'],
+      ollama_think_level: value as AppConfig['ollama_think_level'],
     };
     onChange(config);
   });
   const thinkHint = document.createElement('small');
   thinkHint.className = 'form-hint';
   thinkHint.textContent = '建議先用低，若請求過久可改成關閉思考。';
-  thinkGroup.appendChild(thinkLabel);
-  thinkGroup.appendChild(thinkSelect);
   thinkGroup.appendChild(thinkHint);
   wrapper.appendChild(thinkGroup);
 
@@ -1234,13 +1095,6 @@ function buildAiPromptSection(
 // ─────────────────────────────────────────────
 // 工具函式
 // ─────────────────────────────────────────────
-// 產生頁面內唯一的元素 id 序號
-let elementIdSeq = 0;
-function nextElementId(): number {
-  elementIdSeq += 1;
-  return elementIdSeq;
-}
-
 // ─────────────────────────────────────────────
 // 模型欄位沿用共用下拉選單，篩選、手動輸入與清單更新分開操作。
 // ─────────────────────────────────────────────
@@ -1371,135 +1225,6 @@ function buildInputGroup(
   group.appendChild(label);
   group.appendChild(input);
   return group;
-}
-
-function buildSelectGroup(
-  labelText: string,
-  options: Array<{ value: string; label: string }>,
-  selected: string,
-  onChange: (v: string) => void,
-  settings: { filterable?: boolean; allowCustom?: boolean } = {}
-): HTMLElement & { setOptions: (options: Array<{ value: string; label: string }>) => void } {
-  const group = document.createElement('div');
-  group.className = 'form-group';
-  const label = document.createElement('label');
-  label.textContent = labelText;
-  const select = document.createElement('select');
-  select.className = 'form-control';
-  select.id = `settings-select-${nextElementId()}`;
-  label.htmlFor = select.id;
-
-  // 篩選字串與已選值獨立，開啟選單不會以目前模型名稱限制選項。
-  const filter = document.createElement('input');
-  filter.type = 'search';
-  filter.className = 'form-control';
-  filter.placeholder = '輸入關鍵字篩選模型（不會變更已選模型）';
-  filter.setAttribute('aria-label', `篩選${labelText}`);
-  filter.id = `${select.id}-filter`;
-  filter.hidden = true;
-  filter.style.marginTop = '8px';
-
-  const custom = document.createElement('input');
-  custom.type = 'text';
-  custom.className = 'form-control';
-  custom.placeholder = '輸入模型 ID';
-  custom.setAttribute('aria-label', `手動輸入${labelText}`);
-  custom.hidden = true;
-  custom.style.marginTop = '8px';
-  custom.value = selected;
-  const customValue = '__manual_model__';
-  let manual = false;
-
-  const renderOptions = (): void => {
-    const query = filter.value.trim().toLowerCase();
-    const visible = options.filter((opt) => !query ||
-      opt.value.toLowerCase().includes(query) || opt.label.toLowerCase().includes(query));
-    // 保留已選值，避免篩選或清單更新讓瀏覽器自動改選第一個模型。
-    if (selected && !visible.some((opt) => opt.value === selected)) {
-      visible.unshift(options.find((opt) => opt.value === selected) ?? { value: selected, label: selected });
-    }
-    select.replaceChildren();
-    if (!selected) {
-      const placeholder = document.createElement('option');
-      placeholder.value = '';
-      placeholder.textContent = `請選擇${labelText}`;
-      placeholder.disabled = true;
-      select.appendChild(placeholder);
-    }
-    for (const opt of visible) {
-      const el = document.createElement('option');
-      el.value = opt.value;
-      el.textContent = opt.label;
-      select.appendChild(el);
-    }
-    if (settings.allowCustom) {
-      const el = document.createElement('option');
-      el.value = customValue;
-      el.textContent = '手動輸入模型 ID…';
-      select.appendChild(el);
-    }
-    select.value = manual ? customValue : selected;
-  };
-  select.addEventListener('change', () => {
-    manual = settings.allowCustom === true && select.value === customValue;
-    custom.hidden = !manual;
-    if (manual) {
-      custom.value = selected;
-      custom.focus();
-      custom.select();
-    } else {
-      selected = select.value;
-      onChange(selected);
-    }
-  });
-  custom.addEventListener('input', () => {
-    selected = custom.value;
-    onChange(selected);
-  });
-  filter.addEventListener('input', renderOptions);
-
-  group.appendChild(label);
-  if (settings.filterable || settings.allowCustom) {
-    const row = document.createElement('div');
-    row.className = 'input-row';
-    row.appendChild(select);
-    if (settings.filterable) {
-      const filterBtn = document.createElement('button');
-      filterBtn.type = 'button';
-      filterBtn.className = 'btn btn-secondary btn-sm settings-icon-btn';
-      filterBtn.innerHTML = ICON_SEARCH;
-      filterBtn.title = '篩選模型';
-      filterBtn.setAttribute('aria-label', `篩選${labelText}`);
-      filterBtn.setAttribute('aria-controls', filter.id);
-      filterBtn.setAttribute('aria-expanded', 'false');
-      filterBtn.addEventListener('click', () => {
-        filter.hidden = !filter.hidden;
-        filterBtn.setAttribute('aria-expanded', String(!filter.hidden));
-        filterBtn.title = filter.hidden ? '篩選模型' : '取消篩選';
-        filterBtn.setAttribute('aria-label', filter.hidden ? `篩選${labelText}` : `取消篩選${labelText}`);
-        filterBtn.setAttribute('aria-pressed', String(!filter.hidden));
-        if (filter.hidden) {
-          filter.value = '';
-          renderOptions();
-        } else {
-          filter.focus();
-        }
-      });
-      row.appendChild(filterBtn);
-    }
-    group.appendChild(row);
-    if (settings.filterable) group.appendChild(filter);
-    if (settings.allowCustom) group.appendChild(custom);
-  } else {
-    group.appendChild(select);
-  }
-  renderOptions();
-  return Object.assign(group, {
-    setOptions: (nextOptions: Array<{ value: string; label: string }>): void => {
-      options = nextOptions;
-      renderOptions();
-    },
-  });
 }
 
 function buildDirectoryPickerGroup(

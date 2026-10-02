@@ -34,14 +34,18 @@
 | 設定 | 決定 |
 |---|---|
 | `live_caption_backend` | 新增 `assemblyai_streaming`；舊預設 `local_whisper` 不變 |
-| API Key | 重用 `assembly_ai_key`，Rust 從設定讀取；即時頁可編輯同一金鑰並自動遮蔽輸入 |
+| 供應商設定 | `asr_provider_configs` 保存具 UUID、名稱、種類的多組設定；API Key、批次／即時 URL、本地模型路徑集中於設定頁 |
+| 服務選擇 | `asr_provider_id` 與 `live_caption_provider_id` 各自引用供應商設定，不修改另一服務的選擇 |
+| API Key | Rust 由該服務選取的 AssemblyAI 設定讀取；金鑰只在設定頁的遮蔽欄位編輯 |
 | `live_caption_assemblyai_model` | 新增字串，預設 `universal-3-6-pro`，與批次 `assembly_ai_speech_model` 分離 |
 | 語言 | 沿用 `live_caption_language`；不改批次 `asr_language` |
 | `live_caption_incremental_enabled` | 僅控制本地／自架 LocalAgreement，AssemblyAI 始終依服務端串流結果更新 |
 
-新增欄位依既有 `serde(default)` 相容舊 TOML，Rust/TS 型別同步。即時頁沿用既有原生 select 風格：後端選單新增來源，雲端模型提供已知 U3.6/U3.5 識別建議與明確手動輸入入口，未宣稱可遠端列出模型。手動 ID 原樣送出，服務拒絕或協定不相容時回報原因，不靜默改用別的模型。
+新增欄位依既有 `serde(default)` 相容舊 TOML，Rust/TS 型別同步。首次載入舊設定時，將三種既有連線設定移入具穩定 UUID 的供應商設定，保留金鑰、URL、本地模型路徑及兩服務的選擇，不重設模型／語言。供應商可新增同類設定；正在被服務使用的設定不得直接刪除。執行時依選取 ID 解析，ID 不存在則回報設定錯誤，不靜默改用其他設定。舊純量欄位保留相容用途，供應商設定清單為連線資訊的唯一來源。
 
-選此來源時只顯示 API Key、串流模型、來源語言及既有音源／顯示／翻譯／校稿設定；本地模型、自架端點、視窗預設、靜音視窗門檻、LocalAgreement 開關與解碼間隔隱藏，但保留設定值供切回原來源使用。開始前儲存完整目前設定，包含共享金鑰，避免用局部舊快照覆寫其他設定。
+設定頁與即時字幕頁一律使用抽出的共用 `buildSelectGroup`，沿用設定頁既有篩選、保留選值與手動模型 ID 入口。批次 ASR 區塊及即時頁只選供應商設定與模型；API Key、URL、模型檔路徑集中在設定頁獨立的「語音辨識供應商」區塊。AssemblyAI 提供各服務獨立的模型建議及手動輸入；自架服務目前未提供模型切換契約，顯示使用服務端模型；本地即時引擎使用所選供應商設定的 GGML 模型檔。手動 ID 原樣送出，服務拒絕或協定不相容時回報原因，不靜默改用別的模型。
+
+選此來源時只顯示供應商選擇、串流模型、來源語言及既有音源／顯示／翻譯／校稿設定；視窗預設、靜音視窗門檻、LocalAgreement 開關與解碼間隔隱藏，但保留設定值供切回原來源使用。開始前以最新完整設定合併本頁的服務選擇及字幕選項；不從字幕頁舊快照覆寫設定頁的供應商連線資訊。
 
 ### 3. 官方協定與語言
 

@@ -2,11 +2,17 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 
+mod providers;
+pub use providers::AsrProviderConfig;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)] // 舊版 config.toml 缺少新欄位時，自動填入 Default 值
 pub struct AppConfig {
     // ASR 供應商："assemblyai" | "local" | "voxnote_asr"
     pub asr_provider: String,
+    pub asr_provider_configs: Vec<AsrProviderConfig>,
+    pub asr_provider_id: String,
+    pub live_caption_provider_id: String,
     pub assembly_ai_key: String,
     pub assembly_ai_speech_model: String, // 官方模型識別，亦允許手動指定
     pub recording_storage_dir: String,
@@ -21,8 +27,9 @@ pub struct AppConfig {
     pub auto_proofread_after_transcription: bool, // 逐段轉譯完成後自動 AI 校稿
 
     // 即時字幕
-    pub live_caption_backend: String, // "local_whisper" | "voxnote_asr"
-    pub live_caption_model_path: String, // GGML .bin 模型路徑
+    pub live_caption_backend: String, // "local_whisper" | "voxnote_asr" | "assemblyai_streaming"
+    pub live_caption_assemblyai_model: String,
+    pub live_caption_model_path: String,   // GGML .bin 模型路徑
     pub live_caption_audio_source: String, // "microphone" | "system"
     pub live_caption_window_seconds: u32,
     pub live_caption_step_seconds: u32,
@@ -91,6 +98,9 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             asr_provider: "assemblyai".into(),
+            asr_provider_configs: Vec::new(),
+            asr_provider_id: String::new(),
+            live_caption_provider_id: String::new(),
             assembly_ai_key: String::new(),
             assembly_ai_speech_model: "universal-2".into(),
             recording_storage_dir: String::new(),
@@ -104,6 +114,7 @@ impl Default for AppConfig {
             speaker_detection: true,
             auto_proofread_after_transcription: false,
             live_caption_backend: "local_whisper".into(),
+            live_caption_assemblyai_model: "universal-3-6-pro".into(),
             live_caption_model_path: String::new(),
             live_caption_audio_source: "system".into(),
             live_caption_window_seconds: 5,
@@ -161,11 +172,14 @@ pub fn load_config(app: &AppHandle) -> Result<AppConfig> {
     let config_path = data_dir.join("config.toml");
 
     if !config_path.exists() {
-        return Ok(AppConfig::default());
+        let mut config = AppConfig::default();
+        config.initialize_provider_configs();
+        return Ok(config);
     }
 
     let content = std::fs::read_to_string(&config_path)?;
-    let config: AppConfig = toml::from_str(&content)?;
+    let mut config: AppConfig = toml::from_str(&content)?;
+    config.initialize_provider_configs();
     Ok(config)
 }
 
@@ -228,6 +242,7 @@ live_caption_click_through = true
         assert_eq!(config.live_caption_remote_base_url, "");
         assert_eq!(config.live_caption_remote_model, "");
         assert_eq!(config.live_caption_remote_timeout_seconds, 8);
+        assert_eq!(config.live_caption_assemblyai_model, "universal-3-6-pro");
         assert!(!config.live_caption_incremental_enabled);
         assert_eq!(config.live_caption_decode_interval_ms, 800);
         // 既有欄位不應被預設值覆蓋
@@ -242,6 +257,27 @@ live_caption_click_through = true
 
         assert!(!reparsed.live_caption_incremental_enabled);
         assert_eq!(reparsed.live_caption_decode_interval_ms, 800);
+    }
+
+    #[test]
+    fn assemblyai_streaming_model_is_independent_from_batch_settings() {
+        let mut config = AppConfig::default();
+        config.live_caption_backend = "assemblyai_streaming".into();
+        config.live_caption_assemblyai_model = "custom-stream-model".into();
+        config.assembly_ai_speech_model = "universal-2".into();
+        config.asr_language = "en".into();
+        config.live_caption_language = "zh".into();
+
+        let serialized = toml::to_string_pretty(&config).expect("應可序列化");
+        let reparsed: AppConfig = toml::from_str(&serialized).expect("應可重新解析");
+
+        assert_eq!(
+            reparsed.live_caption_assemblyai_model,
+            "custom-stream-model"
+        );
+        assert_eq!(reparsed.assembly_ai_speech_model, "universal-2");
+        assert_eq!(reparsed.asr_language, "en");
+        assert_eq!(reparsed.live_caption_language, "zh");
     }
 
     #[test]
@@ -270,7 +306,10 @@ pub fn save_config(app: &AppHandle, config: &AppConfig) -> Result<()> {
     std::fs::create_dir_all(&data_dir)?;
 
     let config_path = data_dir.join("config.toml");
-    let content = toml::to_string_pretty(config)?;
+    let mut config = config.clone();
+    config.initialize_provider_configs();
+    config.validate_provider_configs()?;
+    let content = toml::to_string_pretty(&config)?;
     std::fs::write(&config_path, content)?;
     Ok(())
 }

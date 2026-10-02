@@ -1,6 +1,7 @@
-import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { getLiveCaptionBuildInfo } from '../api/liveCaption';
 import type { AppConfig } from '../types';
+import { buildSelectGroup } from './selectGroup';
+import { buildAsrProviderSelection } from './asrProviderSelection';
 
 /** 字幕字級的四檔預設值（像素），須與 src-tauri 的 FONT_SIZE_PRESETS 一致。 */
 const FONT_SIZE_PRESETS = [20, 24, 28, 36];
@@ -47,29 +48,7 @@ export function buildLiveCaptionSettings(
   const container = document.createElement('div');
   container.className = 'live-caption-settings';
 
-  const selectGroup = (
-    labelText: string,
-    options: Array<{ value: string; label: string }>,
-    selected: string,
-    update: (value: string) => void,
-  ): HTMLElement => {
-    const group = document.createElement('div');
-    group.className = 'form-group';
-    const label = document.createElement('label');
-    label.textContent = labelText;
-    const select = document.createElement('select');
-    select.className = 'form-control';
-    for (const option of options) {
-      const element = document.createElement('option');
-      element.value = option.value;
-      element.textContent = option.label;
-      element.selected = option.value === selected;
-      select.appendChild(element);
-    }
-    select.addEventListener('change', () => update(select.value));
-    group.append(label, select);
-    return group;
-  };
+  const selectGroup = buildSelectGroup;
 
   const numberGroup = (
     labelText: string,
@@ -134,20 +113,13 @@ export function buildLiveCaptionSettings(
     return group;
   };
 
-  // ── 轉錄後端 ──
-  container.appendChild(selectGroup(
-    '轉錄後端',
-    [
-      { value: 'local_whisper', label: '本地 Whisper（音訊不離開電腦）' },
-      { value: 'voxnote_asr', label: 'VoxNote 轉錄服務' },
-    ],
-    config.live_caption_backend || 'local_whisper',
-    (value) => {
-      config = { ...config, live_caption_backend: value as AppConfig['live_caption_backend'] };
-      onChange(config);
-      updateBackendVisibility(value);
-    },
-  ));
+  container.appendChild(buildAsrProviderSelection(config, 'live', (updated) => {
+    config = { ...config, live_caption_provider_id: updated.live_caption_provider_id,
+      live_caption_backend: updated.live_caption_backend,
+      live_caption_assemblyai_model: updated.live_caption_assemblyai_model };
+    onChange(config);
+    updateBackendVisibility(config.live_caption_backend);
+  }));
 
   // ── 來源語言 ──
   container.appendChild(selectGroup(
@@ -170,45 +142,7 @@ export function buildLiveCaptionSettings(
   languageHint.textContent = '此為即時字幕專屬的來源語言，與「設定」頁批次逐字稿的轉錄語言各自獨立、互不影響。';
   container.appendChild(languageHint);
 
-  // ── 遠端端點（VoxNote 轉錄服務專用）──
-  const remoteSection = document.createElement('div');
-  const remoteUrlGroup = document.createElement('div');
-  remoteUrlGroup.className = 'form-group';
-  const remoteUrlLabel = document.createElement('label');
-  remoteUrlLabel.textContent = '即時字幕遠端服務 Base URL';
-  const remoteUrlInput = document.createElement('input');
-  remoteUrlInput.type = 'url';
-  remoteUrlInput.className = 'form-control';
-  remoteUrlInput.value = config.live_caption_remote_base_url || '';
-  remoteUrlInput.placeholder = '留空則沿用批次逐字稿的自架 ASR 位址';
-  remoteUrlInput.addEventListener('input', () => {
-    config = { ...config, live_caption_remote_base_url: remoteUrlInput.value };
-    onChange(config);
-  });
-  remoteUrlGroup.append(remoteUrlLabel, remoteUrlInput);
-  const remoteUrlHint = document.createElement('small');
-  remoteUrlHint.className = 'form-hint';
-  remoteUrlHint.textContent = '可指向載入不同模型的另一服務實例（例如英文低延遲模型），與「設定」頁批次逐字稿所用的位址分開設定。';
-  remoteUrlGroup.appendChild(remoteUrlHint);
-  remoteSection.appendChild(remoteUrlGroup);
-
-  const remoteModelGroup = document.createElement('div');
-  remoteModelGroup.className = 'form-group';
-  const remoteModelLabel = document.createElement('label');
-  remoteModelLabel.textContent = '遠端模型名稱（選填）';
-  const remoteModelInput = document.createElement('input');
-  remoteModelInput.type = 'text';
-  remoteModelInput.className = 'form-control';
-  remoteModelInput.value = config.live_caption_remote_model || '';
-  remoteModelInput.placeholder = '依服務端設定，留空則使用服務端預設模型';
-  remoteModelInput.addEventListener('input', () => {
-    config = { ...config, live_caption_remote_model: remoteModelInput.value };
-    onChange(config);
-  });
-  remoteModelGroup.append(remoteModelLabel, remoteModelInput);
-  remoteSection.appendChild(remoteModelGroup);
-
-  remoteSection.appendChild(numberGroup(
+  const remoteTimeoutGroup = numberGroup(
     '即時逾時（秒）',
     config.live_caption_remote_timeout_seconds || 8,
     1,
@@ -219,45 +153,8 @@ export function buildLiveCaptionSettings(
       onChange(config);
     },
     '單一視窗請求超過此秒數即放棄該段並繼續處理後續音訊，與批次逐字稿的逾時分開設定。',
-  ));
-  container.appendChild(remoteSection);
-
-  // ── 模型檔 ──
-  const modelGroup = document.createElement('div');
-  modelGroup.className = 'form-group';
-  const modelLabel = document.createElement('label');
-  modelLabel.textContent = 'GGML 模型檔（.bin）';
-  const modelRow = document.createElement('div');
-  modelRow.className = 'directory-picker-row';
-  const modelInput = document.createElement('input');
-  modelInput.type = 'text';
-  modelInput.className = 'form-control';
-  modelInput.readOnly = true;
-  modelInput.value = config.live_caption_model_path || '';
-  modelInput.placeholder = '請選擇 ggml-small.bin 或 ggml-medium.bin';
-  const modelButton = document.createElement('button');
-  modelButton.type = 'button';
-  modelButton.className = 'btn btn-secondary btn-sm';
-  modelButton.textContent = '選擇檔案';
-  modelButton.addEventListener('click', async () => {
-    const selected = await openDialog({
-      multiple: false,
-      title: '選擇即時字幕 GGML 模型',
-      filters: [{ name: 'Whisper GGML 模型', extensions: ['bin'] }],
-    });
-    if (typeof selected === 'string') {
-      modelInput.value = selected;
-      config = { ...config, live_caption_model_path: selected };
-      onChange(config);
-    }
-  });
-  modelRow.append(modelInput, modelButton);
-  modelGroup.append(modelLabel, modelRow);
-  const modelHint = document.createElement('small');
-  modelHint.className = 'form-hint';
-  modelHint.textContent = '模型需自行下載；建議 small 或 medium。';
-  modelGroup.appendChild(modelHint);
-  container.appendChild(modelGroup);
+  );
+  container.appendChild(remoteTimeoutGroup);
 
   // ── 顯示相關 ──
   container.appendChild(selectGroup(
@@ -274,7 +171,7 @@ export function buildLiveCaptionSettings(
     },
   ));
 
-  container.appendChild(toggleGroup(
+  const incrementalGroup = toggleGroup(
     '增量字幕模式',
     config.live_caption_incremental_enabled === true,
     (checked) => {
@@ -282,9 +179,10 @@ export function buildLiveCaptionSettings(
       onChange(config);
     },
     '較早顯示字幕，但尚未確定的文字可能在後續解碼後被修正；不支援的後端會回退至視窗式輸出並提示。',
-  ));
+  );
+  container.appendChild(incrementalGroup);
 
-  container.appendChild(numberGroup(
+  const decodeIntervalGroup = numberGroup(
     '增量解碼間隔（毫秒）',
     config.live_caption_decode_interval_ms || 800,
     100,
@@ -295,7 +193,8 @@ export function buildLiveCaptionSettings(
       onChange(config);
     },
     '必須短於分析視窗長度；間隔越短延遲越低，但解碼負載越高。',
-  ));
+  );
+  container.appendChild(decodeIntervalGroup);
 
   container.appendChild(toggleGroup(
     '翻譯成繁體中文',
@@ -362,27 +261,11 @@ export function buildLiveCaptionSettings(
   // ── 視窗長度情境預設 ──
   // 主要操作路徑：使用者選情境即可，不需理解「視窗長度」「步進」的意義。
   // 精確調整仍保留在下方的進階區塊，供想直接輸入秒數的使用者使用。
-  const sceneGroup = document.createElement('div');
-  sceneGroup.className = 'form-group';
-  const sceneLabel = document.createElement('label');
-  sceneLabel.textContent = '字幕情境';
-  const sceneSelect = document.createElement('select');
-  sceneSelect.className = 'form-control';
-  for (const preset of WINDOW_SCENE_PRESETS) {
-    const option = document.createElement('option');
-    option.value = preset.value;
-    option.textContent = preset.label;
-    sceneSelect.appendChild(option);
-  }
-  const customOption = document.createElement('option');
-  customOption.value = CUSTOM_WINDOW_SCENE;
-  customOption.textContent = '自訂';
-  // 「自訂」僅為狀態顯示（手動調整後的數值不匹配任何情境時顯示），
-  // 不可被使用者主動選取——選取它沒有對應的秒數可套用，等於無效選項。
-  customOption.disabled = true;
-  sceneSelect.appendChild(customOption);
-  sceneGroup.appendChild(sceneLabel);
-  sceneGroup.appendChild(sceneSelect);
+  const sceneGroup = selectGroup('字幕情境', [
+    ...WINDOW_SCENE_PRESETS.map((preset) => ({ value: preset.value, label: preset.label })),
+    { value: CUSTOM_WINDOW_SCENE, label: '自訂', disabled: true },
+  ], matchWindowScene(config.live_caption_window_seconds, config.live_caption_step_seconds), () => {});
+  const sceneSelect = sceneGroup.select;
   const sceneHint = document.createElement('small');
   sceneHint.className = 'form-hint';
   sceneHint.textContent = '語速快、字幕常在句中被切斷時選較長的情境；想盡快看到字可選較短的情境。可於下方「進階字幕參數」精確調整。';
@@ -458,7 +341,7 @@ export function buildLiveCaptionSettings(
   const syncSceneFromValues = (): void => {
     const windowSeconds = Number(windowSecondsInput.value);
     const stepSeconds = Number(stepSecondsInput.value);
-    sceneSelect.value = matchWindowScene(windowSeconds, stepSeconds);
+    sceneGroup.setValue(matchWindowScene(windowSeconds, stepSeconds));
   };
   windowSecondsInput.addEventListener('change', () => {
     const next = Number(windowSecondsInput.value);
@@ -519,8 +402,12 @@ export function buildLiveCaptionSettings(
   advancedBody.appendChild(gpuStatus);
 
   const updateBackendVisibility = (backend: string): void => {
-    modelGroup.style.display = backend === 'local_whisper' ? '' : 'none';
-    remoteSection.style.display = backend === 'voxnote_asr' ? '' : 'none';
+    remoteTimeoutGroup.hidden = backend !== 'voxnote_asr';
+    const streaming = backend === 'assemblyai_streaming';
+    incrementalGroup.style.display = streaming ? 'none' : '';
+    decodeIntervalGroup.style.display = streaming ? 'none' : '';
+    sceneGroup.style.display = streaming ? 'none' : '';
+    advancedDetails.style.display = streaming ? 'none' : '';
   };
   updateBackendVisibility(config.live_caption_backend || 'local_whisper');
 

@@ -25,6 +25,7 @@ import { save as saveDialog, open as openDialog } from '@tauri-apps/plugin-dialo
 import { exportMeetingBundle } from '../api/meetingExport';
 import { isProcessing, startProcessing, finishProcessing, onProcessingComplete } from '../utils/processingState';
 import { notifyCompletion } from '../utils/notifications';
+import { getSelectedAsrProvider } from '../utils/asrProviders';
 
 type TranscriptVersion = 'original' | 'proofread' | 'manual';
 type ManualBaseVersion = 'original' | 'proofread';
@@ -149,7 +150,7 @@ async function loadVoiceprintProposals(
     return;
   }
   // AssemblyAI 為黑箱 API，不暴露嵌入向量，本能力僅本地 ASR 供應商啟用
-  if (config.asr_provider !== 'voxnote_asr') return;
+  if (getSelectedAsrProvider(config, 'batch')?.kind !== 'voxnote_asr') return;
 
   const [mergeProposals, linkProposals, identityProposals] = await Promise.all([
     getWithinRecordingMergeProposals(meetingId).catch(() => []),
