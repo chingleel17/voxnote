@@ -326,6 +326,21 @@ select.form-control { appearance: none; background-image: url("data:image/svg+xm
 .input-row { display: flex; gap: 8px; align-items: center; }
 .input-row .form-control { flex: 1; }
 
+.settings-icon-btn {
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.settings-icon-btn[aria-pressed="true"] {
+  color: var(--color-accent);
+  border-color: var(--color-accent);
+}
+
 /* ============================================================
    共用元件：卡片
    ============================================================ */

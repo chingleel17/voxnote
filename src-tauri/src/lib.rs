@@ -114,6 +114,7 @@ pub fn run() {
             commit_temporary_recording,
             delete_recording,
             set_no_break_before,
+            set_recording_speaker_count,
             reorder_recordings,
             remerge_segments,
             // settings
@@ -122,6 +123,7 @@ pub fn run() {
             test_ollama_connection,
             test_local_asr_connection,
             get_ollama_models,
+            list_provider_models,
             test_llm_connection_cmd,
             // ai
             proofread_transcript,

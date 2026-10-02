@@ -14,6 +14,8 @@ export const testOllamaConnection = (endpoint: string) => invoke<boolean>('test_
 export const testLocalAsrConnection = (baseUrl: string) =>
   invoke<boolean>('test_local_asr_connection', { baseUrl });
 export const getOllamaModels = (endpoint: string) => invoke<string[]>('get_ollama_models', { endpoint });
+export const listProviderModels = (provider: string) =>
+  invoke<string[]>('list_provider_models', { provider });
 export const detectLocalAsrTools = () => invoke<LocalAsrInfo[]>('detect_local_asr_tools');
 export const startTranscription = (meetingId: string, recordingId: string, filePath: string) =>
   invoke<string>('start_transcription', { meetingId, recordingId, filePath });

@@ -2,6 +2,8 @@
 
 定義即時字幕如何從連續音訊產生逐步穩定的文字：以小於視窗長度的步進重複解碼，並依連續解碼結果的一致程度判定文字是否已穩定，使字幕延遲不再受限於視窗長度。
 
+本規格所有解碼、一致性判定、視窗回退及固定 4 秒段落規則僅適用於本地 Whisper／自架 ASR 的增量解碼路徑，不適用於 AssemblyAI 原生串流；後者的暫定及完成契約由 `assemblyai-streaming-caption` 定義。
+
 ## ADDED Requirements
 
 ### Requirement: System emits caption text before the analysis window is full

@@ -9,7 +9,7 @@ use crate::{
     backup::DataOperationLock,
     commands::ai_cmds::proofread_recording_segment_with_config,
     config::load_config,
-    db::{meeting, recording, transcript, voiceprint},
+    db::{recording, transcript, voiceprint},
 };
 
 fn emit_asr_progress(app: &AppHandle, meeting_id: &str, message: &str) {
@@ -37,13 +37,16 @@ pub async fn start_transcription(
     let _guard = data_lock.try_begin_write()?;
     let config = load_config(&app).map_err(|e| e.to_string())?;
 
-    // 預期講者人數取自該會議的與會人員數，可提升語者分離準確度；取不到時以 0 表示未知
-    let speakers_expected = meeting::get_meeting(&pool, &meeting_id)
+    // 整場與會名單不代表每段實際發言人數；未指定時交由供應商自動判斷。
+    let segment = recording::get_recording_by_id(&pool, &recording_id)
         .await
-        .ok()
-        .flatten()
-        .map(|m| m.participants.len() as u32)
-        .unwrap_or(0);
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "找不到錄音段落".to_string())?;
+    if segment.meeting_id != meeting_id {
+        return Err("錄音段落不屬於此會議".into());
+    }
+    recording::validate_speaker_count(segment.speaker_count).map_err(|e| e.to_string())?;
+    let speakers_expected = segment.speaker_count.unwrap_or(0) as u32;
 
     let mut diarization_degraded = false;
     let text = match config.asr_provider.as_str() {

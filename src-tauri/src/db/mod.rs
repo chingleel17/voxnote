@@ -108,6 +108,7 @@ CREATE TABLE IF NOT EXISTS recordings (
     segment_transcript TEXT,
     segment_proofread TEXT,
     diarization_degraded INTEGER NOT NULL DEFAULT 0,
+    speaker_count INTEGER DEFAULT NULL,
     created_at TEXT NOT NULL,
     FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
 );
@@ -259,6 +260,9 @@ pub async fn init_db(app: &AppHandle) -> Result<SqlitePool> {
         sqlx::query("ALTER TABLE recordings ADD COLUMN no_break_before INTEGER NOT NULL DEFAULT 0")
             .execute(&pool)
             .await;
+    let _ = sqlx::query("ALTER TABLE recordings ADD COLUMN speaker_count INTEGER DEFAULT NULL")
+        .execute(&pool)
+        .await;
     let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN manual_content TEXT")
         .execute(&pool)
         .await;

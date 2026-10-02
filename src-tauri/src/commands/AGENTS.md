@@ -11,7 +11,7 @@ Tauri IPC handlers。所有 `#[tauri::command]` 函式在此，前端透過 `inv
 | `recording_cmds.rs` | get_recording, get_recordings, save_recording, import_recording_file, delete_recording |
 | `transcript_cmds.rs` | get_transcript, save_transcript_original, save_transcript_proofread, switch_transcript_version |
 | `summary_cmds.rs` | get_summary, save_summary |
-| `settings_cmds.rs` | get_settings, save_settings, test_ollama_connection, get_ollama_models, test_llm_connection_cmd |
+| `settings_cmds.rs` | get_settings, save_settings, test_ollama_connection, get_ollama_models, list_provider_models, test_llm_connection_cmd |
 | `ai_cmds.rs` | proofread_transcript, generate_summary |
 | `asr_cmds.rs` | detect_local_asr_tools, start_transcription |
 | `tag_cmds.rs` | get_tags, create_tag, delete_tag, set_meeting_tags |

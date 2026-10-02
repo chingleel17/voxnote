@@ -4,7 +4,7 @@ import type { MeetingWithDetails, Transcript, Summary, Recording, SavedParticipa
 import { getMeeting, getCategories, updateMeeting, archiveMeeting, unarchiveMeeting } from '../api/meetings';
 import { exportTextFileToPath, getTranscript, saveTranscriptManual, saveTranscriptProofread, switchTranscriptVersion } from '../api/transcripts';
 import { getSummary } from '../api/summaries';
-import { getRecordings, deleteRecording, setNoBreakBefore, reorderRecordings, remergeSegments, importRecordingFiles } from '../api/recordings';
+import { getRecordings, deleteRecording, setNoBreakBefore, setRecordingSpeakerCount, reorderRecordings, remergeSegments, importRecordingFiles } from '../api/recordings';
 import { startTranscription, proofreadRecordingSegment, proofreadTranscript, generateSummary } from '../api/settings';
 import { getSavedParticipants, upsertSavedParticipant } from '../api/participants';
 import { deleteSpeakerMapping, getSpeakerMappings, upsertSpeakerMapping } from '../api/speakerMappings';
@@ -2476,6 +2476,52 @@ function buildRecordingSection(
       segWrap.appendChild(audioEl);
       segWrap.appendChild(playerEl);
 
+      const speakerCountGroup = document.createElement('div');
+      speakerCountGroup.className = 'form-group';
+      const speakerCountLabel = document.createElement('label');
+      speakerCountLabel.textContent = '本段發言人數';
+      const speakerCountInput = document.createElement('input');
+      speakerCountInput.type = 'number';
+      speakerCountInput.min = '1';
+      speakerCountInput.max = '20';
+      speakerCountInput.step = '1';
+      speakerCountInput.placeholder = '自動判斷';
+      speakerCountInput.className = 'form-control';
+      speakerCountInput.id = `speaker-count-${rec.id}`;
+      speakerCountLabel.htmlFor = speakerCountInput.id;
+      speakerCountInput.value = rec.speaker_count == null ? '' : String(rec.speaker_count);
+      speakerCountInput.disabled = inProgress;
+      const speakerCountHint = document.createElement('small');
+      speakerCountHint.className = 'form-hint';
+      speakerCountHint.id = `${speakerCountInput.id}-hint`;
+      speakerCountHint.textContent = '輸入 1～20 人，留空為自動判斷。只計算本段實際發言的人；啟用語者分離時生效，變更後需重新轉譯。';
+      speakerCountInput.setAttribute('aria-describedby', speakerCountHint.id);
+      speakerCountInput.addEventListener('change', async () => {
+        const previous = rec.speaker_count;
+        if (!speakerCountInput.checkValidity()) {
+          speakerCountInput.reportValidity();
+          speakerCountInput.value = previous == null ? '' : String(previous);
+          return;
+        }
+        const count = speakerCountInput.value === '' ? null : speakerCountInput.valueAsNumber;
+        if (count === (previous ?? null)) return;
+        speakerCountInput.disabled = true;
+        transcribeBtn.disabled = true;
+        try {
+          await setRecordingSpeakerCount(rec.id, count);
+          rec.speaker_count = count;
+          showToast('本段發言人數已儲存，下次轉譯時套用', 'success');
+        } catch (err) {
+          speakerCountInput.value = previous == null ? '' : String(previous);
+          showToast(`儲存發言人數失敗：${String(err)}`, 'error');
+        } finally {
+          speakerCountInput.disabled = inProgress || isProcessing(transcribeKey);
+          transcribeBtn.disabled = inProgress || isProcessing(transcribeKey);
+        }
+      });
+      speakerCountGroup.append(speakerCountLabel, speakerCountInput, speakerCountHint);
+      segWrap.appendChild(speakerCountGroup);
+
       // 操作列
       const segActions = document.createElement('div');
       segActions.className = 'recording-segment-actions';
@@ -2526,6 +2572,7 @@ function buildRecordingSection(
         const key = `transcribe:${rec.id}`;
         if (isProcessing(key)) return;
         startProcessing(key, buildProcessingLabel(meetingTitle, '轉譯中', segIndex));
+        speakerCountInput.disabled = true;
         transcribeBtn.disabled = true;
         transcribeBtn.textContent = '轉譯中…';
         statusBadge.className = 'recording-segment-status processing';
@@ -2563,6 +2610,7 @@ function buildRecordingSection(
           statusBadge.textContent = rec.segment_transcript ? '已轉譯' : '未轉譯';
         } finally {
           unlistenProgress();
+          speakerCountInput.disabled = false;
         }
       });
       segActions.appendChild(transcribeBtn);

@@ -6,7 +6,71 @@ use uuid::Uuid;
 use super::models::Recording;
 
 const SELECT_COLS: &str =
-    "id, meeting_id, file_path, original_file_name, duration_seconds, source_mode, sort_order, segment_transcript, segment_proofread, diarization_degraded, no_break_before, created_at";
+    "id, meeting_id, file_path, original_file_name, duration_seconds, source_mode, sort_order, segment_transcript, segment_proofread, diarization_degraded, no_break_before, speaker_count, created_at";
+
+// 維持目前應用程式可指定的人數範圍；None 表示不向供應商指定人數。
+pub const MAX_SPEAKER_COUNT: i64 = 20;
+
+pub fn validate_speaker_count(speaker_count: Option<i64>) -> Result<()> {
+    if speaker_count.is_some_and(|count| !(1..=MAX_SPEAKER_COUNT).contains(&count)) {
+        anyhow::bail!("本段發言人數須為 1 至 {} 的整數，或選擇自動判斷", MAX_SPEAKER_COUNT);
+    }
+    Ok(())
+}
+
+pub async fn set_speaker_count(
+    pool: &SqlitePool,
+    recording_id: &str,
+    speaker_count: Option<i64>,
+) -> Result<()> {
+    validate_speaker_count(speaker_count)?;
+    let result = sqlx::query("UPDATE recordings SET speaker_count = ? WHERE id = ?")
+        .bind(speaker_count)
+        .bind(recording_id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        anyhow::bail!("找不到錄音段落");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod speaker_count_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn recording_counts_are_independent_nullable_and_validated() -> Result<()> {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await?;
+        sqlx::raw_sql(super::super::MIGRATION_SQL).execute(&pool).await?;
+        sqlx::query("ALTER TABLE recordings ADD COLUMN no_break_before INTEGER NOT NULL DEFAULT 0")
+            .execute(&pool).await?;
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES ('meeting', 'meeting', 'now', 'now')")
+            .execute(&pool).await?;
+        let first = create_recording(&pool, "meeting", None, None, None, None).await?;
+        let second = create_recording(&pool, "meeting", None, None, None, None).await?;
+        assert_eq!(first.speaker_count, None);
+        assert_eq!(second.speaker_count, None);
+        set_speaker_count(&pool, &first.id, Some(8)).await?;
+        set_speaker_count(&pool, &second.id, Some(3)).await?;
+        let recordings = get_recordings(&pool, "meeting").await?;
+        assert_eq!(recordings[0].speaker_count, Some(8));
+        assert_eq!(recordings[1].speaker_count, Some(3));
+        for invalid in [-1, 0, MAX_SPEAKER_COUNT + 1] {
+            assert!(set_speaker_count(&pool, &second.id, Some(invalid)).await.is_err());
+        }
+        assert_eq!(get_recording_by_id(&pool, &second.id).await?.expect("錄音應存在").speaker_count, Some(3));
+        set_speaker_count(&pool, &second.id, None).await?;
+        assert_eq!(get_recording_by_id(&pool, &second.id).await?.expect("錄音應存在").speaker_count, None);
+        assert_eq!(get_recording_by_id(&pool, &first.id).await?.expect("錄音應存在").speaker_count, Some(8));
+        assert!(set_speaker_count(&pool, "missing", Some(3)).await.is_err());
+        pool.close().await;
+        Ok(())
+    }
+}
 
 pub async fn get_recording(pool: &SqlitePool, meeting_id: &str) -> Result<Option<Recording>> {
     let sql = format!("SELECT {SELECT_COLS} FROM recordings WHERE meeting_id = ? ORDER BY sort_order ASC, created_at ASC LIMIT 1");

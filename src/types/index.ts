@@ -82,6 +82,7 @@ export interface Recording {
   segment_proofread: string | null;
   diarization_degraded: number;
   no_break_before: number;
+  speaker_count: number | null;
   created_at: string;
 }
 
@@ -164,7 +165,7 @@ export interface AppConfig {
   // ASR
   asr_provider: 'assemblyai' | 'local' | 'voxnote_asr';
   assembly_ai_key: string;
-  assembly_ai_speech_model: 'universal-2' | 'universal-3-pro';
+  assembly_ai_speech_model: string;
   recording_storage_dir: string;
   archive_storage_dir: string;
   recording_source_mode: RecordingSourceMode;
