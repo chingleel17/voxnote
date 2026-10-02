@@ -253,7 +253,9 @@ pub async fn start_desktop_recording(
     manager: State<'_, DesktopRecordingManager>,
     live_caption_manager: State<'_, LiveCaptionManager>,
 ) -> Result<(), String> {
-    if live_caption_manager.status().active {
+    let _capture_start =
+        audio_recording::reserve_capture_start().map_err(|error| error.to_string())?;
+    if live_caption_manager.has_session() {
         return Err("目前有即時字幕進行中，無法開始桌面錄音".into());
     }
     audio_recording::start_recording(manager.inner(), &app_handle, request)

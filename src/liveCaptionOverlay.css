@@ -98,8 +98,7 @@ body {
   display: flex;
   flex: 1;
   flex-direction: column;
-  /* 貼齊底部並依實際高度顯示歷史段；超長段落保留全文並在內容區捲動。 */
-  justify-content: flex-end;
+  /* 首段的 auto 外距在溢出時會縮為零，讓內容頂端仍可捲到。 */
   gap: 5px;
   min-height: 0;
   overflow-x: hidden;
@@ -117,6 +116,11 @@ body {
   text-align: center;
   text-shadow: 0 2px 5px rgba(0, 0, 0, 0.85);
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.caption-line:first-child {
+  margin-top: auto;
 }
 
 .caption-history {
@@ -134,4 +138,9 @@ body {
   color: var(--caption-muted);
   font-style: italic;
   opacity: 0.78;
+}
+
+.caption-line.caption-tentative:not(:has(.caption-tentative-text)) {
+  color: var(--caption-muted);
+  font-style: italic;
 }

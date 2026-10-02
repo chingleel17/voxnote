@@ -68,6 +68,12 @@ export async function renderLiveCaptionPage(container: HTMLElement): Promise<voi
   let pendingConfig: AppConfig = config;
   let dirty = false;
   let currentActive = false;
+  let starting = false;
+  let stopping = false;
+  let startRequested = false;
+  let cancellationRequested = false;
+  let startingSessionId: string | null = null;
+  let activeSessionId: string | null = null;
 
   const restartHint = document.createElement('p');
   restartHint.className = 'form-hint live-caption-restart-hint';
@@ -115,10 +121,11 @@ export async function renderLiveCaptionPage(container: HTMLElement): Promise<voi
 
   const setStatus = (current: LiveCaptionStatus): void => {
     currentActive = current.active;
+    activeSessionId = current.session_id;
     status.textContent = current.active ? '狀態：進行中，字幕視窗已開啟' : '狀態：未啟動';
-    startButton.disabled = current.active;
-    stopButton.disabled = !current.active;
-    sourceSelect.disabled = current.active;
+    startButton.disabled = current.active || starting || stopping;
+    stopButton.disabled = stopping || (!current.active && !starting);
+    sourceSelect.disabled = current.active || starting || stopping;
     // 未啟動時重新開始就會套用設定，不需再提示。
     if (!current.active) restartHint.hidden = true;
   };
@@ -153,7 +160,13 @@ export async function renderLiveCaptionPage(container: HTMLElement): Promise<voi
 
   startButton.addEventListener('click', async () => {
     errorBox.hidden = true;
+    starting = true;
+    startRequested = false;
+    cancellationRequested = false;
+    startingSessionId = crypto.randomUUID();
     startButton.disabled = true;
+    stopButton.disabled = false;
+    sourceSelect.disabled = true;
     try {
       // 後端在啟動時才讀取設定檔，故必須先確定變更已落盤，否則本次啟動會沿用舊值。
       const source = sourceSelect.value as 'microphone' | 'system';
@@ -171,27 +184,61 @@ export async function renderLiveCaptionPage(container: HTMLElement): Promise<voi
         dirty = false;
         restartHint.hidden = true;
       }
-      const current = await startLiveCaption(source);
+      if (cancellationRequested) return;
+      startRequested = true;
+      const current = await startLiveCaption(source, startingSessionId);
+      if (cancellationRequested) {
+        if (current.active && current.session_id) setStatus(await stopLiveCaption(current.session_id));
+        return;
+      }
       setStatus(current);
       showToast('即時字幕已啟動，請將浮動視窗拖到影片上方。', 'success');
     } catch (error) {
+      if (cancellationRequested) return;
       errorBox.hidden = false;
       errorBox.textContent = `啟動失敗：${String(error)}`;
       showToast(`即時字幕啟動失敗：${String(error)}`, 'error', 5000);
       startButton.disabled = false;
+    } finally {
+      starting = false;
+      startRequested = false;
+      startingSessionId = null;
+      try {
+        setStatus(await getLiveCaptionStatus());
+      } catch {
+        startButton.disabled = currentActive || stopping;
+        stopButton.disabled = stopping || !currentActive;
+        sourceSelect.disabled = currentActive || stopping;
+      }
     }
   });
 
   stopButton.addEventListener('click', async () => {
     stopButton.disabled = true;
+    if (starting) {
+      cancellationRequested = true;
+      if (!startRequested) return;
+    }
+    stopping = true;
+    startButton.disabled = true;
     try {
-      setStatus(await stopLiveCaption());
+      setStatus(await stopLiveCaption((starting ? startingSessionId : activeSessionId) ?? undefined));
       showToast('即時字幕已停止。', 'success');
     } catch (error) {
+      if (starting && cancellationRequested) return;
       errorBox.hidden = false;
       errorBox.textContent = `停止失敗：${String(error)}`;
       showToast(`即時字幕停止失敗：${String(error)}`, 'error');
       stopButton.disabled = false;
+    } finally {
+      stopping = false;
+      try {
+        setStatus(await getLiveCaptionStatus());
+      } catch {
+        startButton.disabled = currentActive || starting;
+        stopButton.disabled = !currentActive && !starting;
+        sourceSelect.disabled = currentActive || starting;
+      }
     }
   });
 

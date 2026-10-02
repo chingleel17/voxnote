@@ -24,8 +24,20 @@ const TARGET_CHANNELS: usize = 1;
 const TEMP_RECORDING_DIR: &str = "temp-recordings";
 const TEMP_RECORDING_TTL_HOURS: u64 = 24;
 
-pub(crate) type SharedQueue = Arc<Mutex<VecDeque<f32>>>;
+mod queue;
+pub(crate) use queue::AudioQueue;
+
+pub(crate) type SharedQueue = Arc<Mutex<AudioQueue>>;
 pub(crate) type SharedError = Arc<Mutex<Option<String>>>;
+
+static CAPTURE_START_LOCK: Mutex<()> = Mutex::new(());
+
+/// 兩種即時收音流程共用啟動 reservation，讓檢查對方狀態與建立 session 不會競態。
+pub(crate) fn reserve_capture_start() -> Result<std::sync::MutexGuard<'static, ()>> {
+    CAPTURE_START_LOCK
+        .try_lock()
+        .map_err(|_| anyhow!("目前有其他音訊來源正在啟動，請稍後再試"))
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -275,8 +287,8 @@ fn run_recording_session(
     let running = Arc::new(AtomicBool::new(true));
     let level_value = Arc::new(Mutex::new(0.0f32));
     let error_state: SharedError = Arc::new(Mutex::new(None));
-    let mic_queue: SharedQueue = Arc::new(Mutex::new(VecDeque::new()));
-    let system_queue: SharedQueue = Arc::new(Mutex::new(VecDeque::new()));
+    let mic_queue: SharedQueue = Arc::new(Mutex::new(AudioQueue::default()));
+    let system_queue: SharedQueue = Arc::new(Mutex::new(AudioQueue::default()));
 
     let mut mic_stream: Option<Stream> = None;
     if request.mode.needs_microphone() {

@@ -1,10 +1,9 @@
 use anyhow::{anyhow, Result};
-use futures_util::{future::BoxFuture, FutureExt, SinkExt, StreamExt};
+use futures_util::{future::BoxFuture, SinkExt, StreamExt};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
-use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use tokio_tungstenite::{
@@ -18,16 +17,986 @@ use tokio_tungstenite::{
 const ASSEMBLYAI_STREAMING_ENDPOINT: &str = "wss://streaming.assemblyai.com/v3/ws";
 const AUDIO_FRAME_SAMPLES: usize = 1_600;
 const MIN_AUDIO_FRAME_SAMPLES: usize = 800;
+#[cfg(test)]
 const MAX_PENDING_SAMPLES: usize = 32_000;
 const DROP_NOTICE_THROTTLE: std::time::Duration = std::time::Duration::from_secs(5);
 const AUDIO_SEND_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const AUDIO_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const FORMATTING_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_SESSION_DURATION: Duration = Duration::from_secs(180 * 60);
+const SHUTDOWN_BUDGET: Duration = Duration::from_millis(4_500);
+const TERMINATION_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_POSTPROCESS_RUNNING: usize = 2;
+const MAX_POSTPROCESS_PENDING: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CaptionPhase {
     Partial,
     Final,
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::audio_recording::AudioQueue;
+    use std::sync::{atomic::AtomicUsize, Mutex};
+    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+    #[derive(Default)]
+    struct Observed {
+        captions: Mutex<Vec<super::super::LiveCaptionPayload>>,
+        notices: Mutex<Vec<String>>,
+        audio: Mutex<Vec<Vec<u8>>>,
+        audio_dispatch_times: Mutex<Vec<tokio::time::Instant>>,
+        controls: Mutex<Vec<String>>,
+        drops: AtomicUsize,
+        calls: AtomicUsize,
+        started_work: AtomicUsize,
+        cancelled_work: AtomicUsize,
+        ready: AtomicUsize,
+        capture_stops: AtomicUsize,
+        read_fail: AtomicBool,
+        write_fail: AtomicBool,
+        llm_fail: AtomicBool,
+    }
+
+    struct Sink(Arc<Observed>);
+    impl SessionEventSink for Sink {
+        fn caption(&mut self, payload: super::super::LiveCaptionPayload) {
+            self.0.captions.lock().expect("字幕鎖").push(payload);
+        }
+        fn notice(&mut self, message: &'static str) {
+            self.0.notices.lock().expect("提示鎖").push(message.into());
+        }
+        fn ready(&mut self) {
+            self.0.ready.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct FakeLlm {
+        observed: Arc<Observed>,
+        blocked: bool,
+    }
+    struct BlockedWork(Arc<Observed>);
+    impl Drop for BlockedWork {
+        fn drop(&mut self) {
+            self.0.cancelled_work.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl Postprocessor for FakeLlm {
+        fn process(
+            &self,
+            _config: crate::config::AppConfig,
+            order: u64,
+            original: String,
+            translate: bool,
+        ) -> PostprocessFuture {
+            self.observed.calls.fetch_add(1, Ordering::SeqCst);
+            let fail = self.observed.llm_fail.load(Ordering::SeqCst);
+            let observed = self.observed.clone();
+            if self.blocked {
+                Box::pin(async move {
+                    observed.started_work.fetch_add(1, Ordering::SeqCst);
+                    let _guard = BlockedWork(observed);
+                    std::future::pending().await
+                })
+            } else {
+                Box::pin(async move {
+                    observed.started_work.fetch_add(1, Ordering::SeqCst);
+                    (
+                        order,
+                        original,
+                        translate,
+                        if fail {
+                            Err(anyhow!("mock private detail"))
+                        } else {
+                            Ok("校稿或譯文".into())
+                        },
+                    )
+                })
+            }
+        }
+    }
+
+    struct FakeSocket {
+        incoming: UnboundedReceiver<ServerFrame>,
+        responder: UnboundedSender<ServerFrame>,
+        observed: Arc<Observed>,
+        acknowledge: bool,
+        blocked_write: bool,
+        write_delay: Duration,
+    }
+    impl Drop for FakeSocket {
+        fn drop(&mut self) {
+            self.observed.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl StreamingSocket for FakeSocket {
+        fn send_binary<'a>(&'a mut self, bytes: Vec<u8>) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                let dispatched_at = tokio::time::Instant::now();
+                if self.blocked_write {
+                    std::future::pending::<()>().await;
+                }
+                if !self.write_delay.is_zero() {
+                    tokio::time::sleep(self.write_delay).await;
+                }
+                if self.observed.write_fail.load(Ordering::SeqCst) {
+                    return Err(anyhow!("mock write error"));
+                }
+                self.observed.audio.lock().expect("封包鎖").push(bytes);
+                self.observed
+                    .audio_dispatch_times
+                    .lock()
+                    .expect("節奏鎖")
+                    .push(dispatched_at);
+                Ok(())
+            })
+        }
+        fn send_text<'a>(&'a mut self, text: String) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                self.observed.controls.lock().expect("控制鎖").push(text);
+                if self.acknowledge {
+                    let _ = self
+                        .responder
+                        .send(ServerFrame::Text(r#"{"type":"Termination"}"#.into()));
+                }
+                Ok(())
+            })
+        }
+        fn receive<'a>(&'a mut self) -> BoxFuture<'a, Result<ServerFrame>> {
+            Box::pin(async move {
+                let frame = self.incoming.recv().await.unwrap_or(ServerFrame::Closed);
+                if self.observed.read_fail.load(Ordering::SeqCst) {
+                    return Err(anyhow!("mock read error"));
+                }
+                Ok(frame)
+            })
+        }
+    }
+
+    struct FakeConnector {
+        socket: Mutex<Option<FakeSocket>>,
+        pending: bool,
+    }
+    impl StreamingConnector for FakeConnector {
+        fn connect<'a>(
+            &'a self,
+            _url: &'a str,
+            _authorization: &'a str,
+        ) -> BoxFuture<'a, Result<Box<dyn StreamingSocket>>> {
+            Box::pin(async move {
+                if self.pending {
+                    std::future::pending::<()>().await;
+                }
+                Ok(Box::new(
+                    self.socket
+                        .lock()
+                        .expect("socket 鎖")
+                        .take()
+                        .expect("單次連線"),
+                ) as Box<dyn StreamingSocket>)
+            })
+        }
+    }
+
+    fn fixture(
+        acknowledge: bool,
+        blocked_write: bool,
+        pending_connect: bool,
+    ) -> (FakeConnector, UnboundedSender<ServerFrame>, Arc<Observed>) {
+        let (sender, incoming) = unbounded_channel();
+        let observed = Arc::new(Observed::default());
+        (
+            FakeConnector {
+                socket: Mutex::new(Some(FakeSocket {
+                    incoming,
+                    responder: sender.clone(),
+                    observed: observed.clone(),
+                    acknowledge,
+                    blocked_write,
+                    write_delay: Duration::ZERO,
+                })),
+                pending: pending_connect,
+            },
+            sender,
+            observed,
+        )
+    }
+
+    async fn drive(
+        connector: &FakeConnector,
+        observed: Arc<Observed>,
+        queue: &crate::audio_recording::SharedQueue,
+        running: &AtomicBool,
+        stop_rx: mpsc::Receiver<()>,
+        ready_tx: mpsc::SyncSender<Result<()>>,
+        deadline: Instant,
+        blocked_llm: bool,
+    ) -> Result<()> {
+        let mut config = crate::config::AppConfig::default();
+        config.live_caption_language = "auto".into();
+        config.live_caption_translate = true;
+        config.live_caption_display_mode = "both".into();
+        drive_config(
+            connector,
+            observed,
+            queue,
+            running,
+            stop_rx,
+            ready_tx,
+            deadline,
+            blocked_llm,
+            config,
+        )
+        .await
+    }
+
+    async fn drive_config(
+        connector: &FakeConnector,
+        observed: Arc<Observed>,
+        queue: &crate::audio_recording::SharedQueue,
+        running: &AtomicBool,
+        stop_rx: mpsc::Receiver<()>,
+        ready_tx: mpsc::SyncSender<Result<()>>,
+        deadline: Instant,
+        blocked_llm: bool,
+        config: crate::config::AppConfig,
+    ) -> Result<()> {
+        let mut sink = Sink(observed.clone());
+        let mut stop_capture = || {
+            assert!(!queue.lock().expect("停止閘門").is_accepting());
+            assert!(!running.load(Ordering::SeqCst));
+            observed.capture_stops.fetch_add(1, Ordering::SeqCst);
+        };
+        let llm = FakeLlm {
+            observed: observed.clone(),
+            blocked: blocked_llm,
+        };
+        run_session_with(
+            connector,
+            &llm,
+            &mut sink,
+            build_connection_config("offline-test-key", "test-model", "auto"),
+            &config,
+            queue,
+            &Arc::new(Mutex::new(None)),
+            running,
+            stop_rx,
+            ready_tx,
+            deadline,
+            &mut stop_capture,
+        )
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_session_uses_single_queue_final_once_and_freezes_before_capture_stop() {
+        let (connector, server, observed) = fixture(true, false, false);
+        let queue = Arc::new(Mutex::new(AudioQueue::bounded(MAX_PENDING_SAMPLES)));
+        queue
+            .lock()
+            .expect("queue")
+            .extend(vec![0.25; AUDIO_FRAME_SAMPLES]);
+        let running = AtomicBool::new(true);
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        server
+            .send(ServerFrame::Text(
+                r#"{"type":"Begin","configuration":{"model":"test-model"}}"#.into(),
+            ))
+            .expect("Begin");
+        let driver = async {
+            while ready_rx.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+            server
+                .send(ServerFrame::Text(
+                    r#"{"type":"Turn","turn_order":0,"transcript":"Hello","end_of_turn":false}"#
+                        .into(),
+                ))
+                .expect("partial");
+            server.send(ServerFrame::Text(r#"{"type":"Turn","turn_order":0,"transcript":"Hello!","end_of_turn":true,"turn_is_formatted":true}"#.into())).expect("final");
+            server.send(ServerFrame::Text(r#"{"type":"Turn","turn_order":0,"transcript":"stale","end_of_turn":true,"turn_is_formatted":true}"#.into())).expect("重送");
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(Duration::from_millis(100)).await;
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            queue.lock().expect("queue").extend(vec![0.5; 400]);
+            stop_tx.send(()).expect("停止");
+        };
+        let (result, ()) = tokio::join!(
+            drive(
+                &connector,
+                observed.clone(),
+                &queue,
+                &running,
+                stop_rx,
+                ready_tx,
+                Instant::now() + Duration::from_secs(10),
+                false
+            ),
+            driver
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(observed.ready.load(Ordering::SeqCst), 1);
+        assert_eq!(observed.calls.load(Ordering::SeqCst), 1);
+        let captions = observed.captions.lock().expect("captions");
+        assert_eq!(
+            captions
+                .iter()
+                .map(|c| c.phase.as_str())
+                .collect::<Vec<_>>(),
+            ["partial", "final", "postprocessed"]
+        );
+        assert_eq!(captions[2].original, "Hello!");
+        assert!(captions[2].revision > captions[1].revision);
+        assert_eq!(
+            observed
+                .audio
+                .lock()
+                .expect("audio")
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            [3_200, 1_600]
+        );
+        assert_eq!(
+            observed.controls.lock().expect("controls").as_slice(),
+            [r#"{"type":"Terminate"}"#]
+        );
+        assert_eq!(observed.capture_stops.load(Ordering::SeqCst), 1);
+        assert!(!queue.lock().expect("queue").is_accepting());
+        queue.lock().expect("queue").extend([9.0]);
+        assert_eq!(queue.lock().expect("queue").len(), 0);
+        assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_ack_is_bounded_and_stop_cancels_pending_llm() {
+        let (connector, server, observed) = fixture(false, false, false);
+        let queue = Arc::new(Mutex::new(AudioQueue::bounded(MAX_PENDING_SAMPLES)));
+        let running = AtomicBool::new(true);
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        server
+            .send(ServerFrame::Text(r#"{"type":"Begin"}"#.into()))
+            .expect("Begin");
+        let driver = async {
+            while ready_rx.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+            for order in 0..15 {
+                server.send(ServerFrame::Text(format!(r#"{{"type":"Turn","turn_order":{order},"transcript":"Hello","end_of_turn":true,"turn_is_formatted":true}}"#))).expect("Turn");
+            }
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            stop_tx.send(()).expect("停止");
+            tokio::time::advance(Duration::from_millis(2_100)).await;
+        };
+        let (result, ()) = tokio::join!(
+            drive(
+                &connector,
+                observed.clone(),
+                &queue,
+                &running,
+                stop_rx,
+                ready_tx,
+                Instant::now() + Duration::from_secs(10),
+                true
+            ),
+            driver
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(observed.calls.load(Ordering::SeqCst), 15);
+        assert_eq!(observed.started_work.load(Ordering::SeqCst), 2);
+        assert_eq!(observed.cancelled_work.load(Ordering::SeqCst), 2);
+        assert!(observed
+            .notices
+            .lock()
+            .expect("notices")
+            .iter()
+            .any(|n| n.contains("佇列已滿")));
+        assert!(observed
+            .captions
+            .lock()
+            .expect("captions")
+            .iter()
+            .all(|c| c.phase == "final"));
+        assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_and_begin_cancellation_release_capture_and_socket() {
+        for pending_connect in [true, false] {
+            let (connector, _server, observed) = fixture(false, false, pending_connect);
+            let queue = Arc::new(Mutex::new(AudioQueue::bounded(MAX_PENDING_SAMPLES)));
+            let running = AtomicBool::new(true);
+            let (stop_tx, stop_rx) = mpsc::channel();
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            let driver = async {
+                tokio::time::advance(Duration::from_millis(25)).await;
+                stop_tx.send(()).expect("停止");
+                tokio::time::advance(Duration::from_secs(2)).await;
+            };
+            let (result, ()) = tokio::join!(
+                drive(
+                    &connector,
+                    observed.clone(),
+                    &queue,
+                    &running,
+                    stop_rx,
+                    ready_tx,
+                    Instant::now() + Duration::from_secs(10),
+                    false
+                ),
+                driver
+            );
+            assert!(result.is_err());
+            assert!(ready_rx.try_recv().expect("啟動錯誤").is_err());
+            assert_eq!(observed.capture_stops.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                observed.drops.load(Ordering::SeqCst),
+                if pending_connect { 0 } else { 1 }
+            );
+            drop(connector);
+            assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn formatting_wait_expires_despite_other_frames() {
+        let (connector, server, observed) = fixture(true, false, false);
+        let queue = Arc::new(Mutex::new(AudioQueue::bounded(MAX_PENDING_SAMPLES)));
+        let running = AtomicBool::new(true);
+        let (_stop_tx, stop_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        server
+            .send(ServerFrame::Text(r#"{"type":"Begin"}"#.into()))
+            .expect("Begin");
+        let driver = async {
+            while ready_rx.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+            server.send(ServerFrame::Text(r#"{"type":"Turn","turn_order":1,"transcript":"待格式化","end_of_turn":true,"turn_is_formatted":false}"#.into())).expect("未格式化");
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            server
+                .send(ServerFrame::Text(
+                    r#"{"type":"Turn","turn_order":2,"transcript":"其他段","end_of_turn":false}"#
+                        .into(),
+                ))
+                .expect("其他段");
+            tokio::time::advance(Duration::from_millis(2_050)).await;
+        };
+        let (result, ()) = tokio::join!(
+            drive(
+                &connector,
+                observed.clone(),
+                &queue,
+                &running,
+                stop_rx,
+                ready_tx,
+                Instant::now() + Duration::from_secs(10),
+                false
+            ),
+            driver
+        );
+        assert!(result
+            .expect_err("應逾時")
+            .to_string()
+            .contains("格式化完成逾時"));
+        assert_eq!(observed.calls.load(Ordering::SeqCst), 0);
+        assert!(observed
+            .captions
+            .lock()
+            .expect("字幕鎖")
+            .iter()
+            .all(|caption| caption.phase == "partial"));
+        assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn any_server_frame_refreshes_idle_but_silence_expires() {
+        let (connector, server, observed) = fixture(true, false, false);
+        let queue = Arc::new(Mutex::new(AudioQueue::bounded(MAX_PENDING_SAMPLES)));
+        let running = AtomicBool::new(true);
+        let (_stop_tx, stop_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        server
+            .send(ServerFrame::Text(r#"{"type":"Begin"}"#.into()))
+            .expect("Begin");
+        let driver = async {
+            while ready_rx.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(Duration::from_secs(14)).await;
+            server.send(ServerFrame::Other).expect("binary 或 Pong");
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(Duration::from_secs(14)).await;
+            assert!(observed.capture_stops.load(Ordering::SeqCst) == 0);
+            tokio::time::advance(Duration::from_secs(2)).await;
+        };
+        let (result, ()) = tokio::join!(
+            drive(
+                &connector,
+                observed.clone(),
+                &queue,
+                &running,
+                stop_rx,
+                ready_tx,
+                Instant::now() + Duration::from_secs(10),
+                false
+            ),
+            driver
+        );
+        assert!(result.expect_err("應失效").to_string().contains("15 秒"));
+        assert_eq!(observed.capture_stops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_and_write_failures_are_reported_without_transport_details() {
+        for read_failure in [true, false] {
+            let (connector, server, observed) = fixture(true, false, false);
+            let queue = Arc::new(Mutex::new(AudioQueue::bounded(MAX_PENDING_SAMPLES)));
+            let running = AtomicBool::new(true);
+            let (_stop_tx, stop_rx) = mpsc::channel();
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            server
+                .send(ServerFrame::Text(r#"{"type":"Begin"}"#.into()))
+                .expect("Begin");
+            let driver = async {
+                while ready_rx.try_recv().is_err() {
+                    tokio::task::yield_now().await;
+                }
+                if read_failure {
+                    observed.read_fail.store(true, Ordering::SeqCst);
+                    server.send(ServerFrame::Other).expect("喚醒 read");
+                } else {
+                    observed.write_fail.store(true, Ordering::SeqCst);
+                    queue
+                        .lock()
+                        .expect("queue")
+                        .extend(vec![0.1; AUDIO_FRAME_SAMPLES]);
+                    tokio::time::advance(Duration::from_millis(100)).await;
+                }
+            };
+            let (result, ()) = tokio::join!(
+                drive(
+                    &connector,
+                    observed.clone(),
+                    &queue,
+                    &running,
+                    stop_rx,
+                    ready_tx,
+                    Instant::now() + Duration::from_secs(10),
+                    false
+                ),
+                driver
+            );
+            let message = result.expect_err("傳輸失敗").to_string();
+            assert!(
+                message.contains(if read_failure {
+                    "讀取失敗"
+                } else {
+                    "傳送失敗"
+                }),
+                "{message}"
+            );
+            assert!(!message.contains("mock"));
+            assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_limit_stops_while_heartbeats_keep_connection_alive() {
+        let (connector, server, observed) = fixture(true, false, false);
+        let queue = Arc::new(Mutex::new(AudioQueue::bounded(MAX_PENDING_SAMPLES)));
+        let running = AtomicBool::new(true);
+        let (_stop_tx, stop_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        server
+            .send(ServerFrame::Text(r#"{"type":"Begin"}"#.into()))
+            .expect("Begin");
+        let driver = async {
+            while ready_rx.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+            for _ in 0..(180 * 60 / 10) {
+                tokio::time::advance(Duration::from_secs(10)).await;
+                if server.send(ServerFrame::Other).is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        let (result, ()) = tokio::join!(
+            drive(
+                &connector,
+                observed.clone(),
+                &queue,
+                &running,
+                stop_rx,
+                ready_tx,
+                Instant::now() + Duration::from_secs(10),
+                false
+            ),
+            driver
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert!(observed
+            .notices
+            .lock()
+            .expect("提示鎖")
+            .iter()
+            .any(|notice| notice.contains("180 分鐘")));
+        assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_deadline_and_bad_begin_clean_up_established_resources() {
+        for pending_connect in [true, false] {
+            let (connector, server, observed) = fixture(true, false, pending_connect);
+            let queue = Arc::new(Mutex::new(AudioQueue::bounded(MAX_PENDING_SAMPLES)));
+            let running = AtomicBool::new(true);
+            let (_stop_tx, stop_rx) = mpsc::channel();
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            if !pending_connect {
+                server
+                    .send(ServerFrame::Text(
+                        r#"{"type":"Begin","configuration":{"model":"wrong"}}"#.into(),
+                    ))
+                    .expect("錯誤模型");
+            }
+            let deadline = Instant::now()
+                + if pending_connect {
+                    Duration::from_millis(50)
+                } else {
+                    Duration::from_secs(10)
+                };
+            let result = drive(
+                &connector,
+                observed.clone(),
+                &queue,
+                &running,
+                stop_rx,
+                ready_tx,
+                deadline,
+                false,
+            )
+            .await;
+            assert!(result.is_err());
+            assert!(ready_rx.try_recv().expect("啟動失敗通知").is_err());
+            assert_eq!(observed.capture_stops.load(Ordering::SeqCst), 1);
+            if !pending_connect {
+                assert_eq!(
+                    observed.controls.lock().expect("控制鎖").as_slice(),
+                    [r#"{"type":"Terminate"}"#]
+                );
+                assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_write_is_cancelled_by_stop_signal_and_terminates() {
+        let (connector, server, observed) = fixture(true, true, false);
+        let queue = Arc::new(Mutex::new(AudioQueue::bounded(MAX_PENDING_SAMPLES)));
+        let running = AtomicBool::new(true);
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        server
+            .send(ServerFrame::Text(r#"{"type":"Begin"}"#.into()))
+            .expect("Begin");
+        let driver = async {
+            while ready_rx.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+            queue
+                .lock()
+                .expect("queue")
+                .extend(vec![0.25; AUDIO_FRAME_SAMPLES]);
+            tokio::time::advance(Duration::from_millis(100)).await;
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            stop_tx.send(()).expect("停止");
+        };
+        let (result, ()) = tokio::join!(
+            drive(
+                &connector,
+                observed.clone(),
+                &queue,
+                &running,
+                stop_rx,
+                ready_tx,
+                Instant::now() + Duration::from_secs(10),
+                false
+            ),
+            driver
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            observed.controls.lock().expect("控制鎖").as_slice(),
+            [r#"{"type":"Terminate"}"#]
+        );
+        assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn service_errors_are_redacted_and_never_reconnect() {
+        let (connector, server, observed) = fixture(true, false, false);
+        let queue = Arc::new(Mutex::new(AudioQueue::bounded(MAX_PENDING_SAMPLES)));
+        let running = AtomicBool::new(true);
+        let (_stop_tx, stop_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        server
+            .send(ServerFrame::Text(r#"{"type":"Begin"}"#.into()))
+            .expect("Begin");
+        let driver = async {
+            while ready_rx.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+            server
+                .send(ServerFrame::Text(
+                    r#"{"type":"Error","error":"quota 429 offline-test-key private transcript"}"#
+                        .into(),
+                ))
+                .expect("錯誤");
+        };
+        let (result, ()) = tokio::join!(
+            drive(
+                &connector,
+                observed.clone(),
+                &queue,
+                &running,
+                stop_rx,
+                ready_tx,
+                Instant::now() + Duration::from_secs(10),
+                false
+            ),
+            driver
+        );
+        let message = result.expect_err("限流應停止").to_string();
+        assert!(message.contains("額度或頻率限制"));
+        assert!(!message.contains("offline-test-key") && !message.contains("transcript"));
+        assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn postprocessing_reuses_language_policy_and_preserves_original_on_errors() {
+        for (language, proofread, fail, calls, translation) in [
+            ("zh", false, false, 0, false),
+            ("zh", true, false, 1, false),
+            ("auto", true, false, 1, true),
+            ("auto", true, true, 1, false),
+        ] {
+            let (connector, server, observed) = fixture(true, false, false);
+            observed.llm_fail.store(fail, Ordering::SeqCst);
+            let queue = Arc::new(Mutex::new(AudioQueue::bounded(MAX_PENDING_SAMPLES)));
+            let running = AtomicBool::new(true);
+            let (stop_tx, stop_rx) = mpsc::channel();
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            server
+                .send(ServerFrame::Text(r#"{"type":"Begin"}"#.into()))
+                .expect("Begin");
+            let mut config = crate::config::AppConfig::default();
+            config.live_caption_language = language.into();
+            config.live_caption_translate = true;
+            config.live_caption_proofread = proofread;
+            config.live_caption_display_mode = "both".into();
+            let driver = async {
+                while ready_rx.try_recv().is_err() {
+                    tokio::task::yield_now().await;
+                }
+                server.send(ServerFrame::Text(r#"{"type":"Turn","turn_order":1,"transcript":"原始文字","end_of_turn":true,"turn_is_formatted":true}"#.into())).expect("final");
+                for _ in 0..30 {
+                    tokio::task::yield_now().await;
+                }
+                stop_tx.send(()).expect("停止");
+            };
+            let (result, ()) = tokio::join!(
+                drive_config(
+                    &connector,
+                    observed.clone(),
+                    &queue,
+                    &running,
+                    stop_rx,
+                    ready_tx,
+                    Instant::now() + Duration::from_secs(10),
+                    false,
+                    config
+                ),
+                driver
+            );
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(observed.calls.load(Ordering::SeqCst), calls);
+            let captions = observed.captions.lock().expect("字幕鎖");
+            assert_eq!(captions[0].original, "原始文字");
+            assert!(captions
+                .iter()
+                .all(|caption| caption.original == "原始文字"));
+            assert_eq!(
+                captions.iter().any(|caption| caption.translation.is_some()),
+                translation
+            );
+            assert_eq!(captions.len(), if calls == 1 && !fail { 2 } else { 1 });
+            if fail {
+                assert!(observed
+                    .notices
+                    .lock()
+                    .expect("提示鎖")
+                    .iter()
+                    .any(|notice| notice.contains("保留原文")));
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successful_writes_keep_100ms_cadence_without_skipping_every_other_packet() {
+        let (connector, server, observed) = fixture(true, false, false);
+        connector
+            .socket
+            .lock()
+            .expect("socket")
+            .as_mut()
+            .expect("socket 應存在")
+            .write_delay = Duration::from_millis(5);
+        let queue = Arc::new(Mutex::new(AudioQueue::bounded(32_000)));
+        queue
+            .lock()
+            .expect("queue")
+            .extend(vec![0.25; AUDIO_FRAME_SAMPLES * 4]);
+        let running = AtomicBool::new(true);
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        server
+            .send(ServerFrame::Text(r#"{"type":"Begin"}"#.into()))
+            .expect("Begin");
+        let driver = async {
+            while ready_rx.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_millis(310)).await;
+            stop_tx.send(()).expect("停止");
+        };
+        let (result, _) = tokio::join!(
+            drive(
+                &connector,
+                observed.clone(),
+                &queue,
+                &running,
+                stop_rx,
+                ready_tx,
+                Instant::now() + Duration::from_secs(10),
+                false
+            ),
+            driver
+        );
+        assert!(result.is_ok());
+        assert_eq!(observed.audio.lock().expect("audio").len(), 4);
+        let times = observed.audio_dispatch_times.lock().expect("節奏鎖");
+        assert!(times
+            .windows(2)
+            .all(|pair| pair[1].duration_since(pair[0]) >= AUDIO_SEND_INTERVAL));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_failure_while_waiting_for_begin_terminates_the_socket() {
+        let (connector, server, observed) = fixture(true, false, false);
+        let queue = Arc::new(Mutex::new(AudioQueue::bounded(32_000)));
+        let running = AtomicBool::new(true);
+        let error_state = Arc::new(Mutex::new(None));
+        let (_stop_tx, stop_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let mut sink = Sink(observed.clone());
+        let llm = FakeLlm {
+            observed: observed.clone(),
+            blocked: false,
+        };
+        let mut stop_capture = || {
+            observed.capture_stops.fetch_add(1, Ordering::SeqCst);
+        };
+        let config = crate::config::AppConfig::default();
+        let driver = async {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            *error_state.lock().expect("音源錯誤鎖") = Some("private device error".into());
+            server.send(ServerFrame::Other).expect("frame");
+        };
+        let (result, _) = tokio::join!(
+            run_session_with(
+                &connector,
+                &llm,
+                &mut sink,
+                build_connection_config("fixture-only", "test-model", "auto"),
+                &config,
+                &queue,
+                &error_state,
+                &running,
+                stop_rx,
+                ready_tx,
+                Instant::now() + Duration::from_secs(10),
+                &mut stop_capture
+            ),
+            driver
+        );
+        assert!(result
+            .expect_err("音源失敗應停止")
+            .to_string()
+            .contains("音源已中斷"));
+        assert!(ready_rx.try_recv().expect("啟動錯誤").is_err());
+        assert_eq!(observed.capture_stops.load(Ordering::SeqCst), 1);
+        assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            observed.controls.lock().expect("controls").as_slice(),
+            [r#"{"type":"Terminate"}"#]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_transport_write_times_out_in_the_production_session_loop() {
+        let (connector, server, observed) = fixture(true, true, false);
+        let queue = Arc::new(Mutex::new(AudioQueue::bounded(32_000)));
+        queue
+            .lock()
+            .expect("queue")
+            .extend(vec![0.25; AUDIO_FRAME_SAMPLES]);
+        let running = AtomicBool::new(true);
+        let (_stop_tx, stop_rx) = mpsc::channel();
+        let (ready_tx, _ready_rx) = mpsc::sync_channel(1);
+        server
+            .send(ServerFrame::Text(r#"{"type":"Begin"}"#.into()))
+            .expect("Begin");
+        let started = tokio::time::Instant::now();
+        let result = drive(
+            &connector,
+            observed.clone(),
+            &queue,
+            &running,
+            stop_rx,
+            ready_tx,
+            Instant::now() + Duration::from_secs(10),
+            false,
+        )
+        .await;
+        assert!(result
+            .expect_err("卡住的 write 應逾時")
+            .to_string()
+            .contains("音訊寫入逾時"));
+        assert!(
+            started.elapsed() >= AUDIO_WRITE_TIMEOUT && started.elapsed() < Duration::from_secs(2)
+        );
+        assert_eq!(observed.capture_stops.load(Ordering::SeqCst), 1);
+        assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -39,7 +1008,7 @@ pub(super) struct TurnCaptionUpdate {
     pub words: Option<serde_json::Value>,
 }
 
-type PostprocessFuture = BoxFuture<'static, (u64, String, Result<String>)>;
+type PostprocessFuture = BoxFuture<'static, (u64, String, bool, Result<String>)>;
 
 #[derive(Debug, Default)]
 pub(super) struct TurnReducer {
@@ -129,214 +1098,41 @@ pub(super) async fn run_stream_session(
     session_id: String,
     audio_source: String,
     queue: crate::audio_recording::SharedQueue,
+    error_state: crate::audio_recording::SharedError,
     running: Arc<AtomicBool>,
     stop_rx: mpsc::Receiver<()>,
     ready_tx: mpsc::SyncSender<Result<()>>,
+    startup_deadline: Instant,
+    stop_capture: &mut dyn FnMut(),
 ) -> Result<()> {
-    let mut capture_pump = QueuePump::start(queue.clone());
     let connection = build_connection_config(
         &config.assembly_ai_key,
         &config.live_caption_assemblyai_model,
         &config.live_caption_language,
-    )?;
-    let connector = TlsWebSocketConnector;
-    let mut socket =
-        connect_and_wait_for_begin(&connector, &connection, &running, Duration::from_secs(10))
-            .await?;
-    let _ = app.emit(
-        super::LIVE_CAPTION_STATUS_EVENT,
-        super::LiveCaptionStatus {
-            active: true,
-            backend: Some("assemblyai_streaming".into()),
-            audio_source: Some(audio_source),
-            session_id: Some(session_id.clone()),
-        },
     );
-    ready_tx
-        .send(Ok(()))
-        .map_err(|_| anyhow!("即時字幕啟動狀態無法回傳"))?;
-
-    let mut last_sent_at = None;
-    let mut last_server_frame_at = Instant::now();
-    let session_started_at = Instant::now();
-    let mut reducer = TurnReducer::default();
-    let mut postprocess_pending: VecDeque<PostprocessFuture> = VecDeque::new();
-    let mut postprocess_running = futures_util::stream::FuturesUnordered::new();
-    let mut stopping = false;
-    loop {
-        if !running.load(Ordering::SeqCst) || stop_rx.try_recv().is_ok() {
-            stopping = true;
-            break;
-        }
-        if session_started_at.elapsed() >= Duration::from_secs(180 * 60) {
-            super::emit_error(&app, "即時字幕已達 180 分鐘上限，連線正在停止".into());
-            stopping = true;
-            break;
-        }
-        if last_server_frame_at.elapsed() >= Duration::from_secs(15) {
-            return Err(anyhow!("AssemblyAI 連線 15 秒內沒有收到服務訊息"));
-        }
-        reducer.check_formatting_deadlines(Instant::now())?;
-        while postprocess_running.len() < 2 {
-            let Some(work) = postprocess_pending.pop_front() else {
-                break;
-            };
-            postprocess_running.push(work);
-        }
-        if let Some(Some((turn_order, original, result))) =
-            postprocess_running.next().now_or_never()
-        {
-            match result {
-                Ok(value) if !value.trim().is_empty() && running.load(Ordering::SeqCst) => {
-                    let value = value.trim().to_string();
-                    let is_translation = config.live_caption_language != "zh"
-                        && config.live_caption_translate
-                        && config.live_caption_display_mode != "original";
-                    let revision = reducer
-                        .turns
-                        .get(&turn_order)
-                        .map(|turn| turn.revision.saturating_add(1))
-                        .unwrap_or(1);
-                    let display_text = if is_translation {
-                        super::build_display_text(
-                            &original,
-                            Some(&value),
-                            &config.live_caption_display_mode,
-                        )
-                    } else {
-                        value.clone()
-                    };
-                    let _ = app.emit(
-                        super::LIVE_CAPTION_EVENT,
-                        super::LiveCaptionPayload {
-                            session_id: session_id.clone(),
-                            sequence: turn_order.saturating_add(1),
-                            revision,
-                            phase: "postprocessed".into(),
-                            original: if is_translation {
-                                original.clone()
-                            } else {
-                                value.clone()
-                            },
-                            translation: is_translation.then_some(value.clone()),
-                            display_text,
-                            confirmed_text: if is_translation { original } else { value },
-                            tentative_text: String::new(),
-                            is_tentative: false,
-                        },
-                    );
-                }
-                Ok(_) => {}
-                Err(error) => super::emit_error(&app, format!("字幕後處理失敗，保留原文：{error}")),
-            }
-            continue;
-        }
-        if capture_pump.take_drop_notice() {
-            super::emit_error(&app, "串流音訊超過佇列上限，已捨棄較舊音訊".into());
-        }
-
-        if remaining_audio_cadence(last_sent_at, Instant::now()).is_zero() {
-            if let Some(frame) = capture_pump.take_frame() {
-                send_frame_cancellable(socket.as_mut(), frame, &running).await?;
-                last_sent_at = Some(Instant::now());
-                continue;
-            }
-        }
-
-        match tokio::time::timeout(Duration::from_millis(25), socket.receive()).await {
-            Ok(Ok(ServerFrame::Text(text))) => {
-                last_server_frame_at = Instant::now();
-                match parse_server_event(&text, &connection.authorization)? {
-                    ServerEvent::Turn { .. } => {
-                        let event = parse_server_event(&text, &connection.authorization)?;
-                        if let Some(update) = reducer.apply(event, Instant::now())? {
-                            let sequence = update.turn_order.saturating_add(1);
-                            let is_tentative = update.phase == CaptionPhase::Partial;
-                            let display_text = update.text.clone();
-                            let _ = app.emit(
-                                super::LIVE_CAPTION_EVENT,
-                                super::LiveCaptionPayload {
-                                    session_id: session_id.clone(),
-                                    sequence,
-                                    revision: update.revision,
-                                    phase: if is_tentative { "partial" } else { "final" }.into(),
-                                    original: update.text.clone(),
-                                    translation: None,
-                                    display_text,
-                                    confirmed_text: if is_tentative {
-                                        String::new()
-                                    } else {
-                                        update.text.clone()
-                                    },
-                                    tentative_text: if is_tentative {
-                                        update.text.clone()
-                                    } else {
-                                        String::new()
-                                    },
-                                    is_tentative,
-                                },
-                            );
-                            if update.phase == CaptionPhase::Final {
-                                if let Some(work) = make_postprocess_future(
-                                    config.clone(),
-                                    update.turn_order,
-                                    update.text,
-                                ) {
-                                    if postprocess_pending.len() >= 8 {
-                                        postprocess_pending.pop_front();
-                                        super::emit_error(
-                                            &app,
-                                            "字幕後處理佇列已滿，略過較舊工作並保留原文".into(),
-                                        );
-                                    }
-                                    postprocess_pending.push_back(work);
-                                }
-                            }
-                        }
-                    }
-                    ServerEvent::Error { message } => return Err(anyhow!("{message}")),
-                    ServerEvent::Termination => break,
-                    _ => {}
-                }
-            }
-            Ok(Ok(ServerFrame::Ping(_))) => last_server_frame_at = Instant::now(),
-            Ok(Ok(ServerFrame::Closed)) => return Err(anyhow!("AssemblyAI 串流連線已關閉")),
-            Ok(Err(error)) => return Err(error),
-            Err(_) => {}
-        }
-    }
-
-    if stopping {
-        running.store(false, Ordering::SeqCst);
-        postprocess_pending.clear();
-        postprocess_running.clear();
-        for tail in capture_pump.stop_and_take_frames(&queue) {
-            let _ = tokio::time::timeout(AUDIO_WRITE_TIMEOUT, socket.send_binary(tail)).await;
-        }
-        let _ = tokio::time::timeout(
-            AUDIO_WRITE_TIMEOUT,
-            socket.send_text(r#"{"type":"Terminate"}"#.into()),
-        )
-        .await;
-        let termination_deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < termination_deadline {
-            match tokio::time::timeout(Duration::from_millis(100), socket.receive()).await {
-                Ok(Ok(ServerFrame::Text(text)))
-                    if matches!(
-                        parse_server_event(&text, &connection.authorization),
-                        Ok(ServerEvent::Termination)
-                    ) =>
-                {
-                    break
-                }
-                Ok(Ok(ServerFrame::Closed)) | Ok(Err(_)) => break,
-                _ => {}
-            }
-        }
-    }
-    Ok(())
+    let mut sink = AppEventSink {
+        app,
+        session_id,
+        audio_source,
+    };
+    run_session_with(
+        &TlsWebSocketConnector,
+        &LlmPostprocessor,
+        &mut sink,
+        connection,
+        &config,
+        &queue,
+        &error_state,
+        &running,
+        stop_rx,
+        ready_tx,
+        startup_deadline,
+        stop_capture,
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn connect_and_wait_for_begin(
     connector: &dyn StreamingConnector,
     connection: &AssemblyAiConnectionConfig,
@@ -379,7 +1175,7 @@ async fn connect_and_wait_for_begin(
                     _ => return Err(anyhow!("AssemblyAI Begin 前收到非預期事件")),
                 }
             }
-            Ok(Ok(ServerFrame::Ping(_))) => continue,
+            Ok(Ok(ServerFrame::Ping(_) | ServerFrame::Other)) => continue,
             Ok(Ok(ServerFrame::Closed)) => return Err(anyhow!("AssemblyAI 在 Begin 前關閉連線")),
             Ok(Err(error)) => return Err(error),
             Err(_) => return Err(anyhow!("等待 AssemblyAI Begin 逾時")),
@@ -387,129 +1183,419 @@ async fn connect_and_wait_for_begin(
     }
 }
 
-fn make_postprocess_future(
-    config: crate::config::AppConfig,
-    turn_order: u64,
-    original: String,
-) -> Option<PostprocessFuture> {
-    let (should_translate, should_proofread) = super::resolve_translate_or_proofread(
-        config.live_caption_translate,
-        config.live_caption_proofread,
-        &config.live_caption_display_mode,
-        &config.live_caption_language,
-    );
-    if !should_translate && !should_proofread {
-        return None;
+trait SessionEventSink {
+    fn caption(&mut self, payload: super::LiveCaptionPayload);
+    fn notice(&mut self, message: &'static str);
+    fn ready(&mut self);
+}
+
+struct AppEventSink {
+    app: AppHandle,
+    session_id: String,
+    audio_source: String,
+}
+
+impl SessionEventSink for AppEventSink {
+    fn caption(&mut self, mut payload: super::LiveCaptionPayload) {
+        payload.session_id = self.session_id.clone();
+        let _ = self.app.emit(super::LIVE_CAPTION_EVENT, payload);
     }
-    let system_prompt = if should_translate {
-        "你是即時字幕翻譯員。請將輸入內容翻譯成自然、簡潔的繁體中文台灣用語。只輸出譯文，不要加註解、前綴或引號。"
-    } else {
-        super::PROOFREAD_CORE_SYSTEM
-    };
-    Some(Box::pin(async move {
-        let result = super::call_llm(&config, system_prompt, &original).await;
-        (turn_order, original, result)
+
+    fn notice(&mut self, message: &'static str) {
+        super::emit_error(&self.app, message.into());
+    }
+
+    fn ready(&mut self) {
+        let _ = self.app.emit(
+            super::LIVE_CAPTION_STATUS_EVENT,
+            super::LiveCaptionStatus {
+                active: true,
+                backend: Some("assemblyai_streaming".into()),
+                audio_source: Some(self.audio_source.clone()),
+                session_id: Some(self.session_id.clone()),
+            },
+        );
+    }
+}
+
+trait Postprocessor {
+    fn process(
+        &self,
+        config: crate::config::AppConfig,
+        turn_order: u64,
+        original: String,
+        translate: bool,
+    ) -> PostprocessFuture;
+}
+
+struct LlmPostprocessor;
+
+impl Postprocessor for LlmPostprocessor {
+    fn process(
+        &self,
+        config: crate::config::AppConfig,
+        turn_order: u64,
+        original: String,
+        translate: bool,
+    ) -> PostprocessFuture {
+        Box::pin(async move {
+            let prompt = if translate {
+                "你是即時字幕翻譯員。請將輸入內容翻譯成自然、簡潔的繁體中文台灣用語。只輸出譯文，不要加註解、前綴或引號。"
+            } else {
+                super::PROOFREAD_CORE_SYSTEM
+            };
+            let result = super::call_llm(&config, prompt, &original).await;
+            (turn_order, original, translate, result)
+        })
+    }
+}
+
+fn stop_requested(running: &AtomicBool, stop_rx: &mpsc::Receiver<()>) -> bool {
+    !running.load(Ordering::SeqCst)
+        || matches!(
+            stop_rx.try_recv(),
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected)
+        )
+}
+
+async fn wait_for_session_stop(running: &AtomicBool, stop_rx: &mpsc::Receiver<()>) {
+    while !stop_requested(running, stop_rx) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn caption_payload(
+    update: TurnCaptionUpdate,
+    config: &crate::config::AppConfig,
+) -> super::LiveCaptionPayload {
+    let partial = update.phase == CaptionPhase::Partial;
+    super::LiveCaptionPayload {
+        session_id: String::new(),
+        sequence: update.turn_order.saturating_add(1),
+        revision: update.revision,
+        phase: if partial { "partial" } else { "final" }.into(),
+        original: update.text.clone(),
+        translation: None,
+        display_text: super::build_display_text(
+            &update.text,
+            None,
+            &config.live_caption_display_mode,
+        ),
+        confirmed_text: if partial {
+            String::new()
+        } else {
+            update.text.clone()
+        },
+        tentative_text: if partial { update.text } else { String::new() },
+        is_tentative: partial,
+    }
+}
+
+fn check_capture(error_state: &crate::audio_recording::SharedError) -> Result<()> {
+    if error_state
+        .lock()
+        .map_err(|_| anyhow!("音源狀態無法讀取"))?
+        .take()
+        .is_some()
+    {
+        return Err(anyhow!("即時字幕音源已中斷"));
+    }
+    Ok(())
+}
+
+fn gate_postprocess(
+    mut work: PostprocessFuture,
+    queue: crate::audio_recording::SharedQueue,
+) -> PostprocessFuture {
+    Box::pin(std::future::poll_fn(move |context| {
+        let guard = match queue.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !guard.is_accepting() {
+            // 週期式停止檢查將釋放此 future；停止閘門關閉後不再輪詢 LLM。
+            return std::task::Poll::Pending;
+        }
+        work.as_mut().poll(context)
     }))
 }
 
-#[derive(Default)]
-struct CaptureBufferState {
-    accepting: bool,
-    audio: BoundedAudioQueue,
-    drop_notice_pending: bool,
-}
-
-struct QueuePump {
-    running: Arc<AtomicBool>,
-    state: Arc<std::sync::Mutex<CaptureBufferState>>,
-    handle: Option<thread::JoinHandle<()>>,
-}
-
-impl QueuePump {
-    fn start(source: crate::audio_recording::SharedQueue) -> Self {
-        let running = Arc::new(AtomicBool::new(true));
-        let state = Arc::new(std::sync::Mutex::new(CaptureBufferState {
-            accepting: true,
-            audio: BoundedAudioQueue::default(),
-            drop_notice_pending: false,
-        }));
-        let thread_running = running.clone();
-        let thread_state = state.clone();
-        let handle = thread::spawn(move || {
-            while thread_running.load(Ordering::SeqCst) {
-                let captured = source
-                    .lock()
-                    .map(|mut source| source.drain(..).collect::<Vec<_>>())
-                    .unwrap_or_default();
-                if !captured.is_empty() {
-                    if let Ok(mut state) = thread_state.lock() {
-                        if state.accepting && state.audio.push(captured, Instant::now()) {
-                            state.drop_notice_pending = true;
-                        }
-                    }
+async fn run_session_with(
+    connector: &dyn StreamingConnector,
+    postprocessor: &dyn Postprocessor,
+    sink: &mut dyn SessionEventSink,
+    connection: Result<AssemblyAiConnectionConfig>,
+    config: &crate::config::AppConfig,
+    queue: &crate::audio_recording::SharedQueue,
+    error_state: &crate::audio_recording::SharedError,
+    running: &AtomicBool,
+    stop_rx: mpsc::Receiver<()>,
+    ready_tx: mpsc::SyncSender<Result<()>>,
+    startup_deadline: Instant,
+    stop_capture: &mut dyn FnMut(),
+) -> Result<()> {
+    let mut socket = None;
+    let mut ready = false;
+    let authorization = connection
+        .as_ref()
+        .map(|value| value.authorization.clone())
+        .unwrap_or_default();
+    let started = tokio::time::Instant::now();
+    let result = async {
+        let connection = connection?;
+        if stop_requested(running, &stop_rx) {
+            return Err(anyhow!("AssemblyAI 串流啟動已取消"));
+        }
+        check_capture(error_state)?;
+        let deadline = tokio::time::Instant::from_std(startup_deadline);
+        if deadline <= tokio::time::Instant::now() {
+            return Err(anyhow!("AssemblyAI 串流啟動逾時"));
+        }
+        let mut poll = tokio::time::interval(Duration::from_millis(10));
+        let connect = connector.connect(&connection.url, &connection.authorization);
+        tokio::pin!(connect);
+        socket = Some(loop {
+            tokio::select! {
+                biased;
+                _ = poll.tick() => {
+                    if stop_requested(running, &stop_rx) { return Err(anyhow!("AssemblyAI 串流啟動已取消")); }
+                    check_capture(error_state)?;
                 }
-                thread::sleep(Duration::from_millis(10));
+                result = &mut connect => {
+                    break result?;
+                }
+                _ = tokio::time::sleep_until(deadline) => return Err(anyhow!("AssemblyAI 串流啟動逾時")),
             }
         });
-        Self {
-            running,
-            state,
-            handle: Some(handle),
+        loop {
+            if stop_requested(running, &stop_rx) { return Err(anyhow!("AssemblyAI 串流啟動已取消")); }
+            check_capture(error_state)?;
+            let current = socket.as_mut().ok_or_else(|| anyhow!("AssemblyAI socket 未建立"))?;
+            let frame = tokio::select! {
+                biased;
+                _ = poll.tick() => continue,
+                result = current.receive() => result.map_err(|_| anyhow!("AssemblyAI WebSocket 讀取失敗"))?,
+                _ = tokio::time::sleep_until(deadline) => return Err(anyhow!("等待 AssemblyAI Begin 逾時")),
+            };
+            match frame {
+                ServerFrame::Text(text) => {
+                    let event = parse_server_event(&text, &connection.authorization)?;
+                    match event {
+                        ServerEvent::Begin { .. } => { validate_begin_model(&event, &connection.model)?; break; }
+                        ServerEvent::Error { message } => return Err(anyhow!("{message}")),
+                        ServerEvent::Ignore => continue,
+                        _ => return Err(anyhow!("AssemblyAI Begin 前收到非預期事件")),
+                    }
+                }
+                ServerFrame::Closed => return Err(anyhow!("AssemblyAI 在 Begin 前關閉連線")),
+                ServerFrame::Ping(_) | ServerFrame::Other => {}
+            }
         }
-    }
+        if stop_requested(running, &stop_rx) { return Err(anyhow!("AssemblyAI 串流啟動已取消")); }
+        ready_tx.send(Ok(())).map_err(|_| anyhow!("即時字幕啟動狀態無法回傳"))?;
+        ready = true;
+        sink.ready();
 
-    fn take_frame(&self) -> Option<Vec<u8>> {
-        self.state.lock().ok()?.audio.take_frame()
-    }
+        let mut reducer = TurnReducer::default();
+        let mut pending: VecDeque<PostprocessFuture> = VecDeque::new();
+        let mut active = futures_util::stream::FuturesUnordered::new();
+        let mut last_frame = tokio::time::Instant::now();
+        let mut ticker = tokio::time::interval(AUDIO_SEND_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut check = tokio::time::interval(Duration::from_millis(10));
+        check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            if stop_requested(running, &stop_rx) { break; }
+            check_capture(error_state)?;
+            if tokio::time::Instant::now().duration_since(started) >= MAX_SESSION_DURATION {
+                sink.notice("即時字幕已達 180 分鐘上限，連線正在停止");
+                break;
+            }
+            reducer.check_formatting_deadlines(tokio::time::Instant::now().into_std())?;
+            while active.len() < MAX_POSTPROCESS_RUNNING {
+                let Some(work) = pending.pop_front() else { break; };
+                active.push(work);
+            }
+            let current = socket.as_mut().ok_or_else(|| anyhow!("AssemblyAI socket 未建立"))?;
+            tokio::select! {
+                frame = current.receive() => {
+                    last_frame = tokio::time::Instant::now();
+                    if stop_requested(running, &stop_rx) { break; }
+                    match frame.map_err(|_| anyhow!("AssemblyAI WebSocket 讀取失敗"))? {
+                        ServerFrame::Text(text) => match parse_server_event(&text, &connection.authorization)? {
+                            event @ ServerEvent::Turn { .. } => {
+                                if let Some(update) = reducer.apply(event, tokio::time::Instant::now().into_std())? {
+                                    let is_final = update.phase == CaptionPhase::Final;
+                                    let turn_order = update.turn_order;
+                                    let original = update.text.clone();
+                                    let gate = queue.lock().map_err(|_| anyhow!("音訊佇列無法讀取"))?;
+                                    if !gate.is_accepting() || !running.load(Ordering::SeqCst) { break; }
+                                    sink.caption(caption_payload(update, config));
+                                    if is_final {
+                                        let (translate, proofread) = super::resolve_translate_or_proofread(
+                                            config.live_caption_translate,
+                                            config.live_caption_proofread,
+                                            &config.live_caption_display_mode,
+                                            &config.live_caption_language,
+                                        );
+                                        if translate || proofread {
+                                            if pending.len() == MAX_POSTPROCESS_PENDING {
+                                                pending.pop_front();
+                                                sink.notice("字幕後處理佇列已滿，略過較舊工作並保留原文");
+                                            }
+                                            pending.push_back(gate_postprocess(
+                                                postprocessor.process(config.clone(), turn_order, original, translate),
+                                                queue.clone(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            ServerEvent::Error { message } => return Err(anyhow!("{message}")),
+                            ServerEvent::Termination => return Err(anyhow!("AssemblyAI 串流提前結束")),
+                            _ => {}
+                        },
+                        ServerFrame::Closed => return Err(anyhow!("AssemblyAI 串流連線已關閉")),
+                        ServerFrame::Ping(_) | ServerFrame::Other => {}
+                    }
+                }
+                _ = check.tick() => {
+                    if stop_requested(running, &stop_rx) { break; }
+                    check_capture(error_state)?;
+                    if tokio::time::Instant::now().duration_since(last_frame) >= SERVER_IDLE_TIMEOUT {
+                        return Err(anyhow!("AssemblyAI 連線 15 秒內沒有收到服務訊息"));
+                    }
+                    if queue.lock().map_err(|_| anyhow!("音訊佇列無法讀取"))?
+                        .take_drop_notice(Instant::now(), DROP_NOTICE_THROTTLE) {
+                        sink.notice("串流音訊超過佇列上限，已捨棄較舊音訊");
+                    }
+                }
+                Some((order, original, translated, result)) = active.next(), if !active.is_empty() => {
+                    let gate = queue.lock().map_err(|_| anyhow!("音訊佇列無法讀取"))?;
+                    if !gate.is_accepting() || !running.load(Ordering::SeqCst) { break; }
+                    match result {
+                        Ok(value) if !value.trim().is_empty() => {
+                            let value = value.trim().to_string();
+                            if let Some(turn) = reducer.turns.get_mut(&order) {
+                                if turn.final_text.as_deref() == Some(original.as_str()) {
+                                    turn.revision = turn.revision.saturating_add(1);
+                                    sink.caption(super::LiveCaptionPayload {
+                                        session_id: String::new(), sequence: order.saturating_add(1),
+                                        revision: turn.revision, phase: "postprocessed".into(),
+                                        original: original.clone(), translation: translated.then(|| value.clone()),
+                                        display_text: if translated { super::build_display_text(&original, Some(&value), &config.live_caption_display_mode) } else { value },
+                                        confirmed_text: original, tentative_text: String::new(), is_tentative: false,
+                                    });
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => sink.notice("字幕後處理失敗，已保留原文"),
+                    }
+                }
+                _ = ticker.tick() => {
+                    if stop_requested(running, &stop_rx) { break; }
+                    let frame = {
+                        let mut queue = queue.lock().map_err(|_| anyhow!("音訊佇列無法讀取"))?;
+                        if queue.len() >= AUDIO_FRAME_SAMPLES {
+                            Some(encode_pcm16_le(&queue.drain(..AUDIO_FRAME_SAMPLES).collect::<Vec<_>>()))
+                        } else { None }
+                    };
+                    if let Some(frame) = frame {
+                        let dispatched_at = tokio::time::Instant::now();
+                        tokio::select! {
+                            result = tokio::time::timeout(AUDIO_WRITE_TIMEOUT, current.send_binary(frame)) => {
+                                result.map_err(|_| anyhow!("AssemblyAI 音訊寫入逾時"))?
+                                    .map_err(|_| anyhow!("AssemblyAI 音訊傳送失敗"))?;
+                            }
+                            _ = wait_for_session_stop(running, &stop_rx) => break,
+                        }
+                        ticker.reset_at(dispatched_at + AUDIO_SEND_INTERVAL);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }.await;
 
-    fn take_drop_notice(&self) -> bool {
-        self.state
-            .lock()
-            .map(|mut state| std::mem::take(&mut state.drop_notice_pending))
-            .unwrap_or(false)
-    }
-
-    fn stop_and_take_frames(
-        &mut self,
-        source: &crate::audio_recording::SharedQueue,
-    ) -> Vec<Vec<u8>> {
-        let Ok(mut state) = self.state.lock() else {
-            return Vec::new();
+    // 收尾順序與 capture callback 使用同一把鎖，快照不會收進停止後才完成的 callback。
+    let stopped_at = {
+        let mut guard = match queue.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
         };
-        state.accepting = false;
-        if let Ok(mut source) = source.lock() {
-            let captured = source.drain(..).collect::<Vec<_>>();
-            state.audio.push(captured, Instant::now());
+        guard.freeze();
+        guard.stopped_at().unwrap_or_else(Instant::now)
+    };
+    running.store(false, Ordering::SeqCst);
+    stop_capture();
+    if let Some(mut socket) = socket {
+        let mut tail = match queue.lock() {
+            Ok(mut guard) => guard.take_stopped_samples(),
+            Err(poisoned) => poisoned.into_inner().take_stopped_samples(),
+        };
+        let deadline =
+            tokio::time::Instant::now() + SHUTDOWN_BUDGET.saturating_sub(stopped_at.elapsed());
+        while !tail.is_empty() {
+            let count = tail.len().min(16_000);
+            let mut samples: Vec<f32> = tail.drain(..count).collect();
+            if samples.len() < MIN_AUDIO_FRAME_SAMPLES {
+                samples.resize(MIN_AUDIO_FRAME_SAMPLES, 0.0);
+            }
+            let limit = (tokio::time::Instant::now() + AUDIO_WRITE_TIMEOUT).min(deadline);
+            if !matches!(
+                tokio::time::timeout_at(limit, socket.send_binary(encode_pcm16_le(&samples))).await,
+                Ok(Ok(()))
+            ) {
+                break;
+            }
         }
-        self.running.store(false, Ordering::SeqCst);
-        state.audio.take_shutdown_frames()
+        let limit = (tokio::time::Instant::now() + AUDIO_WRITE_TIMEOUT).min(deadline);
+        if tokio::time::timeout_at(limit, socket.send_text(r#"{"type":"Terminate"}"#.into()))
+            .await
+            .is_ok_and(|result| result.is_ok())
+        {
+            let ack_deadline =
+                (tokio::time::Instant::now() + TERMINATION_ACK_TIMEOUT).min(deadline);
+            while tokio::time::Instant::now() < ack_deadline {
+                match tokio::time::timeout_at(ack_deadline, socket.receive()).await {
+                    Ok(Ok(ServerFrame::Text(text)))
+                        if matches!(
+                            parse_server_event(&text, &authorization),
+                            Ok(ServerEvent::Termination)
+                        ) =>
+                    {
+                        break
+                    }
+                    Ok(Ok(ServerFrame::Closed)) | Ok(Err(_)) | Err(_) => break,
+                    _ => {}
+                }
+            }
+        }
     }
+    if !ready {
+        if let Err(error) = &result {
+            let _ = ready_tx.try_send(Err(anyhow!("{error}")));
+        }
+    }
+    result
 }
 
-impl Drop for QueuePump {
-    fn drop(&mut self) {
-        self.running.store(false, Ordering::SeqCst);
-        if let Ok(mut state) = self.state.lock() {
-            state.accepting = false;
-        }
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
+#[cfg(test)]
 async fn wait_for_stop(running: &AtomicBool) {
     while running.load(Ordering::SeqCst) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub(super) struct BoundedAudioQueue {
     samples: VecDeque<f32>,
     last_drop_notice: Option<std::time::Instant>,
 }
 
+#[cfg(test)]
 impl BoundedAudioQueue {
     pub fn push(
         &mut self,
@@ -569,12 +1655,14 @@ impl BoundedAudioQueue {
     }
 }
 
+#[cfg(test)]
 fn remaining_audio_cadence(last_sent_at: Option<Instant>, now: Instant) -> Duration {
     last_sent_at
         .map(|sent| AUDIO_SEND_INTERVAL.saturating_sub(now.saturating_duration_since(sent)))
         .unwrap_or(Duration::ZERO)
 }
 
+#[cfg(test)]
 pub(super) async fn send_frame_cancellable(
     socket: &mut dyn StreamingSocket,
     bytes: Vec<u8>,
@@ -621,6 +1709,7 @@ pub(super) struct AssemblyAiConnectionConfig {
 pub(super) enum ServerFrame {
     Text(String),
     Ping(Vec<u8>),
+    Other,
     Closed,
 }
 
@@ -643,7 +1732,7 @@ pub(super) enum ServerEvent {
     Ignore,
 }
 
-pub(super) fn parse_server_event(text: &str, api_key: &str) -> Result<ServerEvent> {
+pub(super) fn parse_server_event(text: &str, _api_key: &str) -> Result<ServerEvent> {
     let event: serde_json::Value =
         serde_json::from_str(text).map_err(|_| anyhow!("AssemblyAI 傳回無效 JSON 事件"))?;
     let event_type = event
@@ -654,7 +1743,7 @@ pub(super) fn parse_server_event(text: &str, api_key: &str) -> Result<ServerEven
         "Begin" => Ok(ServerEvent::Begin {
             model: event
                 .get("configuration")
-                .and_then(|value| value.get("speech_model").or_else(|| value.get("model")))
+                .and_then(|value| value.get("model").or_else(|| value.get("speech_model")))
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
         }),
@@ -693,11 +1782,24 @@ pub(super) fn parse_server_event(text: &str, api_key: &str) -> Result<ServerEven
         }
         "Termination" => Ok(ServerEvent::Termination),
         "Error" => {
-            let message = event
+            let detail = event
                 .get("error")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("AssemblyAI 服務回報錯誤")
-                .replace(api_key, "[已遮蔽]");
+                .unwrap_or("");
+            let lower = detail.to_ascii_lowercase();
+            let message =
+                if lower.contains("rate") || lower.contains("quota") || lower.contains("429") {
+                    "AssemblyAI 額度或頻率限制，請稍後重試"
+                } else if lower.contains("auth")
+                    || lower.contains("key")
+                    || lower.contains("401")
+                    || lower.contains("403")
+                {
+                    "AssemblyAI 認證失敗，請檢查 API Key"
+                } else {
+                    "AssemblyAI 服務回報錯誤"
+                }
+                .to_string();
             Ok(ServerEvent::Error { message })
         }
         // Heartbeat 及後續新增的非必要事件不視為字幕或錯誤。
@@ -712,7 +1814,7 @@ pub(super) fn validate_begin_model(event: &ServerEvent, expected_model: &str) ->
         ServerEvent::Begin { model: Some(_) } => {
             Err(anyhow!("AssemblyAI Begin 回報的模型與請求不一致"))
         }
-        ServerEvent::Begin { model: None } => Err(anyhow!("AssemblyAI Begin 缺少模型識別")),
+        ServerEvent::Begin { model: None } => Ok(()),
         _ => Err(anyhow!("等待 AssemblyAI Begin 時收到非 Begin 事件")),
     }
 }
@@ -747,9 +1849,19 @@ impl StreamingConnector for TlsWebSocketConnector {
             let authorization = HeaderValue::from_str(authorization)
                 .map_err(|_| anyhow!("AssemblyAI API Key 格式無效"))?;
             request.headers_mut().insert(AUTHORIZATION, authorization);
-            let (socket, _) = connect_async(request)
-                .await
-                .map_err(|_| anyhow!("AssemblyAI WebSocket 連線失敗，請檢查網路與認證設定"))?;
+            let (socket, _) = connect_async(request).await.map_err(|error| match error {
+                tokio_tungstenite::tungstenite::Error::Http(response)
+                    if matches!(response.status().as_u16(), 401 | 403) =>
+                {
+                    anyhow!("AssemblyAI 認證失敗，請檢查 API Key")
+                }
+                tokio_tungstenite::tungstenite::Error::Http(response)
+                    if response.status().as_u16() == 429 =>
+                {
+                    anyhow!("AssemblyAI 額度或頻率限制，請稍後重試")
+                }
+                _ => anyhow!("AssemblyAI WebSocket 連線失敗，請檢查網路與認證設定"),
+            })?;
             Ok(Box::new(TlsStreamingSocket { socket }) as Box<dyn StreamingSocket>)
         })
     }
@@ -765,7 +1877,7 @@ impl StreamingSocket for TlsStreamingSocket {
             self.socket
                 .send(Message::binary(bytes))
                 .await
-                .map_err(|error| anyhow!("AssemblyAI 音訊傳送失敗：{error}"))
+                .map_err(|_| anyhow!("AssemblyAI 音訊傳送失敗"))
         })
     }
 
@@ -774,7 +1886,7 @@ impl StreamingSocket for TlsStreamingSocket {
             self.socket
                 .send(Message::text(text))
                 .await
-                .map_err(|error| anyhow!("AssemblyAI 控制訊息傳送失敗：{error}"))
+                .map_err(|_| anyhow!("AssemblyAI 控制訊息傳送失敗"))
         })
     }
 
@@ -790,14 +1902,14 @@ impl StreamingSocket for TlsStreamingSocket {
                         self.socket
                             .send(Message::Pong(payload.clone().into()))
                             .await
-                            .map_err(|error| anyhow!("AssemblyAI Pong 傳送失敗：{error}"))?;
+                            .map_err(|_| anyhow!("AssemblyAI Pong 傳送失敗"))?;
                         return Ok(ServerFrame::Ping(payload));
                     }
                     Some(Ok(Message::Close(_))) | None => return Ok(ServerFrame::Closed),
-                    Some(Ok(Message::Binary(_))) | Some(Ok(Message::Pong(_))) => continue,
-                    Some(Err(error)) => {
-                        return Err(anyhow!("AssemblyAI WebSocket 讀取失敗：{error}"))
+                    Some(Ok(Message::Binary(_))) | Some(Ok(Message::Pong(_))) => {
+                        return Ok(ServerFrame::Other)
                     }
+                    Some(Err(_)) => return Err(anyhow!("AssemblyAI WebSocket 讀取失敗")),
                     _ => continue,
                 }
             }
@@ -1264,7 +2376,7 @@ mod tests {
         assert_eq!(
             error,
             ServerEvent::Error {
-                message: "invalid [已遮蔽]".into()
+                message: "AssemblyAI 認證失敗，請檢查 API Key".into()
             }
         );
         assert_eq!(
@@ -1294,7 +2406,7 @@ mod tests {
             model: Some("model-a".into()),
         };
         assert!(validate_begin_model(&begin, "model-b").is_err());
-        assert!(validate_begin_model(&ServerEvent::Begin { model: None }, "model-a").is_err());
+        assert!(validate_begin_model(&ServerEvent::Begin { model: None }, "model-a").is_ok());
     }
 
     fn turn_event(order: u64, text: &str, end: bool, formatted: Option<bool>) -> ServerEvent {

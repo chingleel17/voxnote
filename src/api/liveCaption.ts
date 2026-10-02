@@ -15,12 +15,13 @@ const LIVE_CAPTION_STATUS_EVENT = 'live-caption-status';
 const LIVE_CAPTION_SETTINGS_EVENT = 'live-caption-settings';
 const LIVE_CAPTION_INTERACTIVE_EVENT = 'live-caption-interactive';
 
-export const startLiveCaption = (audioSource?: 'microphone' | 'system') =>
+export const startLiveCaption = (audioSource?: 'microphone' | 'system', sessionId?: string) =>
   invoke<LiveCaptionStatus>('start_live_caption', {
-    request: { audio_source: audioSource ?? null },
+    request: { audio_source: audioSource ?? null, session_id: sessionId ?? null },
   });
 
-export const stopLiveCaption = () => invoke<LiveCaptionStatus>('stop_live_caption');
+export const stopLiveCaption = (sessionId?: string) =>
+  invoke<LiveCaptionStatus>('stop_live_caption', { sessionId: sessionId ?? null });
 export const getLiveCaptionStatus = () => invoke<LiveCaptionStatus>('get_live_caption_status');
 export const listLiveCaptionAudioSources = () =>
   invoke<RecordingDeviceList>('list_live_caption_audio_sources');

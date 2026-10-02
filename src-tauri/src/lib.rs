@@ -1,3 +1,8 @@
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use tauri::{Manager, WindowEvent};
 
 mod ai;
@@ -18,36 +23,44 @@ use commands::{
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let shutdown_started = Arc::new(AtomicBool::new(false));
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_notification::init())
-        .on_window_event(|window, event| {
+        .on_window_event(move |window, event| {
             if window.label() != "main" {
                 return;
             }
 
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
+                if shutdown_started.swap(true, Ordering::SeqCst) {
+                    return;
+                }
                 let app_handle = window.app_handle().clone();
-                let live_caption_manager = app_handle.state::<live_caption::LiveCaptionManager>();
-                if live_caption_manager.status().active {
-                    if let Err(error) = live_caption_manager.stop(&app_handle) {
-                        println!("[shutdown] 停止即時字幕失敗：{error}");
+                // 保持主事件迴圈可處理字幕視窗操作，避免退出時 worker 等待 GUI 而互鎖。
+                std::thread::spawn(move || {
+                    let live_caption_manager =
+                        app_handle.state::<live_caption::LiveCaptionManager>();
+                    if live_caption_manager.has_session() {
+                        if let Err(error) = live_caption_manager.stop(&app_handle) {
+                            println!("[shutdown] 停止即時字幕失敗：{error}");
+                        }
                     }
-                }
-                live_caption::close_overlay_on_app_exit(&app_handle);
+                    live_caption::close_overlay_on_app_exit(&app_handle);
 
-                let recording_manager =
-                    app_handle.state::<audio_recording::DesktopRecordingManager>();
-                if audio_recording::is_recording(&recording_manager) {
-                    if let Err(error) = audio_recording::stop_recording(&recording_manager) {
-                        println!("[shutdown] 停止桌面錄音失敗：{error}");
+                    let recording_manager =
+                        app_handle.state::<audio_recording::DesktopRecordingManager>();
+                    if audio_recording::is_recording(&recording_manager) {
+                        if let Err(error) = audio_recording::stop_recording(&recording_manager) {
+                            println!("[shutdown] 停止桌面錄音失敗：{error}");
+                        }
                     }
-                }
 
-                app_handle.exit(0);
+                    app_handle.exit(0);
+                });
             }
         })
         .setup(|app| {

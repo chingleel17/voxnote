@@ -15,37 +15,37 @@
 ## 2. 音訊傳送與服務事件
 
 - [x] 2.1 實作 mono f32 至 PCM16 little-endian 與 100 ms 封包；測試正負端點、飽和、非有限數值、3,200-byte 封包及尾包補零至 50 ms。
-- [ ] 2.2 加入每 100 ms 至多一包、producer/consumer 2 秒 queue 上限、write 1 秒逾時與每 5 秒遺漏提示節流；以假時鐘／阻塞 transport 測試記憶體上限、不加速補播及可取消寫入。
+- [x] 2.2 加入每 100 ms 至多一包、producer/consumer 2 秒 queue 上限、write 1 秒逾時與每 5 秒遺漏提示節流；以假時鐘／阻塞 transport 測試記憶體上限、不加速補播及可取消寫入。
 - [x] 2.3 解析 Begin/Turn/Termination/Error 與非必要 Heartbeat/Ping/Pong；以官方形狀 fixtures 驗證模型核對、未知事件相容、必要欄位錯誤及機密資訊不外洩。
 - [x] 2.4 實作 turn 狀態、暫定／完成／格式化判定與空白抑制，重用共用 OpenCC s2twp 轉換中文顯示文字，不套用 LocalAgreement 或相似度去重；以繁簡混合、英文保留、word 時間不變、重複 final、同 turn 修正、跨 turn 相同短句、完成欄位缺漏／型別錯誤、格式化等候 2 秒及未完成 turn 測試驗證。
 
 ## 3. Session、取消與退出
 
-- [ ] 3.1 將新來源接入 manager／既有開始停止 commands，音源與 Begin 皆就緒才 ready；以 mock 驗證 10 秒啟動期限、啟動取消、缺 key 及來源失敗時不遺留 socket。
-- [ ] 3.2 共用現有 mic/system queue，分派串流消費器並保留既有視窗解碼路徑；以假 capture 測試不載入本地模型、不探測自架 health 及不驗證不適用視窗參數。
-- [ ] 3.3 完成 Terminate→Termination 收尾，ack 2 秒與總停止 5 秒上限，停止時撤銷 producer 入列權限、取出一次性尾端快照且不派發新字幕／LLM；以正常 ack、無 ack、停在 read/write/connect 與停止後 callback 完成的 mock 整合測試驗證。
-- [ ] 3.4 實作 15 秒 frame 存活監控及雲端錯誤狀態，不自動重連、重播或切換後端；以斷線、認證、rate limit、無 frame 與音源錯誤測試驗證停止及可手動重啟。
+- [x] 3.1 將新來源接入 manager／既有開始停止 commands，音源與 Begin 皆就緒才 ready；以 mock 驗證 10 秒啟動期限、啟動取消、缺 key 及來源失敗時不遺留 socket。
+- [x] 3.2 共用現有 mic/system queue，分派串流消費器並保留既有視窗解碼路徑；以假 capture 測試不載入本地模型、不探測自架 health 及不驗證不適用視窗參數。
+- [x] 3.3 完成 Terminate→Termination 收尾，ack 2 秒與總停止 5 秒上限，停止時撤銷 producer 入列權限、取出一次性尾端快照且不派發新字幕／LLM；以正常 ack、無 ack、停在 read/write/connect 與停止後 callback 完成的 mock 整合測試驗證。
+- [x] 3.4 實作 15 秒 frame 存活監控及雲端錯誤狀態，不自動重連、重播或切換後端；以斷線、認證、rate limit、無 frame 與音源錯誤測試驗證停止及可手動重啟。
 - [ ] 3.5 接入主視窗退出與 180 分鐘 session 上限，明確關閉隱藏 overlay；以假時鐘和關閉主視窗的測試驗證期限及背景 worker 結束。
 
 ## 4. 翻譯與字幕事件
 
-- [ ] 4.1 建立串流完成段的可取消後處理 queue（2 個執行中、8 個待處理），溢位保留原文並提示；以延遲假 LLM 測試接收不阻塞、queue 有界與取消生效。
-- [ ] 4.2 重用既有翻譯／校稿／同語言 no-op 策略，以 session+turn 去重；測試 partial 不呼叫 LLM、final 只呼叫一次、auto／zh 開關組合及錯誤保留原文。
+- [x] 4.1 建立串流完成段的可取消後處理 queue（2 個執行中、8 個待處理），溢位保留原文並提示；以延遲假 LLM 測試接收不阻塞、queue 有界與取消生效。
+- [x] 4.2 重用既有翻譯／校稿／同語言 no-op 策略，以 session+turn 去重；測試 partial 不呼叫 LLM、final 只呼叫一次、auto／zh 開關組合及錯誤保留原文。
 - [ ] 4.3 擴充字幕及狀態 payload 的 session 身分、revision、phase，同步既有後端發送與 TS 型別；以序列化與舊後端事件測試驗證欄位一致及 source 切換不碰撞。
 
 ## 5. 即時字幕介面
 
 - [x] 5.1 設定頁新增獨立供應商管理，集中編輯 API Key、URL、本地模型路徑並可新增同類多設定；批次及即時頁只選供應商與模型，一律使用抽出的共用下拉元件；以前端建置及 UI 操作驗證完整設定保存、來源切換及手動模型。
 - [x] 5.2 依來源隱藏本地／自架與視窗／LocalAgreement 專屬設定，保留語言、音源、翻譯、校稿及顯示控制；以來回切換測試驗證原值不遺失、變更需重啟提示仍有效。
-- [ ] 5.3 overlay 依 session/sequence/revision/phase 就地更新且區分暫定／完成；以可執行的前端事件狀態測試驗證重複、較舊 revision、final 後 partial 與跨 session 遲到譯文。
-- [ ] 5.4 開始／停止清空字幕與計時器，晚到譯文不重建已清空／移出段；以自動清空、停止再開始及亂序回填測試驗證，維持既有換行與有限歷史規則。
-- [ ] 5.5 所有後端統一容量式歷史（最多 20 段含當前段），以高度／字級變更、超長 turn 的內容區捲動、短 turn 接續及晚到譯文測試驗證；AssemblyAI 不套 4 秒輪替或閱讀等待，本地 4 秒閱讀驗收仍追蹤於增量 change 6b.8。
+- [x] 5.3 overlay 依 session/sequence/revision/phase 就地更新且區分暫定／完成；以可執行的前端事件狀態測試驗證重複、較舊 revision、final 後 partial 與跨 session 遲到譯文。
+- [x] 5.4 開始／停止清空字幕與計時器，晚到譯文不重建已清空／移出段；以自動清空、停止再開始及亂序回填測試驗證，維持既有換行與有限歷史規則。
+- [x] 5.5 所有後端統一容量式歷史（最多 20 段含當前段），以高度／字級變更、超長 turn 的內容區捲動、短 turn 接續及晚到譯文測試驗證；AssemblyAI 不套 4 秒輪替或閱讀等待，本地 4 秒閱讀驗收仍追蹤於增量 change 6b.8。
 - [ ] 5.6 驗證所有後端在 stopping 後均不新增字幕／LLM，既有本地 flush 僅內部完成；測試停止與解碼／翻譯完成競態，確認新 session 不受舊結果影響。
 
 ## 6. 不需付費服務的整合驗證
 
-- [ ] 6.1 建立 mock WebSocket＋假 capture＋假 LLM 完整 session 測試，覆蓋啟動、音訊、partial/final、停止與錯誤；測試不需 GPU、Whisper、音訊裝置或 API Key，且不呼叫外部服務。
-- [ ] 6.2 執行 cargo check、相關 cargo test、npm run build 與前端事件測試；確認所有檢查通過並記錄實際命令，不把只建置成功當成辨識品質驗收。
+- [x] 6.1 建立 mock WebSocket＋假 capture＋假 LLM 完整 session 測試，覆蓋啟動、音訊、partial/final、停止與錯誤；測試不需 GPU、Whisper、音訊裝置或 API Key，且不呼叫外部服務。
+- [x] 6.2 執行 cargo check、相關 cargo test、npm run build 與前端事件測試；確認所有檢查通過並記錄實際命令，不把只建置成功當成辨識品質驗收。
 - [ ] 6.3 驗證本地 Whisper、自架 ASR、錄音互斥與批次設定的回歸，並檢查增量 change 的三路徑條文仍一致；以既有測試及來源切換操作紀錄確認。
 
 ## 7. 明確啟用的實際驗收與交付
@@ -64,3 +64,18 @@
 - 使用目前 Vite dev server 的 `/tests/asr-provider-ui.html` 在 Chromium 執行實際 DOM 操作測試：共用下拉、新增／命名同類設定、獨立 URL、自動儲存、批次／字幕切換、獨立模型及完整最新設定保存皆通過。測試使用假 IPC，不使用 dev app 金鑰、不連接付費服務。
 - `openspec validate add-assemblyai-streaming-caption --strict`：通過。
 - 2.2／3.1 的 helper 測試已通過，但尚缺原始 capture callback 的有界入列與 manager 啟動取消整合證據，恢復為未完成，待完整驗證後勾選。
+
+## 第二段驗證（2026-10-02）
+
+- Herdr `voxnote-overlay`（`wC:pF`）完成 overlay，主代理以目前 dev server 重跑 `/tests/live-caption-overlay.html`：25 項 Chromium 事件／真實 DOM 版面測試通過，對應 5.3–5.5。
+- `cargo test audio_recording::queue::tests`：3 項通過，涵蓋 producer 2 秒上限、錄音預設完整保留、停止後完成的 callback 不入列與一次性尾端快照。
+- `cargo test live_caption::lifecycle_tests`：5 項通過，涵蓋雲端不驗證本地／視窗設定、connecting／stopping 音源保留、有限完成等待及停止時 LLM future 不啟動／可取消。
+- `npx tsc -p tests/tsconfig.json`、`npm run build` 通過；`/tests/asr-provider-ui.html` Chromium 5 組通過，新增 connecting 取消／恢復操作驗證。
+
+### 最終整合結果
+
+- Herdr `voxnote-stream`（`wC:pG`）提供可注入 transport／事件／LLM 的串流核心與 mock session；主代理完成共用 queue、manager、commands、主視窗退出與前端接線。
+- 修正共用收音啟動 reservation、停止命令的 session 身分、停止後 LLM future 再次喚醒的輪詢閘門；本地增量段在完成前維持 partial，校稿保留 ASR 原文快照。
+- 主代理重跑 `cargo test`：122 項通過；`cargo check`、`npx tsc -p tests/tsconfig.json`、`npm run build`、`git diff --check` 通過。
+- Chromium `/tests/asr-provider-ui.html`：6 組通過；`/tests/live-caption-overlay.html`：26 項通過。新增舊開始回應不停止新 session，以及段內 confirmed 不等於整段 final 的驗證。
+- 3.5 的主視窗退出實際 GUI／背景程序證據、4.3／5.6 的既有解碼器完整事件及停止競態、6.3 的實際來源切換／三路徑回歸與第 7 節實測仍保持未完成；mock 通過不代表付費服務的辨識品質已驗收。

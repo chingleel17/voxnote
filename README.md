@@ -83,7 +83,7 @@ VoxNote 是一款以**本地優先**設計的桌面會議助理。所有資料�
 
 供應商的 API Key、URL 與本地 GGML 模型檔路徑集中在「設定 → 語音辨識供應商」管理，支援同類多組設定；批次 ASR 與即時字幕各自選擇供應商設定及可用模型。既有設定會相容遷移並保留原金鑰與服務位址。
 
-使用 AssemblyAI 即時串流前，請在設定頁配置供應商，再於即時字幕頁明確選取該設定。串流依服務連線時間計費；停止字幕後會終止連線。離線模擬測試可在 `src-tauri` 執行 `cargo test live_caption::assemblyai::tests`，不需要 API Key 或外部服務；這些測試不代表實際語音辨識品質驗收。
+使用 AssemblyAI 即時串流前，請在設定頁配置供應商，再於即時字幕頁明確選取該設定。串流依服務連線時間計費；停止字幕後會終止連線。離線模擬測試可在 `src-tauri` 執行 `cargo test live_caption::assemblyai`，不需要 API Key 或外部服務；這些測試不代表實際語音辨識品質驗收。
 
 ### 語音轉文字（ASR）
 
@@ -225,6 +225,21 @@ npm run dev
 # 啟動完整 Tauri 應用（含 Rust 後端，首次編譯約 2-5 分鐘）
 npm run tauri dev
 ```
+
+即時字幕的離線驗證：
+
+```bash
+# 專案根目錄：前端與操作測試型別檢查
+npm run build
+npx tsc -p tests/tsconfig.json
+
+# src-tauri 目錄：收音佇列、生命週期與模擬 WebSocket
+cargo test audio_recording::queue::tests
+cargo test live_caption::lifecycle_tests
+cargo test live_caption::assemblyai
+```
+
+Vite 啟動後，可在瀏覽器開啟 `/tests/asr-provider-ui.html` 與 `/tests/live-caption-overlay.html` 執行供應商操作、字幕事件及版面測試。測試頁使用假 IPC，不讀取桌面設定，也不連接付費 ASR／LLM；實際音訊準確度與 Windows 裝置操作另行驗收。
 
 ### 4. 建置發行版
 

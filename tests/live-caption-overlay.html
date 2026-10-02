@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>即時字幕事件與版面測試</title>
+  </head>
+  <body>
+    <main id="caption-overlay" style="width: 420px; height: 150px">
+      <header id="caption-drag-handle">
+        <span>即時字幕</span>
+        <div id="caption-controls">
+          <button id="caption-lock" type="button">鎖定</button>
+          <button id="caption-close" type="button">關閉</button>
+        </div>
+      </header>
+      <section id="caption-list" aria-live="polite"></section>
+    </main>
+    <pre id="result" role="status">測試進行中</pre>
+    <script type="module" src="./live-caption-overlay.ts"></script>
+  </body>
+</html>

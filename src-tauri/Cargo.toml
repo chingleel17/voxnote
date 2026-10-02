@@ -40,3 +40,6 @@ futures-util = { version = "0.3.34", features = ["sink"] }
 
 [features]
 live-caption-cuda = ["whisper-rs/cuda"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

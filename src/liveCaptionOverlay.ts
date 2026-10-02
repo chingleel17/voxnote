@@ -31,6 +31,14 @@ let clearSeconds = 8;
 let lastCaptionAt = 0;
 let locked = false;
 let activeSessionId: string | null = null;
+let highestSequence = 0;
+const retiredSessions = new Set<string>();
+
+function clearCaptions(): void {
+  captions = [];
+  lastCaptionAt = 0;
+  renderCaptions();
+}
 
 function renderLockButton(): void {
   if (!lockButton) return;
@@ -38,53 +46,60 @@ function renderLockButton(): void {
   lockButton.classList.toggle('is-locked', locked);
 }
 
-function renderCaptions(): void {
+function renderCaptions(scrollToLatest = false): void {
   if (!captionList) return;
   const renderLines = (visibleCaptions: LiveCaptionPayload[]): void => {
-    captionList.innerHTML = '';
+    const existingLines = new Map(
+      Array.from(captionList.querySelectorAll<HTMLElement>('[data-sequence]'))
+        .map((line) => [line.dataset.sequence, line]),
+    );
     if (visibleCaptions.length === 0) {
       const empty = document.createElement('p');
       empty.className = 'caption-line caption-empty';
       empty.textContent = '等待語音…';
-      captionList.appendChild(empty);
+      captionList.replaceChildren(empty);
       return;
     }
 
+    const lines: HTMLElement[] = [];
     for (const [index, caption] of visibleCaptions.entries()) {
-    const line = document.createElement('p');
-    line.className = `caption-line ${index === visibleCaptions.length - 1 ? 'caption-current' : 'caption-history'}${caption.is_tentative ? ' caption-tentative' : ''}`;
-    if (caption.tentative_text) {
-      const confirmed = document.createElement('span');
-      confirmed.className = 'caption-confirmed';
-      confirmed.textContent = caption.confirmed_text;
-      const tentative = document.createElement('span');
-      tentative.className = 'caption-tentative-text';
-      tentative.textContent = caption.tentative_text;
-      line.append(confirmed, tentative);
-    } else {
-      line.textContent = caption.display_text;
+      const line = existingLines.get(String(caption.sequence)) ?? document.createElement('p');
+      line.dataset.sequence = String(caption.sequence);
+      line.dataset.phase = caption.phase;
+      line.className = `caption-line ${index === visibleCaptions.length - 1 ? 'caption-current' : 'caption-history'}${caption.is_tentative ? ' caption-tentative' : ''}`;
+      if (caption.tentative_text) {
+        const confirmed = document.createElement('span');
+        confirmed.className = 'caption-confirmed';
+        confirmed.textContent = caption.confirmed_text;
+        const tentative = document.createElement('span');
+        tentative.className = 'caption-tentative-text';
+        tentative.textContent = caption.tentative_text;
+        line.replaceChildren(confirmed, tentative);
+      } else {
+        line.textContent = caption.display_text;
+      }
+      lines.push(line);
     }
-      captionList.appendChild(line);
-    }
-    captionList.scrollTop = captionList.scrollHeight;
+    captionList.replaceChildren(...lines);
   };
 
-  const retained = captions.slice(-MAX_RETAINED_CAPTIONS);
+  const retained = captions;
   renderLines(retained);
-  if (retained.length <= 1 || captionList.clientHeight <= 0) return;
-
-  const gap = Number.parseFloat(getComputedStyle(captionList).rowGap) || 0;
-  const availableHeight = captionList.clientHeight;
-  const lines = Array.from(captionList.children) as HTMLElement[];
-  let height = 0;
-  let visibleCount = 0;
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const nextHeight = height + lines[index].offsetHeight + (visibleCount > 0 ? gap : 0);
-    if (visibleCount >= 2 && nextHeight > availableHeight) break;
-    height = nextHeight;
-    visibleCount += 1;
+  if (retained.length > 2 && captionList.clientHeight > 0) {
+    const gap = Number.parseFloat(getComputedStyle(captionList).rowGap) || 0;
+    const availableHeight = captionList.clientHeight;
+    const lines = Array.from(captionList.children) as HTMLElement[];
+    let height = 0;
+    let visibleCount = 0;
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const nextHeight = height + lines[index].offsetHeight + (visibleCount > 0 ? gap : 0);
+      if (visibleCount >= 2 && nextHeight > availableHeight) break;
+      height = nextHeight;
+      visibleCount += 1;
+    }
+    if (visibleCount < retained.length) renderLines(retained.slice(-Math.max(2, visibleCount)));
   }
-  renderLines(retained.slice(-Math.max(2, visibleCount)));
+  if (scrollToLatest) captionList.scrollTop = captionList.scrollHeight;
 }
 
 void listenLiveCaption((payload) => {
@@ -94,36 +109,37 @@ void listenLiveCaption((payload) => {
   if (existingIndex >= 0) {
     const existing = captions[existingIndex];
     if (payload.revision <= existing.revision) return;
-    if (existing.phase !== 'partial' && payload.phase === 'partial') return;
-    speechChanged =
-      payload.phase !== 'postprocessed' &&
-      (payload.original !== existing.original || payload.phase !== existing.phase);
+    if (existing.phase !== 'partial' && payload.phase !== 'postprocessed') return;
+    if (existing.phase === 'partial' && payload.phase === 'postprocessed') return;
+    if (payload.phase === 'postprocessed' && payload.original !== existing.original) return;
+    speechChanged = payload.phase !== 'postprocessed' && payload.original !== existing.original;
     captions[existingIndex] = payload;
   } else {
     if (payload.phase === 'postprocessed') return;
-    const latestSequence = captions[captions.length - 1]?.sequence ?? 0;
-    if (payload.sequence < latestSequence) return;
+    if (payload.sequence <= highestSequence) return;
+    highestSequence = payload.sequence;
     captions = [...captions, payload].slice(-MAX_RETAINED_CAPTIONS);
     speechChanged = true;
   }
   if (speechChanged) lastCaptionAt = Date.now();
-  renderCaptions();
+  renderCaptions(speechChanged);
 });
 
 void listenLiveCaptionStatus((status) => {
   if (status.active) {
+    if (!status.session_id || retiredSessions.has(status.session_id)) return;
     if (status.session_id === activeSessionId) return;
+    if (activeSessionId) retiredSessions.add(activeSessionId);
     activeSessionId = status.session_id;
-    captions = [];
-    lastCaptionAt = 0;
-    renderCaptions();
+    highestSequence = 0;
+    clearCaptions();
     return;
   }
-  if (status.session_id && activeSessionId && status.session_id !== activeSessionId) return;
+  if (!activeSessionId || (status.session_id && status.session_id !== activeSessionId)) return;
+  retiredSessions.add(activeSessionId);
   activeSessionId = null;
-  captions = [];
-  lastCaptionAt = 0;
-  renderCaptions();
+  highestSequence = 0;
+  clearCaptions();
 });
 
 const resizeObserver = new ResizeObserver(() => renderCaptions());
@@ -144,8 +160,7 @@ void listenLiveCaptionSettings((settings) => {
 window.setInterval(() => {
   if (clearSeconds <= 0 || captions.length === 0 || lastCaptionAt === 0) return;
   if (Date.now() - lastCaptionAt >= clearSeconds * 1000) {
-    captions = [];
-    renderCaptions();
+    clearCaptions();
   }
 }, CLEAR_CHECK_INTERVAL);
 
@@ -156,7 +171,7 @@ void listenLiveCaptionInteractive((isInteractive) => {
 });
 
 closeButton?.addEventListener('click', () => {
-  void stopLiveCaption().catch(() => undefined);
+  void stopLiveCaption(activeSessionId ?? undefined).catch(() => undefined);
 });
 
 // 鎖定＝穿透：開啟後滑鼠事件穿透至下層視窗，游標移回標題列或邊框時仍會暫時恢復互動，

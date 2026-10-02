@@ -33,11 +33,14 @@ let saved: AppConfig | null = null;
 let liveStatus: LiveCaptionStatus = { active: false, backend: null, audio_source: null, session_id: null };
 let callbackId = 0;
 let startCalls = 0;
+let mockStartupDelay = 0;
+let mockStartupCancelled = false;
+let mockStaleStartResponse = false;
 Object.assign(window, {
   __TAURI_INTERNALS__: {
     transformCallback: () => ++callbackId,
     unregisterCallback: () => undefined,
-    invoke: async (command: string, args?: { config?: AppConfig }): Promise<unknown> => {
+    invoke: async (command: string, args?: { config?: AppConfig; request?: { session_id?: string }; sessionId?: string }): Promise<unknown> => {
       if (command === 'get_settings') return structuredClone(fixtureConfig);
       if (command === 'save_settings') {
         saved = structuredClone(args?.config ?? fixtureConfig);
@@ -48,10 +51,19 @@ Object.assign(window, {
       if (command === 'list_live_caption_audio_sources') return { microphones: [], system_outputs: [], system_audio_supported: true };
       if (command === 'start_live_caption') {
         startCalls += 1;
-        liveStatus = { active: true, backend: 'assemblyai_streaming', audio_source: 'system', session_id: 'fixture-session' };
+        mockStartupCancelled = false;
+        if (mockStartupDelay > 0) await delay(mockStartupDelay);
+        if (mockStartupCancelled) throw new Error('測試串流啟動已取消');
+        const response: LiveCaptionStatus = { active: true, backend: 'assemblyai_streaming', audio_source: 'system', session_id: args?.request?.session_id ?? 'fixture-session' };
+        if (mockStaleStartResponse) return response;
+        liveStatus = response;
         return liveStatus;
       }
       if (command === 'stop_live_caption') {
+        if (args?.sessionId && liveStatus.session_id && args.sessionId !== liveStatus.session_id) {
+          throw new Error('欲停止的 session 已結束');
+        }
+        mockStartupCancelled = true;
         liveStatus = { ...liveStatus, active: false };
         return liveStatus;
       }
@@ -155,6 +167,26 @@ async function run(): Promise<void> {
   await delay(20);
   assert(!selectByLabel(root, '音訊來源').disabled, '停止後應恢復音源選擇');
   results.push('字幕開始：保留最新完整設定與重啟提示');
+
+  mockStartupDelay = 120;
+  start.click();
+  await delay(20);
+  assert(!stop.disabled, 'connecting 期間必須可停止');
+  stop.click();
+  await delay(160);
+  assert(!liveStatus.active && !start.disabled, '取消 connecting 後應可重新開始');
+  assert(root.querySelector<HTMLElement>('.live-caption-error')!.hidden, '使用者取消不應當作啟動錯誤');
+  results.push('connecting：可取消且不回到執行中');
+
+  mockStaleStartResponse = true;
+  start.click();
+  await delay(20);
+  liveStatus = { active: true, backend: 'local_whisper', audio_source: 'system', session_id: 'newer-session' };
+  stop.click();
+  await delay(160);
+  assert(liveStatus.active && liveStatus.session_id === 'newer-session', '舊開始回應不能停止新 session');
+  assert(root.querySelector<HTMLElement>('.live-caption-error')!.hidden, '舊 session 已結束不應誤報新的 session 錯誤');
+  results.push('session 停止：舊開始回應不影響新 session');
 }
 
 void run().then(() => {

@@ -32,8 +32,7 @@ pub async fn start_live_caption(
     }
     manager
         .start(&app_handle, recording_manager.inner(), config, request)
-        .map_err(|error| error.to_string())?;
-    Ok(manager.status())
+        .map_err(|error| error.to_string())
 }
 
 /// 決定本次 session 要使用的即時字幕轉錄位址。
@@ -95,11 +94,12 @@ async fn probe_health(base_url: &str) -> bool {
 
 #[tauri::command]
 pub async fn stop_live_caption(
+    session_id: Option<String>,
     app_handle: AppHandle,
     manager: State<'_, LiveCaptionManager>,
 ) -> Result<LiveCaptionStatus, String> {
     manager
-        .stop(&app_handle)
+        .stop_session(&app_handle, session_id.as_deref())
         .map_err(|error| error.to_string())?;
     Ok(manager.status())
 }

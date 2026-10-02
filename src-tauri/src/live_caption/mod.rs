@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Condvar, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -18,7 +18,7 @@ use crate::{
     ai::call_llm,
     asr::transcribe_live_caption_remote,
     audio_recording::{
-        self, DesktopRecordingManager, RecordingDeviceList, SharedError, SharedQueue,
+        self, AudioQueue, DesktopRecordingManager, RecordingDeviceList, SharedError, SharedQueue,
     },
     commands::ai_cmds::PROOFREAD_CORE_SYSTEM,
     config::AppConfig,
@@ -26,6 +26,8 @@ use crate::{
 
 mod agreement;
 mod assemblyai;
+#[cfg(test)]
+mod lifecycle_tests;
 use agreement::LocalAgreement;
 
 pub const LIVE_CAPTION_EVENT: &str = "live-caption";
@@ -80,6 +82,8 @@ fn nearest_font_size_preset(value: u32) -> u32 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct StartLiveCaptionRequest {
     pub audio_source: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -162,8 +166,10 @@ pub struct LiveCaptionManager {
 
 struct ActiveLiveCaptionSession {
     stop_tx: mpsc::Sender<()>,
-    finished_rx: mpsc::Receiver<()>,
+    finished: Arc<SessionCompletion>,
+    queue: SharedQueue,
     running: Arc<AtomicBool>,
+    ready: Arc<AtomicBool>,
     handle: thread::JoinHandle<()>,
     backend: String,
     audio_source: String,
@@ -174,6 +180,52 @@ struct ActiveLiveCaptionSession {
     click_through_enabled: Arc<AtomicBool>,
 }
 
+impl ActiveLiveCaptionSession {
+    fn request_stop(&self) -> Result<Instant> {
+        let deadline = {
+            let mut queue = self.queue.lock().map_err(|_| anyhow!("無法停止音訊入列"))?;
+            queue.freeze();
+            queue.stopped_at().unwrap_or_else(Instant::now) + Duration::from_secs(5)
+        };
+        self.running.store(false, Ordering::SeqCst);
+        self.ready.store(false, Ordering::SeqCst);
+        let _ = self.stop_tx.send(());
+        Ok(deadline)
+    }
+}
+
+#[derive(Default)]
+struct SessionCompletion {
+    completed: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl SessionCompletion {
+    fn complete(&self) {
+        if let Ok(mut completed) = self.completed.lock() {
+            *completed = true;
+            self.changed.notify_all();
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.completed
+            .lock()
+            .map(|completed| *completed)
+            .unwrap_or(false)
+    }
+
+    fn wait(&self, timeout: Duration) -> bool {
+        let Ok(completed) = self.completed.lock() else {
+            return false;
+        };
+        self.changed
+            .wait_timeout_while(completed, timeout, |completed| !*completed)
+            .map(|(completed, _)| *completed)
+            .unwrap_or(false)
+    }
+}
+
 impl LiveCaptionManager {
     pub fn start(
         &self,
@@ -181,60 +233,55 @@ impl LiveCaptionManager {
         recording_manager: &DesktopRecordingManager,
         config: AppConfig,
         request: Option<StartLiveCaptionRequest>,
-    ) -> Result<()> {
+    ) -> Result<LiveCaptionStatus> {
+        let _capture_start = audio_recording::reserve_capture_start()?;
         if audio_recording::is_recording(recording_manager) {
             return Err(anyhow!("目前有桌面錄音進行中，無法啟動即時字幕"));
         }
 
         let audio_source = request
-            .and_then(|request| request.audio_source)
+            .as_ref()
+            .and_then(|request| request.audio_source.clone())
             .unwrap_or_else(|| config.live_caption_audio_source.clone());
         validate_audio_source(&audio_source)?;
+        let session_id = match request
+            .as_ref()
+            .and_then(|request| request.session_id.as_deref())
+        {
+            Some(id) => uuid::Uuid::parse_str(id)
+                .map_err(|_| anyhow!("即時字幕 session ID 格式無效"))?
+                .to_string(),
+            None => uuid::Uuid::new_v4().to_string(),
+        };
 
         let backend = normalize_backend(&config.live_caption_backend)?;
-        if backend != "assemblyai_streaming" {
-            validate_caption_window(&config)?;
-        } else if config.assembly_ai_key.trim().is_empty() {
-            return Err(anyhow!("AssemblyAI API Key 未設定"));
-        } else if config.live_caption_assemblyai_model.trim().is_empty() {
-            return Err(anyhow!("AssemblyAI 即時串流模型未設定"));
-        }
-        if backend == "local_whisper" {
-            let model_path = config.live_caption_model_path.trim();
-            if model_path.is_empty() {
-                return Err(anyhow!("尚未設定即時字幕的 GGML 模型檔路徑"));
-            }
-            if !std::path::Path::new(model_path).is_file() {
-                return Err(anyhow!("即時字幕模型檔不存在：{}", model_path));
-            }
-        }
+        validate_backend_config(&config, &backend)?;
 
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| anyhow!("無法取得即時字幕狀態"))?;
         if let Some(session) = guard.as_ref() {
-            if session.running.load(Ordering::SeqCst) {
+            if !session.finished.is_finished() {
                 return Err(anyhow!("已有即時字幕進行中"));
             }
-            let finished = guard.take();
-            drop(guard);
-            if let Some(session) = finished {
+            if let Some(session) = guard.take() {
                 let _ = session.handle.join();
             }
-            guard = self
-                .inner
-                .lock()
-                .map_err(|_| anyhow!("無法取得即時字幕狀態"))?;
         }
 
-        let queue: SharedQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let queue: SharedQueue = Arc::new(Mutex::new(if backend == "assemblyai_streaming" {
+            AudioQueue::bounded(SAMPLE_RATE as usize * 2)
+        } else {
+            AudioQueue::default()
+        }));
         let error_state: SharedError = Arc::new(Mutex::new(None));
         let running = Arc::new(AtomicBool::new(true));
+        let ready = Arc::new(AtomicBool::new(false));
         let (stop_tx, stop_rx) = mpsc::channel();
-        let (finished_tx, finished_rx) = mpsc::channel();
+        let finished = Arc::new(SessionCompletion::default());
+        let thread_finished = finished.clone();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let session_id = uuid::Uuid::new_v4().to_string();
         let app_handle = app.clone();
         let thread_config = config.clone();
         let thread_source = audio_source.clone();
@@ -245,6 +292,7 @@ impl LiveCaptionManager {
         let thread_error = error_state.clone();
         let startup_tx = ready_tx.clone();
         let error_app = app_handle.clone();
+        let startup_deadline = Instant::now() + Duration::from_secs(10);
 
         let handle = thread::spawn(move || {
             let result = run_live_caption_session(
@@ -258,37 +306,66 @@ impl LiveCaptionManager {
                 thread_running.clone(),
                 stop_rx,
                 ready_tx,
+                startup_deadline,
             );
             thread_running.store(false, Ordering::SeqCst);
-            let _ = finished_tx.send(());
             if let Err(error) = result {
-                let _ = startup_tx.send(Err(anyhow!(error.to_string())));
+                let _ = startup_tx.try_send(Err(anyhow!(error.to_string())));
                 emit_error(&error_app, error.to_string());
             }
+            thread_finished.complete();
         });
 
-        match ready_rx.recv_timeout(Duration::from_secs(11)) {
+        let click_through_enabled = Arc::new(AtomicBool::new(config.live_caption_click_through));
+        *guard = Some(ActiveLiveCaptionSession {
+            stop_tx,
+            finished,
+            queue,
+            running: running.clone(),
+            ready: ready.clone(),
+            handle,
+            backend: backend.clone(),
+            audio_source: audio_source.clone(),
+            session_id: session_id.clone(),
+            click_through_enabled: click_through_enabled.clone(),
+        });
+        // 必須在等待 capture／Begin 前釋放鎖，停止命令才能取消 connecting session。
+        drop(guard);
+
+        let startup_result = if backend == "assemblyai_streaming" {
+            ready_rx.recv_timeout(startup_deadline.saturating_duration_since(Instant::now()))
+        } else {
+            ready_rx
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        };
+        match startup_result {
             Ok(Ok(())) => {
+                let guard = self
+                    .inner
+                    .lock()
+                    .map_err(|_| anyhow!("無法取得即時字幕狀態"))?;
+                if !guard
+                    .as_ref()
+                    .is_some_and(|session| session.session_id == session_id)
+                    || !running.load(Ordering::SeqCst)
+                {
+                    return Err(anyhow!("即時字幕啟動已取消"));
+                }
+                drop(guard);
                 let overlay = match app.get_webview_window(LIVE_CAPTION_OVERLAY_LABEL) {
                     Some(overlay) => overlay,
                     None => {
-                        running.store(false, Ordering::SeqCst);
-                        let _ = stop_tx.send(());
-                        let _ = handle.join();
+                        let _ = self.stop_session(app, Some(&session_id));
                         return Err(anyhow!("找不到即時字幕浮動視窗"));
                     }
                 };
                 if let Err(error) = overlay.show() {
-                    running.store(false, Ordering::SeqCst);
-                    let _ = stop_tx.send(());
-                    let _ = handle.join();
+                    let _ = self.stop_session(app, Some(&session_id));
                     return Err(anyhow!("無法開啟即時字幕浮動視窗：{error}"));
                 }
                 if let Err(error) = overlay.set_always_on_top(true) {
-                    running.store(false, Ordering::SeqCst);
-                    let _ = stop_tx.send(());
-                    let _ = handle.join();
-                    let _ = overlay.hide();
+                    let _ = self.stop_session(app, Some(&session_id));
                     return Err(anyhow!("無法將即時字幕視窗設為最上層：{error}"));
                 }
                 // 每次啟動皆套用預設大小與位置：目前無位置持久化機制，
@@ -303,8 +380,6 @@ impl LiveCaptionManager {
                         click_through: config.live_caption_click_through,
                     },
                 );
-                let click_through_enabled =
-                    Arc::new(AtomicBool::new(config.live_caption_click_through));
                 let _ = overlay.set_ignore_cursor_events(config.live_caption_click_through);
                 // watcher 全程運作：鎖定關閉時強制維持可互動，鎖定開啟時依游標位置動態切換。
                 spawn_click_through_watcher(
@@ -312,6 +387,18 @@ impl LiveCaptionManager {
                     running.clone(),
                     click_through_enabled.clone(),
                 );
+                let guard = self
+                    .inner
+                    .lock()
+                    .map_err(|_| anyhow!("無法取得即時字幕狀態"))?;
+                if !guard
+                    .as_ref()
+                    .is_some_and(|session| session.session_id == session_id)
+                    || !running.load(Ordering::SeqCst)
+                {
+                    return Err(anyhow!("即時字幕啟動已取消"));
+                }
+                ready.store(true, Ordering::SeqCst);
                 let _ = app.emit(
                     LIVE_CAPTION_STATUS_EVENT,
                     LiveCaptionStatus {
@@ -321,60 +408,79 @@ impl LiveCaptionManager {
                         session_id: Some(session_id.clone()),
                     },
                 );
-                *guard = Some(ActiveLiveCaptionSession {
-                    stop_tx,
-                    finished_rx,
-                    running,
-                    handle,
-                    backend,
-                    audio_source,
-                    session_id,
-                    click_through_enabled,
-                });
-                Ok(())
+                Ok(LiveCaptionStatus {
+                    active: true,
+                    backend: Some(backend),
+                    audio_source: Some(audio_source),
+                    session_id: Some(session_id),
+                })
             }
             Ok(Err(error)) => {
-                running.store(false, Ordering::SeqCst);
-                let _ = stop_tx.send(());
-                let _ = handle.join();
+                let _ = self.stop_session(app, Some(&session_id));
                 Err(error)
             }
             Err(_) => {
-                running.store(false, Ordering::SeqCst);
-                let _ = stop_tx.send(());
+                let _ = self.stop_session(app, Some(&session_id));
                 Err(anyhow!("即時字幕啟動逾時或執行緒未回報結果"))
             }
         }
     }
 
     pub fn stop(&self, app: &AppHandle) -> Result<()> {
-        let session = self
+        self.stop_session(app, None)
+    }
+
+    pub(crate) fn stop_session(&self, app: &AppHandle, expected_id: Option<&str>) -> Result<()> {
+        let guard = self
             .inner
             .lock()
-            .map_err(|_| anyhow!("無法取得即時字幕狀態"))?
-            .take()
+            .map_err(|_| anyhow!("無法取得即時字幕狀態"))?;
+        let session = guard
+            .as_ref()
             .ok_or_else(|| anyhow!("目前沒有進行中的即時字幕"))?;
-        session.running.store(false, Ordering::SeqCst);
-        let _ = session.stop_tx.send(());
-        if session
-            .finished_rx
-            .recv_timeout(Duration::from_secs(5))
-            .is_ok()
-        {
-            let _ = session.handle.join();
-        } else {
+        if expected_id.is_some_and(|expected| expected != session.session_id) {
+            return Err(anyhow!("欲停止的即時字幕 session 已結束"));
+        }
+        let stop_deadline = session.request_stop()?;
+        let finished = session.finished.clone();
+        let session_id = session.session_id.clone();
+        let status = LiveCaptionStatus {
+            active: false,
+            backend: Some(session.backend.clone()),
+            audio_source: Some(session.audio_source.clone()),
+            session_id: Some(session_id.clone()),
+        };
+        // 在等待 worker 前先清空／隱藏字幕；session 仍保留，以防停止期間重啟。
+        close_overlay(app);
+        drop(guard);
+        let _ = app.emit(LIVE_CAPTION_STATUS_EVENT, status);
+        if !finished.wait(stop_deadline.saturating_duration_since(Instant::now())) {
             return Err(anyhow!("即時字幕停止逾時，背景工作已要求取消"));
         }
-        let _ = app.emit(
-            LIVE_CAPTION_STATUS_EVENT,
-            LiveCaptionStatus {
-                active: false,
-                backend: Some(session.backend),
-                audio_source: Some(session.audio_source),
-                session_id: Some(session.session_id),
-            },
-        );
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow!("無法取得即時字幕狀態"))?;
+        if guard
+            .as_ref()
+            .is_some_and(|session| session.session_id == session_id)
+        {
+            if let Some(session) = guard.take() {
+                let _ = session.handle.join();
+            }
+        }
         Ok(())
+    }
+
+    pub fn has_session(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|session| {
+                session
+                    .as_ref()
+                    .is_some_and(|session| !session.finished.is_finished())
+            })
+            .unwrap_or(true)
     }
 
     pub fn status(&self) -> LiveCaptionStatus {
@@ -392,7 +498,8 @@ impl LiveCaptionManager {
         guard
             .as_ref()
             .map(|session| LiveCaptionStatus {
-                active: session.running.load(Ordering::SeqCst),
+                active: session.ready.load(Ordering::SeqCst)
+                    && session.running.load(Ordering::SeqCst),
                 backend: Some(session.backend.clone()),
                 audio_source: Some(session.audio_source.clone()),
                 session_id: Some(session.session_id.clone()),
@@ -446,6 +553,28 @@ fn normalize_backend(backend: &str) -> Result<String> {
         "assemblyai_streaming" => Ok("assemblyai_streaming".into()),
         other => Err(anyhow!("不支援的即時字幕轉錄後端：{}", other)),
     }
+}
+
+fn validate_backend_config(config: &AppConfig, backend: &str) -> Result<()> {
+    if backend == "assemblyai_streaming" {
+        assemblyai::build_connection_config(
+            &config.assembly_ai_key,
+            &config.live_caption_assemblyai_model,
+            &config.live_caption_language,
+        )?;
+        return Ok(());
+    }
+    validate_caption_window(config)?;
+    if backend == "local_whisper" {
+        let model_path = config.live_caption_model_path.trim();
+        if model_path.is_empty() {
+            return Err(anyhow!("尚未設定即時字幕的 GGML 模型檔路徑"));
+        }
+        if !std::path::Path::new(model_path).is_file() {
+            return Err(anyhow!("即時字幕模型檔不存在：{model_path}"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_audio_source(source: &str) -> Result<()> {
@@ -509,6 +638,7 @@ fn run_live_caption_session(
     running: Arc<AtomicBool>,
     stop_rx: mpsc::Receiver<()>,
     ready_tx: mpsc::SyncSender<Result<()>>,
+    startup_deadline: Instant,
 ) -> Result<()> {
     let whisper_context = if backend == "local_whisper" {
         Some(
@@ -523,7 +653,7 @@ fn run_live_caption_session(
     };
 
     let level_value = Arc::new(Mutex::new(0.0f32));
-    let mic_stream = if audio_source == "microphone" {
+    let mut mic_stream = if audio_source == "microphone" {
         let selected = audio_recording::select_input_device(None)?;
         let stream = audio_recording::start_microphone_stream(
             selected.device,
@@ -541,7 +671,7 @@ fn run_live_caption_session(
     };
 
     #[cfg(target_os = "windows")]
-    let loopback_handle = if audio_source == "system" {
+    let mut loopback_handle = if audio_source == "system" {
         Some(audio_recording::start_windows_loopback_capture(
             None,
             queue.clone(),
@@ -554,7 +684,7 @@ fn run_live_caption_session(
         None
     };
     #[cfg(not(target_os = "windows"))]
-    let loopback_handle: Option<thread::JoinHandle<Result<()>>> = None;
+    let mut loopback_handle: Option<thread::JoinHandle<Result<()>>> = None;
 
     // 供本 session 所有視窗共用，避免每視窗重建連線與 TLS 交握。
     let remote_client = if backend == "voxnote_asr" {
@@ -568,15 +698,25 @@ fn run_live_caption_session(
     };
 
     let result = if backend == "assemblyai_streaming" {
+        let mut stop_capture = || {
+            running.store(false, Ordering::SeqCst);
+            drop(mic_stream.take());
+            if let Some(handle) = loopback_handle.take() {
+                let _ = handle.join();
+            }
+        };
         tauri::async_runtime::block_on(assemblyai::run_stream_session(
             app.clone(),
             config.clone(),
             session_id.clone(),
             audio_source.clone(),
             queue.clone(),
+            error_state.clone(),
             running.clone(),
             stop_rx,
             ready_tx,
+            startup_deadline,
+            &mut stop_capture,
         ))
     } else {
         let _ = app.emit(
@@ -606,8 +746,11 @@ fn run_live_caption_session(
     };
 
     running.store(false, Ordering::SeqCst);
-    drop(mic_stream);
-    if let Some(handle) = loopback_handle {
+    if let Ok(mut queue) = queue.lock() {
+        queue.freeze();
+    }
+    drop(mic_stream.take());
+    if let Some(handle) = loopback_handle.take() {
         if let Err(error) = handle
             .join()
             .map_err(|_| anyhow!("系統音訊擷取執行緒異常中止"))?
@@ -697,6 +840,7 @@ fn process_caption_windows(
                 session_id,
                 &mut revision,
                 running,
+                queue,
             );
         }
         let interval_elapsed = last_decode_at
@@ -868,6 +1012,10 @@ fn process_caption_windows(
         }
         let display_text =
             build_display_text(&emitted_text, None, &config.live_caption_display_mode);
+        let gate = queue.lock().map_err(|_| anyhow!("無法取得字幕派發狀態"))?;
+        if !gate.is_accepting() || !running.load(Ordering::SeqCst) {
+            continue;
+        }
         revision = revision.saturating_add(1);
         let _ = app.emit(
             LIVE_CAPTION_EVENT,
@@ -875,7 +1023,7 @@ fn process_caption_windows(
                 session_id: session_id.to_string(),
                 sequence: event_sequence,
                 revision,
-                phase: if is_tentative { "partial" } else { "final" }.into(),
+                phase: if incremental { "partial" } else { "final" }.into(),
                 original: emitted_text.clone(),
                 translation: None,
                 display_text,
@@ -902,19 +1050,26 @@ fn process_caption_windows(
             let translation_mode = config.live_caption_display_mode.clone();
             let translation_failure_reported = translation_failure_reported.clone();
             let translation_running = running.clone();
+            let translation_queue = queue.clone();
             // 翻譯不得阻塞下一段 ASR；完成後用相同 sequence 更新已顯示的字幕。
             thread::spawn(move || {
-                match tauri::async_runtime::block_on(call_llm(
-                    &translation_config,
-                    "你是即時字幕翻譯員。請將輸入內容翻譯成自然、簡潔的繁體中文台灣用語。只輸出譯文，不要加註解、前綴或引號。",
-                    &translation_text,
+                match tauri::async_runtime::block_on(run_caption_work_until_stopped(
+                    &translation_running,
+                    &translation_queue,
+                    call_llm(
+                        &translation_config,
+                        "你是即時字幕翻譯員。請將輸入內容翻譯成自然、簡潔的繁體中文台灣用語。只輸出譯文，不要加註解、前綴或引號。",
+                        &translation_text,
+                    ),
                 )) {
-                    Ok(value) if !value.trim().is_empty() => {
+                    Ok(Some(value)) if !value.trim().is_empty() => {
                         if !translation_running.load(Ordering::SeqCst) {
                             return;
                         }
                         let value = value.trim().to_string();
                         translation_failure_reported.store(false, Ordering::SeqCst);
+                        let Ok(gate) = translation_queue.lock() else { return; };
+                        if !gate.is_accepting() || !translation_running.load(Ordering::SeqCst) { return; }
                         let _ = translation_app.emit(
                             LIVE_CAPTION_EVENT,
                             LiveCaptionPayload {
@@ -955,20 +1110,26 @@ fn process_caption_windows(
             let proofread_session_id = session_id.to_string();
             let proofread_failure_reported = translation_failure_reported.clone();
             let proofread_running = running.clone();
-            // 校稿是「修正原文」而非另一種呈現，故以校正後文字取代 original／
-            // display_text，translation 欄位維持 None——與翻譯的語意區分開來。
+            let proofread_queue = queue.clone();
+            // 校稿更新顯示文字；保留 ASR 原文快照作為段落身分，譯文欄位維持 None。
             thread::spawn(move || {
-                match tauri::async_runtime::block_on(call_llm(
-                    &proofread_config,
-                    PROOFREAD_CORE_SYSTEM,
-                    &proofread_text,
+                match tauri::async_runtime::block_on(run_caption_work_until_stopped(
+                    &proofread_running,
+                    &proofread_queue,
+                    call_llm(&proofread_config, PROOFREAD_CORE_SYSTEM, &proofread_text),
                 )) {
-                    Ok(value) if !value.trim().is_empty() => {
+                    Ok(Some(value)) if !value.trim().is_empty() => {
                         if !proofread_running.load(Ordering::SeqCst) {
                             return;
                         }
                         let value = value.trim().to_string();
                         proofread_failure_reported.store(false, Ordering::SeqCst);
+                        let Ok(gate) = proofread_queue.lock() else {
+                            return;
+                        };
+                        if !gate.is_accepting() || !proofread_running.load(Ordering::SeqCst) {
+                            return;
+                        }
                         let _ = proofread_app.emit(
                             LIVE_CAPTION_EVENT,
                             LiveCaptionPayload {
@@ -976,7 +1137,7 @@ fn process_caption_windows(
                                 sequence: proofread_sequence,
                                 revision: proofread_revision,
                                 phase: "postprocessed".into(),
-                                original: value.clone(),
+                                original: proofread_text.clone(),
                                 // 不透過 build_display_text：該函式依 mode 在原文／譯文間選擇，
                                 // 但此處沒有「譯文」，三種 mode 目前都恰好收斂回 value，純屬巧合
                                 // （並非刻意設計）。直接指定 value，避免日後修改
@@ -1016,6 +1177,7 @@ fn process_caption_windows(
                 session_id,
                 &mut revision,
                 running,
+                queue,
             );
         } else {
             let _ = agreement.finish();
@@ -1176,6 +1338,7 @@ fn complete_incremental_segment(
     session_id: &str,
     revision: &mut u64,
     running: &Arc<AtomicBool>,
+    queue: &SharedQueue,
 ) {
     let final_text = if agreement.has_text() {
         agreement.finish().confirmed
@@ -1185,7 +1348,10 @@ fn complete_incremental_segment(
     let completed = segment.complete(captured_sample_offset);
     if let Some((event_sequence, _)) = completed {
         if !final_text.is_empty() {
-            if !running.load(Ordering::SeqCst) {
+            let Ok(gate) = queue.lock() else {
+                return;
+            };
+            if !gate.is_accepting() || !running.load(Ordering::SeqCst) {
                 *agreement = LocalAgreement::default();
                 samples.clear();
                 return;
@@ -1219,6 +1385,7 @@ fn complete_incremental_segment(
                 session_id,
                 revision.saturating_add(1),
                 running,
+                queue,
             );
         }
     }
@@ -1235,6 +1402,7 @@ fn spawn_caption_postprocessing(
     session_id: &str,
     revision: u64,
     running: &Arc<AtomicBool>,
+    queue: &SharedQueue,
 ) {
     let (should_translate, should_proofread) = resolve_translate_or_proofread(
         config.live_caption_translate,
@@ -1252,24 +1420,32 @@ fn spawn_caption_postprocessing(
     let failure_reported = failure_reported.clone();
     let session_id = session_id.to_string();
     let running = running.clone();
+    let queue = queue.clone();
     thread::spawn(move || {
-        let result = if should_translate {
-            tauri::async_runtime::block_on(call_llm(
-                &config,
-                "你是即時字幕翻譯員。請將輸入內容翻譯成自然、簡潔的繁體中文台灣用語。只輸出譯文，不要加註解、前綴或引號。",
-                &text,
-            ))
+        let system_prompt = if should_translate {
+            "你是即時字幕翻譯員。請將輸入內容翻譯成自然、簡潔的繁體中文台灣用語。只輸出譯文，不要加註解、前綴或引號。"
         } else {
-            tauri::async_runtime::block_on(call_llm(&config, PROOFREAD_CORE_SYSTEM, &text))
+            PROOFREAD_CORE_SYSTEM
         };
+        let result = tauri::async_runtime::block_on(run_caption_work_until_stopped(
+            &running,
+            &queue,
+            call_llm(&config, system_prompt, &text),
+        ));
 
         match result {
-            Ok(value) if !value.trim().is_empty() => {
+            Ok(Some(value)) if !value.trim().is_empty() => {
                 if !running.load(Ordering::SeqCst) {
                     return;
                 }
                 let value = value.trim().to_string();
                 failure_reported.store(false, Ordering::SeqCst);
+                let Ok(gate) = queue.lock() else {
+                    return;
+                };
+                if !gate.is_accepting() || !running.load(Ordering::SeqCst) {
+                    return;
+                }
                 let payload = if should_translate {
                     LiveCaptionPayload {
                         session_id: session_id.clone(),
@@ -1289,7 +1465,7 @@ fn spawn_caption_postprocessing(
                         sequence,
                         revision,
                         phase: "postprocessed".into(),
-                        original: value.clone(),
+                        original: text.clone(),
                         display_text: value.clone(),
                         translation: None,
                         confirmed_text: value,
@@ -1310,6 +1486,36 @@ fn spawn_caption_postprocessing(
             }
         }
     });
+}
+
+/// 停止後不輪詢新的 LLM future，並取消正在等待網路回應的本地／自架後處理。
+async fn run_caption_work_until_stopped<F>(
+    running: &AtomicBool,
+    queue: &SharedQueue,
+    work: F,
+) -> Result<Option<String>>
+where
+    F: std::future::Future<Output = Result<String>>,
+{
+    if !running.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+    tokio::pin!(work);
+    tokio::select! {
+        biased;
+        _ = async {
+            while running.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        } => Ok(None),
+        result = std::future::poll_fn(|context| {
+            let Ok(gate) = queue.lock() else { return std::task::Poll::Ready(Ok(None)); };
+            if !gate.is_accepting() || !running.load(Ordering::SeqCst) {
+                return std::task::Poll::Ready(Ok(None));
+            }
+            work.as_mut().poll(context).map(|result| result.map(Some))
+        }) => result,
+    }
 }
 
 fn take_error(error_state: &SharedError) -> Option<anyhow::Error> {
