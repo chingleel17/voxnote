@@ -51,7 +51,9 @@ PID 可能在應用程式重啟後失效或被其他行程重用，因此只存�
 
 理由：兩條路徑的差異僅在**如何取得並初始化 `AudioClient`**，之後的 f32 雙聲道讀取、單聲道混合、約 100 毫秒批次推送與音量更新完全相同。兩者初始化時都要求 `autoconvert` 直接交付 16 kHz，不得在共用迴圈加入第二次重採樣或第二個「實際取樣率」來源；這正是 commit `06233f6` 已修正的錯誤。
 
-process loopback 匯入與麥克風／全系統擷取相同的 `SharedQueue` 後，不再建立來源專屬的轉錄分支。如此 `add-streaming-incremental-caption` 的間隔驅動與 LocalAgreement，以及增量模式關閉時的視窗式處理，都能原樣套用。
+process loopback 匯入與麥克風／全系統擷取相同的 `SharedQueue` 後，不再建立來源專屬的轉錄分支。後端選擇與音源選擇互相獨立：AssemblyAI 走連續 PCM／turn consumer，本地／自架增量走 LocalAgreement，非增量走完整視窗。靜音由所選 consumer 處理，AssemblyAI 不套靜音視窗略過或 4 秒完成規則。
+
+沿用 AssemblyAI 變更交付的 session/revision/phase、容量式歷史、有界入列與停止閘門；producer 必須在同一 queue lock 內檢查入列權限，不能因抽取共用擷取迴圈而失去 2 秒串流 queue 上限或讓停止後 callback 繼續入列。目標結束或擷取錯誤交由共用 session 結束流程；若使用 AssemblyAI，需 Terminate、最多等候 2 秒 ack，全部串流與音源清理在 5 秒內完成。暫時靜音不結束 session，雲端連線仍計費。
 
 ## 風險
 
@@ -66,6 +68,6 @@ process loopback 匯入與麥克風／全系統擷取相同的 `SharedQueue` 後
 ## 與其他變更的關係
 
 - 與 `add-live-caption-remote-asr` **無相依**，但兩者皆修改 `live_caption/mod.rs`、`config/mod.rs`、`liveCaptionSettings.ts`。雖為不同區塊，建議不同時進行以避免合併成本。
-- 與 `add-streaming-incremental-caption` **無解碼契約相依**；本變更只供應音訊。若兩者同時開發，應先整合本變更的 session 請求與擷取分支，再讓新版 `process_caption_windows()` 共用該來源，避免各自建立處理迴圈。
+- 與 `add-streaming-incremental-caption` **無效能調校前置相依**；本變更只供應音訊，既有兩種本地／自架模式仍須回歸驗證，不要求先完成其延遲與模型調校。
 - 與 `add-video-url-subtitle` 的範圍互補：既有非直播 YouTube 影片走預先轉錄與內嵌播放器；本變更保留給直播、會議與其他即時來源。
-- 排程前提（等待轉錄正確性穩定）已於 commit `06233f6` 解除。
+- 新交付順序為 AssemblyAI 基準與共用正確性 → 本變更 → 本地／自架剩餘調校。`06233f6` 的取樣率修正仍保留；本變更整合 AssemblyAI 時須驗證音源與後端可獨立組合。

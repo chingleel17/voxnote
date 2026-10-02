@@ -8,7 +8,7 @@
 
 此音訊來源的擷取粒度為應用程式，MUST NOT 宣稱可隔離應用程式內部的個別分頁、視窗或播放實例。
 
-此來源 MUST 僅改變音訊擷取範圍，MUST 使用與麥克風及全系統音訊相同的後續字幕處理路徑。增量模式啟用時 MUST 套用 `streaming-caption-decoding` 的增量政策；增量模式關閉時 MUST 維持既有視窗式輸出。
+此來源 MUST 僅改變音訊擷取範圍，MUST 使用與麥克風及全系統音訊相同的後端分派。本地／自架增量啟用時 MUST 套用 `streaming-caption-decoding`，關閉時 MUST 維持既有視窗式輸出；AssemblyAI MUST 使用連續 PCM 與服務端 turn，MUST NOT 套用 LocalAgreement、靜音視窗略過或本地 4 秒完成計時器。所有組合 MUST 沿用共用 session/revision/phase 隔離與容量式歷史。
 
 #### Scenario: User captures browser audio while other applications play sound
 
@@ -27,13 +27,18 @@
 
 #### Scenario: Incremental decoding is enabled for application capture
 
-- **WHEN** 使用者以指定應用程式為來源並啟用增量模式
+- **WHEN** 使用者以指定應用程式為來源，選擇本地／自架後端並啟用增量模式
 - **THEN** 系統 MUST 將該來源音訊交由共同的增量解碼與一致性判定處理，MUST NOT 建立來源專屬的字幕政策
 
 #### Scenario: Incremental decoding is disabled for application capture
 
-- **WHEN** 使用者以指定應用程式為來源並關閉增量模式
+- **WHEN** 使用者以指定應用程式為來源，選擇本地／自架後端並關閉增量模式
 - **THEN** 系統 MUST 將該來源音訊交由既有視窗式路徑處理，MUST NOT 因來源不同而改變輸出規則
+
+#### Scenario: Application capture uses AssemblyAI streaming
+
+- **WHEN** 使用者以指定應用程式為音源並選擇 AssemblyAI，不論本地增量開關原值為何
+- **THEN** 系統 MUST 沿用串流音訊節奏、2 秒佇列上限與 turn 完成政策，MUST NOT 建立來源專屬辨識政策
 
 ### Requirement: System presents selectable applications without requiring process identifiers
 
@@ -68,6 +73,8 @@
 
 被擷取的應用程式於 session 進行中結束時，系統 MUST 結束 session 並向使用者回報原因。
 
+目標結束、擷取失敗或使用者停止時 MUST 沿用所選後端的收尾契約；AssemblyAI MUST 終止雲端連線，終止回應最多等候 2 秒、整體串流與音源清理最多 5 秒。停止後 callback MUST 不再入列，舊字幕／翻譯 MUST 不得回填新 session。
+
 被擷取的應用程式仍在執行但暫時沒有音訊輸出時，系統 MUST 將其視為靜音並維持 session，MUST NOT 誤判為應用程式已結束。
 
 #### Scenario: No target application selected at startup
@@ -89,6 +96,11 @@
 
 - **WHEN** 目標應用程式仍在執行但暫時沒有任何音訊 render stream
 - **THEN** 系統 MUST 維持 session 並依靜音行為處理，且在目標恢復輸出後 MUST 繼續擷取
+
+#### Scenario: Target exits while cloud streaming is active
+
+- **WHEN** AssemblyAI 串流的目標應用程式結束
+- **THEN** 系統 MUST 回報原因並依有限時間收尾契約停止收音、字幕與雲端連線，MUST NOT 留下付費連線或讓舊結果回填
 
 ### Requirement: Application-scoped capture is rejected on unsupported platforms
 

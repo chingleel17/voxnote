@@ -70,8 +70,13 @@
 
 #### Scenario: Audio ends while text is still tentative
 
-- **WHEN** 音訊結束或 session 停止時仍有文字處於暫定狀態
-- **THEN** 系統 MUST 將該暫定文字輸出為最終內容，MUST NOT 因未取得一致確認而丟棄該文字
+- **WHEN** 語音已結束但 session 仍為 running，且到達當前段的完成期限時仍有暫定文字
+- **THEN** 系統 MUST 將該暫定文字作為該段最終可用內容輸出，MUST NOT 僅因未取得一致確認而丟棄文字
+
+#### Scenario: Session stops while text is still tentative
+
+- **WHEN** session 已進入 stopping 且仍有暫定文字或解碼工作稍後完成
+- **THEN** 系統 MAY 在內部完成 flush，但 MUST NOT 再發出字幕或新增 LLM 工作，MUST NOT 恢復已清空畫面或回填新 session
 
 ### Requirement: Incremental decoding can be disabled in favor of window-based output
 

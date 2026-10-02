@@ -1,3 +1,7 @@
+## 交付與追蹤
+
+交付順序：AssemblyAI 基準與共用正確性 → 指定應用程式收音 → 本變更剩餘效能調校。既有勾選為歷史紀錄，新契約由下方第 10 節追蹤；6b.8 的本地閱讀正確性不得誤認為可略過的效能項目。本文「主要路徑」僅指本 change 內的本地／自架優先級。
+
 ## 1. 設定與型別
 
 - [x] 1.1 於 `AppConfig`（`src-tauri/src/config/mod.rs`）新增 `live_caption_incremental_enabled`（預設值於 6.x 實測後決定，初期先設 `false` 以免影響既有行為）
@@ -58,6 +62,8 @@
 
 ## 6. 字幕視窗的暫定／確定呈現
 
+以下 6.4 的固定兩段為舊驗收紀錄，現由容量式歷史取代；2.4 的停止時輸出與 6.5 的 sequence-only 回填，亦須依第 10 節更新，不能直接視為符合目前契約。
+
 - [x] 6.1 擴充字幕事件的 payload，使前端能區分暫定與確定文字
 - [x] 6.2 於 `overlay.html`／`liveCaptionOverlay.ts` 實作兩種狀態的視覺區分（對應 spec「Tentative text is visually distinguishable from confirmed text」）
 - [x] 6.3 暫定文字被修正時就地更新，不佔用額外的保留段數、不使前一段提前捲離（對應 spec「Tentative text is revised in place」；見 design 決定 6）
@@ -96,3 +102,12 @@
 
 - [x] 9.1 於專案 README 說明增量模式的行為與取捨，以及解碼間隔與視窗長度的關係
 - [x] 9.2 於 `server/README.md` 說明低延遲端點的用途、與批次端點的差異，以及為何不做對齊與語者分離
+
+## 10. 跨後端契約整合與收尾
+
+本節與 6b.8 是正確性驗收，可隨 AssemblyAI 共用契約交付進行；第 8 節的效能調校排在指定應用程式收音之後。共用功能由 AssemblyAI change 實作，本節引用同一份測試證據並補本地特有案例，不重建第二套狀態機。
+
+- [ ] 10.1 驗證本地／自架 payload 帶 session/revision/phase，段內 confirmed 不提前使整段 final；停止後 flush 不發字幕或新 LLM，舊回填不污染新 session。
+- [ ] 10.2 驗證容量式歷史最多 20 段、依高度／字級顯示、超長內容可捲動，以及本地 4 秒閱讀規則；引用 AssemblyAI 共用測試，完成本 change 6b.8 的本地專屬證據。
+- [ ] 10.3 以 AssemblyAI 基準相同的可分享語料、音源及紀錄格式補齊第 8 節；分開記錄首字、段內穩定、整段 final 與譯文延遲，避免將 LocalAgreement confirmed 等同雲端 final。
+- [ ] 10.4 執行三份 change strict 驗證，確認共享 MODIFIED requirements 一致；封存前對照當時基準，保留已交付的雲端、音源與共用字幕契約，未完成實測不得代勾或提前封存。

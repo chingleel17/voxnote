@@ -8,7 +8,7 @@
 
 ## What Changes
 
-**主要目標路徑**：`voxnote_asr` 後端指向的自架 ASR 服務（`server/`，以 Docker 部署於本機）。此為使用者當前的主力使用路徑，本變更的實作與調校以此為準。
+**本變更的主要目標路徑**：`voxnote_asr` 後端指向的自架 ASR 服務（`server/`，以 Docker 部署於本機），並涵蓋 `local_whisper`。這是本地／自架增量的範圍，不再代表整體即時字幕的首要交付路徑；AssemblyAI 原生串流由獨立 change 優先建立端到端基準。
 
 - 新增**增量式字幕輸出**：以顯著小於視窗長度的步進重複解碼，透過連續兩次解碼結果的共同前綴（LocalAgreement）判定哪些文字已穩定，穩定者即輸出。字幕不再等待整個視窗填滿才更新。
 - 新增**暫定（tentative）與確定（confirmed）兩種字幕狀態**：尚未達成 agreement 的文字先以視覺上可區分的方式顯示，達成 agreement 後轉為確定狀態。使用者可更早看到內容，代價是暫定文字可能被修正。
@@ -54,3 +54,11 @@
 **既有行為**
 - 批次逐字稿流程 MUST 完全不受影響。
 - 增量模式應可關閉並回退至現行的視窗式行為，以便在準確度不足時仍有可用路徑。
+
+## Delivery Order and Shared Contracts
+
+- 交付順序：`add-assemblyai-streaming-caption` → `add-live-caption-process-audio` → 本變更剩餘效能、品質與參數調校；既有實作保留，未驗收項目不因改排程而視為完成。
+- LocalAgreement、重疊視窗、解碼間隔及 4 秒輪替只適用本地／自架；AssemblyAI 依服務端 turn，不受本地增量開關影響。
+- 容量式歷史及 session/revision/phase 為所有後端共用契約，由 AssemblyAI change 先交付共同正確性；本變更保留本地 4 秒閱讀保留與解碼調校驗收責任。
+- 停止後不得發出新字幕／LLM；本地暫定文字 flush 只可內部收尾，不得重建已清空字幕。段內 confirmed 與整段 final 不混用。
+- 不因開發基準改變而更改預設後端或自動啟用增量模式；預設值仍須依本變更的實測任務決定。

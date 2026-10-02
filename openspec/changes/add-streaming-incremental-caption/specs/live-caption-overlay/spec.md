@@ -63,19 +63,19 @@ AssemblyAI 串流 MUST 直接傳送連續、不重疊音訊，並依服務端 Tu
 
 系統 MUST 以獨立的浮動視窗顯示即時字幕。該視窗 MUST 永遠置於其他視窗之上，MUST 可由使用者移動與調整大小，且 MUST 不出現於工作列的獨立項目干擾主視窗操作。
 
-字幕視窗 MUST 區分「已完成歷史段」與「目前正在更新的當前段」。最小視窗 MUST 至少同時顯示 1 個歷史段與 1 個當前段；使用者放大視窗時，系統 MUST 依完整可容納的段落高度增加可見歷史段數。系統 MUST 設定有限的歷史資料上限以避免無限增長，但 MUST NOT 因前端固定常數而在更大視窗中仍只顯示 2 段。
+所有後端的字幕視窗 MUST 區分「已完成歷史段」與「目前正在更新的當前段」，最多保留 20 段（含當前段）。一般內容的最小視窗 MUST 至少同時顯示 1 個歷史段與 1 個當前段；放大視窗時 MUST 依高度與字級增加可見歷史段數，MUST NOT 固定只顯示 2 段。尚無歷史段時 MUST NOT 建立空白佔位字幕。
 
-若視窗縮小而無法完整容納目前可見段落，系統 MUST 優先移除最舊的歷史段，MUST NOT 移除或截斷當前段；即使空間有限，仍 MUST 保留最近 1 個歷史段與當前段。內容 MUST 留在字幕內容區域內，不得蓋住標題列或溢出視窗本體。
+空間不足時 MUST 優先減少可見的最舊歷史段，保留最近 1 個歷史段與當前段。若這兩段本身已超過內容區高度，MUST 保留全文並提供內容區捲動閱讀，MUST NOT 蓋住標題列、溢出視窗或為適應畫面強制結束辨識段。容量內未顯示的歷史可在放大時重新顯示；達資料上限移除或自動清空的段落 MUST NOT 因晚到譯文而復活。
 
-使用者調整字幕視窗大小或變更字級時，系統 MUST 重新計算可完整顯示的歷史段數。視窗變高或字級變小時 MUST 能顯示更多歷史段；視窗變矮或字級變大時 MAY 減少最舊歷史段，但 MUST 維持前述最低兩段行為。
+使用者調整字幕視窗大小或變更字級時，系統 MUST 重新計算可顯示的歷史段數。視窗變高或字級變小時 MUST 能顯示更多仍保留的歷史段；視窗變矮或字級變大時 MAY 減少最舊可見歷史段，但 MUST 維持前述最近兩段與超長內容捲動規則。
 
 單段字幕的文字長度超過視窗寬度時 MUST 自動換行完整顯示，MUST NOT 截斷或省略內容。
 
-增量模式啟用時，字幕視窗 MUST 使暫定文字與確定文字在視覺上可被使用者區分。暫定文字被後續解碼修正時，視窗 MUST 就地更新該文字，MUST NOT 將修正後的內容視為新的一段而佔用額外的保留段數。
+本地／自架增量或 AssemblyAI 串流啟用時，字幕視窗 MUST 區分暫定與穩定文字；暫定修正 MUST 就地更新，不增加段數。更新 MUST 遵循共用 session、sequence、revision 與 phase 隔離；段內 confirmed MUST NOT 被誤認為整段 final。
 
 本地／自架增量模式的當前段 MUST 每 4 秒完成並成為歷史段，後續文字 MUST 使用新的 `sequence` 顯示於新的當前段。LocalAgreement 的確定狀態 MUST NOT 使同一列無限存活。最小視窗下，完成段成為歷史段後 MUST 至少保持可見一個完整顯示週期（4 秒），直到下一段完成後才可被更舊段落取代。AssemblyAI 串流的完成由服務端 turn 決定，MUST NOT 以此本地計時器強制完成；暫定文字的視覺區分及就地更新仍適用於該後端。
 
-當距離最後一段字幕超過使用者設定的秒數仍未產生新字幕時，字幕視窗 MUST 清空既有內容，避免舊字幕長時間停留在畫面上。該秒數 MUST 可由使用者設定，且 MUST 支援設為零以停用自動清空。
+無新語音字幕達使用者設定秒數時 MUST 清空；零 MUST 停用自動清空。翻譯／校稿回填與相同事件重送 MUST NOT 重設此計時；開始與停止 session MUST 清空字幕及計時器，不受零值設定影響。
 
 #### Scenario: User overlays captions on a video player
 
@@ -110,7 +110,7 @@ AssemblyAI 串流 MUST 直接傳送連續、不重疊音訊，並依服務端 Tu
 #### Scenario: Window is too small to fully show the retained captions
 
 - **WHEN** 字幕視窗當下高度不足以完整顯示所有歷史段
-- **THEN** 系統 MUST 移除最舊歷史段直到內容可容納，但 MUST 保留最近 1 個歷史段與當前段，MUST NOT 移除或截斷當前段，且 MUST NOT 讓文字蓋住標題列或溢出視窗本體
+- **THEN** 系統 MUST 先減少最舊可見歷史；最近歷史段與當前段仍過長時 MUST 可在內容區捲動閱讀全文，不蓋住標題列或溢出視窗
 
 #### Scenario: User resizes the caption window
 
@@ -124,7 +124,7 @@ AssemblyAI 串流 MUST 直接傳送連續、不重疊音訊，並依服務端 Tu
 
 #### Scenario: Tentative text is visually distinguishable from confirmed text
 
-- **WHEN** 增量模式啟用且字幕視窗同時顯示暫定與確定的文字
+- **WHEN** 本地／自架增量或 AssemblyAI 串流的字幕視窗同時顯示暫定與穩定文字
 - **THEN** 兩者 MUST 在視覺上可被使用者區分，使使用者能辨識哪些內容可能仍會變動
 
 #### Scenario: Tentative text is revised in place

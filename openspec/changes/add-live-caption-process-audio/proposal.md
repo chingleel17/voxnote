@@ -30,9 +30,9 @@ Windows build 20348 起提供 **process loopback**（`ActivateAudioInterfaceAsyn
 
 `add-live-caption-overlay` 已於 2026-08-11 完成並歸檔，`live-caption-overlay` 已進入 `openspec/specs/` 基準（該基準定義了即時字幕的音訊來源機制與 session 生命週期）。本變更的 spec delta 以 `## ADDED Requirements` 撰寫，新增基準未涵蓋的音訊來源。
 
-本變更與 `add-live-caption-remote-asr` 無相依，兩者可獨立進行。它也不改變 `add-streaming-incremental-caption` 的解碼與 LocalAgreement 政策；指定應用程式只改變音訊擷取來源，增量模式啟用或關閉時都必須沿用同一條後續字幕處理路徑。
+本變更不改變辨識政策；指定應用程式只改變音訊來源，後續依所選後端分派：AssemblyAI 使用連續 PCM／服務端 turn，本地／自架增量使用 LocalAgreement，非增量使用視窗與相似度去重。共同 queue、session 身分、停止閘門及字幕歷史沿用 `add-assemblyai-streaming-caption` 的共用契約，不另建來源專屬 ASR 迴圈。
 
-**排程建議**：先前的排程前提（等待轉錄正確性穩定）已解除——取樣率錯配與幻覺過濾已於 commit `06233f6` 修正並歸檔。本變更現可開始，惟實測時仍應以「電腦音訊（全系統）」作為對照組，確認品質差異來自音訊來源而非轉錄路徑。
+**交付順序**：先完成 `add-assemblyai-streaming-caption` 的 mic/system 端到端基準與共用生命週期，再交付本變更，最後進行 `add-streaming-incremental-caption` 剩餘效能調校。本變更不是 AssemblyAI 的前置條件，也不等待本地效能最佳化；取樣率修正 `06233f6` 仍為既有基礎。實測以相同後端、模型、語料及設定的「全系統音訊」為對照，避免把辨識差異誤認為來源隔離效果。
 
 ## Impact
 
