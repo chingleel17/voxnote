@@ -32,6 +32,8 @@ def fake_result(audio_path: Path, language, diarize, min_speakers, max_speakers,
 class TestTranscriptionApi(unittest.TestCase):
     def setUp(self):
         app.tasks.clear()
+        # 每個 scenario 都用 asyncio.run 建立新迴圈，不能沿用上一輪已綁定的鎖。
+        app.transcription_lock = asyncio.Lock()
 
     def tearDown(self):
         app.tasks.clear()

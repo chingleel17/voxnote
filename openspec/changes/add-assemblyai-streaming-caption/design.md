@@ -57,11 +57,13 @@
 
 ### 4. 音訊封包、節奏與上限
 
-共同 queue 維持 16 kHz mono f32。以 100 ms（1,600 samples、3,200 bytes）封包傳 PCM16 little-endian binary frame；有限數值飽和到 i16 範圍，NaN/Infinity 轉為零。不得封裝 WAV、Base64 或 JSON。
+共同 queue 維持 16 kHz mono f32。正常以 100 ms（1,600 samples、3,200 bytes）封包傳 PCM16 little-endian binary frame；排程／寫入晚到時，單包涵蓋自前次實際派送後經過的音訊時間，最多 1,000 ms，且只取真正已擷取的樣本。不得只固定取 1,600 samples 而把每次晚到累積成延遲，亦不得以快速連發封包補播。有限數值飽和到 i16 範圍，NaN/Infinity 轉為零；不得封裝 WAV、Base64 或 JSON。
 
 即使沒有語音也持續送擷取到的靜音樣本，讓服務端負責 endpointing；這是本產品選擇，不是宣稱官方強制要求。平時不設定 `inactivity_timeout`，不新增 KeepAlive 計時器；回應 WebSocket Ping/Pong，Heartbeat 僅作連線診斷、不當字幕。
 
 待傳 queue 上限 2 秒（32,000 samples），在 producer 入列與 consumer 側都須保護上限，避免 socket 卡住時 queue 無限成長。超過時捨棄最舊完整 sample、保留最新內容，回報字幕遺漏；連續遺漏提示最多每 5 秒一次。以牆鐘節奏每 100 ms 最多送一包，不加速補送積壓；socket write deadline 1 秒，失敗即結束 session。
+
+TCP 啟用 `TCP_NODELAY`，避免小型即時封包被 Nagle 合併延後。非文字 `audio_flow` 診斷每 5 秒記錄累積擷取／送出／丟棄樣本、目前待傳長度與最大寫入時間，用於區分擷取速率、排程及網路瓶頸；不含音訊或字幕內容。
 
 進入 stopping 時先撤銷音訊入列權限，producer 在同一 queue lock 內檢查該權限；隨後取出一次性尾端快照並清空 queue，再停止 capture。即使已在執行中的 callback 稍後取得 lock，也不得再次入列。停止時只送該有限快照，不等待新音訊。最後不足 50 ms 的尾包以零補到 50 ms，其餘尾包仍在官方 50–1,000 ms 範圍內；尾包包含在停止期限內，無法送完時直接結束並記錄非文字診斷。
 

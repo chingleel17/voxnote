@@ -31,13 +31,28 @@ fn connecting_and_stopping_sessions_reserve_capture_until_worker_finishes() -> R
     let finished = Arc::new(SessionCompletion::default());
     let release_worker = Arc::new(Barrier::new(2));
     let (stop_tx, stop_rx) = mpsc::channel();
+    let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+    let reported = Arc::new(Mutex::new(Vec::new()));
     let worker_finished = finished.clone();
     let worker_queue = queue.clone();
     let worker_release = release_worker.clone();
+    let worker_running = running.clone();
+    let worker_reported = reported.clone();
     let handle = thread::spawn(move || {
         stop_rx.recv().expect("connecting worker 應可收到取消");
         worker_release.wait();
         worker_queue.lock().expect("可取得 queue").extend([3.0]);
+        finish_caption_worker(
+            Err(anyhow!("AssemblyAI 串流啟動已取消")),
+            &worker_running,
+            &startup_tx,
+            |message| {
+                worker_reported
+                    .lock()
+                    .expect("可記錄錯誤事件")
+                    .push(message)
+            },
+        );
         worker_finished.complete();
     });
     *manager.inner.lock().expect("可保留 session") = Some(ActiveLiveCaptionSession {
@@ -67,6 +82,18 @@ fn connecting_and_stopping_sessions_reserve_capture_until_worker_finishes() -> R
     assert!(stop_deadline.saturating_duration_since(Instant::now()) <= Duration::from_secs(5));
     release_worker.wait();
     assert!(finished.wait(Duration::from_secs(1)));
+    assert_eq!(
+        startup_rx
+            .try_recv()
+            .expect("啟動取消狀態應回傳")
+            .expect_err("應回傳取消狀態")
+            .to_string(),
+        "AssemblyAI 串流啟動已取消"
+    );
+    assert!(
+        reported.lock().expect("可讀取錯誤事件").is_empty(),
+        "使用者取消 connecting 不應彈出失敗訊息"
+    );
     assert!(!manager.has_session());
     assert_eq!(
         queue.lock().expect("可取得尾端快照").take_stopped_samples(),
@@ -76,6 +103,20 @@ fn connecting_and_stopping_sessions_reserve_capture_until_worker_finishes() -> R
         session.handle.join().expect("worker 應正常結束");
     }
     Ok(())
+}
+
+#[test]
+fn real_startup_failures_still_report_errors_when_worker_stops() {
+    for failure in ["音源初始化失敗", "模型載入失敗", "認證失敗"] {
+        let running = AtomicBool::new(false);
+        let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+        let reported = Mutex::new(Vec::new());
+        finish_caption_worker(Err(anyhow!(failure)), &running, &startup_tx, |message| {
+            reported.lock().expect("錯誤事件鎖").push(message);
+        });
+        assert!(startup_rx.try_recv().expect("失敗狀態應回傳").is_err());
+        assert_eq!(reported.lock().expect("錯誤事件鎖").as_slice(), [failure]);
+    }
 }
 
 #[test]
@@ -169,4 +210,94 @@ async fn completed_llm_wakeup_after_stop_does_not_poll_inner_work_again() -> Res
     assert!(result.is_none());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     Ok(())
+}
+
+#[test]
+fn panicked_startup_worker_reports_failure_and_releases_session_for_restart() -> Result<()> {
+    let queue = Arc::new(Mutex::new(AudioQueue::bounded(32_000)));
+    queue.lock().expect("可入列").extend([1.0]);
+    let running = Arc::new(AtomicBool::new(true));
+    let finished = Arc::new(SessionCompletion::default());
+    let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+    let (stop_tx, _stop_rx) = mpsc::channel();
+    let worker_queue = queue.clone();
+    let worker_running = running.clone();
+    let worker_finished = finished.clone();
+    let worker_errors = errors.clone();
+    let handle = thread::spawn(move || {
+        run_caption_worker(
+            || panic!("fixture panic before TLS Begin"),
+            &worker_running,
+            &worker_queue,
+            &worker_finished,
+            &startup_tx,
+            |message| worker_errors.lock().expect("錯誤鎖").push(message),
+        );
+    });
+    let mut slot = Some(ActiveLiveCaptionSession {
+        stop_tx,
+        finished: finished.clone(),
+        queue: queue.clone(),
+        running: running.clone(),
+        ready: Arc::new(AtomicBool::new(false)),
+        handle,
+        backend: "assemblyai_streaming".into(),
+        audio_source: "system".into(),
+        session_id: "failed-start".into(),
+        click_through_enabled: Arc::new(AtomicBool::new(false)),
+    });
+    let failure = startup_rx
+        .recv_timeout(Duration::from_secs(1))?
+        .expect_err("應回報失敗");
+    assert!(failure.to_string().contains("非預期中止"));
+    assert!(
+        !failure.to_string().contains("fixture panic"),
+        "不向 UI 傳遞 panic payload"
+    );
+    assert!(finished.wait(Duration::from_secs(1)));
+    assert!(!running.load(Ordering::SeqCst));
+    assert!(!queue.lock().expect("queue").is_accepting());
+    assert_eq!(errors.lock().expect("錯誤鎖").len(), 1);
+    assert!(reap_finished_session(&mut slot));
+    assert!(slot.is_none(), "失敗 session 不可阻止下一次開始");
+    assert!(
+        reap_finished_session(&mut slot),
+        "清理後下一次可以建立 session"
+    );
+    Ok(())
+}
+
+#[test]
+fn terminated_worker_without_completion_notification_is_reaped() {
+    let queue = Arc::new(Mutex::new(AudioQueue::default()));
+    let running = Arc::new(AtomicBool::new(true));
+    let finished = Arc::new(SessionCompletion::default());
+    let handle = thread::spawn(|| {});
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !handle.is_finished() && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert!(handle.is_finished());
+    let (stop_tx, _stop_rx) = mpsc::channel();
+    let mut slot = Some(ActiveLiveCaptionSession {
+        stop_tx,
+        finished: finished.clone(),
+        queue: queue.clone(),
+        running: running.clone(),
+        ready: Arc::new(AtomicBool::new(false)),
+        handle,
+        backend: "assemblyai_streaming".into(),
+        audio_source: "system".into(),
+        session_id: "missing-notification".into(),
+        click_through_enabled: Arc::new(AtomicBool::new(false)),
+    });
+    assert!(!finished.is_finished());
+    assert!(
+        reap_finished_session(&mut slot),
+        "已退出執行緒不可永久視為執行中"
+    );
+    assert!(slot.is_none());
+    assert!(!running.load(Ordering::SeqCst));
+    assert!(!queue.lock().expect("queue").is_accepting());
 }

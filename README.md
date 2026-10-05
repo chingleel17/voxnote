@@ -236,10 +236,25 @@ npx tsc -p tests/tsconfig.json
 # src-tauri 目錄：收音佇列、生命週期與模擬 WebSocket
 cargo test audio_recording::queue::tests
 cargo test live_caption::lifecycle_tests
+cargo test live_caption::window_tests
 cargo test live_caption::assemblyai
 ```
 
 Vite 啟動後，可在瀏覽器開啟 `/tests/asr-provider-ui.html` 與 `/tests/live-caption-overlay.html` 執行供應商操作、字幕事件及版面測試。測試頁使用假 IPC，不讀取桌面設定，也不連接付費 ASR／LLM；實際音訊準確度與 Windows 裝置操作另行驗收。
+
+實際串流收尾可在 `npm run tauri dev` 的 Rust 終端觀察 `[assemblyai-streaming]` 診斷：正常停止應有 `terminate_sent=true`、`termination_ack=true`、`socket_released=true`；無回應時允許 ACK 為 false，但須有限時間釋放。`audio_packets` 為成功送出的正常封包數，`tail_packets` 為停止前快照的尾包數；收尾期間正常封包數不應增加。`stop_elapsed_ms` 從本地入列閘門關閉起算，`termination_wait_ms` 為終止回應等待時間，主視窗退出的完整耗時仍需實機觀察。
+
+需要對照可分享測試語料的時序時，可從專案根目錄重新啟動完整 dev：
+
+```powershell
+Get-Location
+$env:VOXNOTE_STREAMING_DIAGNOSTICS = '1'
+npm run tauri dev
+```
+
+此旗標增加每段 `first_caption`、`final`、`postprocessed` 的後端事件時間，仍不記錄原文、譯文、音訊或金鑰。它可協助量測後端時序；實際畫面出字延遲與可讀性需另外觀察，不能以後端事件時間代替端到端品質驗收。
+
+若出現音訊佇列遺漏提示，可查看每 5 秒的 `audio_flow`：`captured_samples`／`sent_samples` 分別為累積擷取及成功送出的正常樣本數，`dropped_samples` 為累積捨棄數，`pending_samples` 是目前待傳量，`max_write_ms` 是最慢一次寫入。以相鄰紀錄的差值對照時間，可辨識 16 kHz 擷取／傳送是否跟得上；正常排程晚到會調整單包時長，維持每秒 16,000 樣本的音訊速率。
 
 ### 4. 建置發行版
 

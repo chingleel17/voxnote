@@ -10,6 +10,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::StreamTrait;
+use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
@@ -28,6 +29,8 @@ mod agreement;
 mod assemblyai;
 #[cfg(test)]
 mod lifecycle_tests;
+#[cfg(test)]
+mod window_tests;
 use agreement::LocalAgreement;
 
 pub const LIVE_CAPTION_EVENT: &str = "live-caption";
@@ -181,6 +184,10 @@ struct ActiveLiveCaptionSession {
 }
 
 impl ActiveLiveCaptionSession {
+    fn is_finished(&self) -> bool {
+        self.finished.is_finished() || self.handle.is_finished()
+    }
+
     fn request_stop(&self) -> Result<Instant> {
         let deadline = {
             let mut queue = self.queue.lock().map_err(|_| anyhow!("無法停止音訊入列"))?;
@@ -261,13 +268,8 @@ impl LiveCaptionManager {
             .inner
             .lock()
             .map_err(|_| anyhow!("無法取得即時字幕狀態"))?;
-        if let Some(session) = guard.as_ref() {
-            if !session.finished.is_finished() {
-                return Err(anyhow!("已有即時字幕進行中"));
-            }
-            if let Some(session) = guard.take() {
-                let _ = session.handle.join();
-            }
+        if !reap_finished_session(&mut guard) {
+            return Err(anyhow!("已有即時字幕進行中"));
         }
 
         let queue: SharedQueue = Arc::new(Mutex::new(if backend == "assemblyai_streaming" {
@@ -292,28 +294,42 @@ impl LiveCaptionManager {
         let thread_error = error_state.clone();
         let startup_tx = ready_tx.clone();
         let error_app = app_handle.clone();
+        let error_status = LiveCaptionStatus {
+            active: false,
+            backend: Some(backend.clone()),
+            audio_source: Some(audio_source.clone()),
+            session_id: Some(session_id.clone()),
+        };
         let startup_deadline = Instant::now() + Duration::from_secs(10);
 
         let handle = thread::spawn(move || {
-            let result = run_live_caption_session(
-                app_handle,
-                thread_config,
-                thread_backend,
-                thread_session_id,
-                thread_source,
-                thread_queue,
-                thread_error,
-                thread_running.clone(),
-                stop_rx,
-                ready_tx,
-                startup_deadline,
+            let cleanup_queue = thread_queue.clone();
+            run_caption_worker(
+                || {
+                    run_live_caption_session(
+                        app_handle,
+                        thread_config,
+                        thread_backend,
+                        thread_session_id,
+                        thread_source,
+                        thread_queue,
+                        thread_error,
+                        thread_running.clone(),
+                        stop_rx,
+                        ready_tx,
+                        startup_deadline,
+                    )
+                },
+                &thread_running,
+                &cleanup_queue,
+                &thread_finished,
+                &startup_tx,
+                |message| {
+                    close_overlay(&error_app);
+                    let _ = error_app.emit(LIVE_CAPTION_STATUS_EVENT, error_status);
+                    emit_error(&error_app, message);
+                },
             );
-            thread_running.store(false, Ordering::SeqCst);
-            if let Err(error) = result {
-                let _ = startup_tx.try_send(Err(anyhow!(error.to_string())));
-                emit_error(&error_app, error.to_string());
-            }
-            thread_finished.complete();
         });
 
         let click_through_enabled = Arc::new(AtomicBool::new(config.live_caption_click_through));
@@ -478,7 +494,7 @@ impl LiveCaptionManager {
             .map(|session| {
                 session
                     .as_ref()
-                    .is_some_and(|session| !session.finished.is_finished())
+                    .is_some_and(|session| !session.is_finished())
             })
             .unwrap_or(true)
     }
@@ -533,6 +549,76 @@ impl LiveCaptionManager {
             let _ = app.emit(LIVE_CAPTION_INTERACTIVE_EVENT, true);
         }
         Ok(())
+    }
+}
+
+/// 即使 worker 非預期中止，也關閉入列、通知等待者，避免永久保留假的 active session。
+struct WorkerCompletion<'a> {
+    running: &'a AtomicBool,
+    queue: &'a SharedQueue,
+    finished: &'a SessionCompletion,
+}
+
+impl Drop for WorkerCompletion<'_> {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        let mut queue = match self.queue.lock() {
+            Ok(queue) => queue,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        queue.freeze();
+        self.finished.complete();
+    }
+}
+
+fn run_caption_worker(
+    work: impl FnOnce() -> Result<()>,
+    running: &AtomicBool,
+    queue: &SharedQueue,
+    finished: &SessionCompletion,
+    startup_tx: &mpsc::SyncSender<Result<()>>,
+    report_error: impl FnOnce(String),
+) {
+    let _completion = WorkerCompletion {
+        running,
+        queue,
+        finished,
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+        .unwrap_or_else(|_| Err(anyhow!("即時字幕背景工作非預期中止，請重新開始")));
+    finish_caption_worker(result, running, startup_tx, report_error);
+}
+
+fn reap_finished_session(slot: &mut Option<ActiveLiveCaptionSession>) -> bool {
+    if slot.as_ref().is_some_and(|session| !session.is_finished()) {
+        return false;
+    }
+    if let Some(session) = slot.take() {
+        let _ = session.request_stop();
+        let _ = session.handle.join();
+    }
+    true
+}
+
+fn finish_caption_worker(
+    result: Result<()>,
+    running: &AtomicBool,
+    startup_tx: &mpsc::SyncSender<Result<()>>,
+    report_error: impl FnOnce(String),
+) {
+    let stopped_by_user = !running.load(Ordering::SeqCst);
+    running.store(false, Ordering::SeqCst);
+    if let Err(error) = result {
+        let message = error.to_string();
+        let _ = startup_tx.try_send(Err(anyhow!(message.clone())));
+        if !(stopped_by_user
+            && matches!(
+                message.as_str(),
+                "AssemblyAI 串流啟動已取消" | "即時字幕啟動已取消"
+            ))
+        {
+            report_error(message);
+        }
     }
 }
 
@@ -785,6 +871,144 @@ fn process_caption_windows(
     running: &Arc<AtomicBool>,
     stop_rx: mpsc::Receiver<()>,
 ) -> Result<()> {
+    let mut decoder = ProductionWindowDecoder {
+        whisper_context,
+        remote_client,
+    };
+    process_caption_windows_with(
+        config,
+        backend,
+        session_id,
+        queue,
+        error_state,
+        running,
+        stop_rx,
+        &mut decoder,
+        Arc::new(AppWindowSink(app.clone())),
+        Arc::new(LlmWindowPostprocessor),
+    )
+}
+
+trait WindowDecoder {
+    fn decode(
+        &mut self,
+        backend: &str,
+        incremental: bool,
+        window: &[f32],
+        config: &AppConfig,
+    ) -> Result<String>;
+
+    #[cfg(test)]
+    fn after_decode(&mut self) {}
+}
+
+struct ProductionWindowDecoder<'a> {
+    whisper_context: Option<&'a WhisperContext>,
+    remote_client: Option<&'a reqwest::Client>,
+}
+
+impl WindowDecoder for ProductionWindowDecoder<'_> {
+    fn decode(
+        &mut self,
+        backend: &str,
+        incremental: bool,
+        window: &[f32],
+        config: &AppConfig,
+    ) -> Result<String> {
+        match backend {
+            "local_whisper" => transcribe_with_whisper(
+                self.whisper_context
+                    .ok_or_else(|| anyhow!("本地 Whisper 模型未初始化"))?,
+                window,
+                &config.live_caption_language,
+            ),
+            "voxnote_asr" => {
+                let client = self
+                    .remote_client
+                    .ok_or_else(|| anyhow!("即時字幕遠端連線未初始化"))?;
+                if incremental {
+                    tauri::async_runtime::block_on(
+                        crate::asr::transcribe_live_caption_remote_incremental(
+                            client,
+                            live_caption_remote_base_url(config),
+                            window,
+                            &config.live_caption_language,
+                            config.live_caption_remote_timeout_seconds as u64,
+                        ),
+                    )
+                } else {
+                    tauri::async_runtime::block_on(transcribe_live_caption_remote(
+                        client,
+                        live_caption_remote_base_url(config),
+                        window,
+                        &config.live_caption_language,
+                        config.live_caption_remote_timeout_seconds as u64,
+                    ))
+                }
+            }
+            _ => Err(anyhow!("不支援的即時字幕轉錄後端：{backend}")),
+        }
+    }
+}
+
+trait WindowEventSink: Send + Sync {
+    fn caption(&self, payload: LiveCaptionPayload);
+    fn error(&self, message: String);
+}
+
+struct AppWindowSink(AppHandle);
+
+impl WindowEventSink for AppWindowSink {
+    fn caption(&self, payload: LiveCaptionPayload) {
+        let _ = self.0.emit(LIVE_CAPTION_EVENT, payload);
+    }
+
+    fn error(&self, message: String) {
+        emit_error(&self.0, message);
+    }
+}
+
+trait WindowPostprocessor: Send + Sync {
+    fn process(
+        &self,
+        config: AppConfig,
+        translate: bool,
+        original: String,
+    ) -> BoxFuture<'static, Result<String>>;
+}
+
+struct LlmWindowPostprocessor;
+
+impl WindowPostprocessor for LlmWindowPostprocessor {
+    fn process(
+        &self,
+        config: AppConfig,
+        translate: bool,
+        original: String,
+    ) -> BoxFuture<'static, Result<String>> {
+        Box::pin(async move {
+            let prompt = if translate {
+                "你是即時字幕翻譯員。請將輸入內容翻譯成自然、簡潔的繁體中文台灣用語。只輸出譯文，不要加註解、前綴或引號。"
+            } else {
+                PROOFREAD_CORE_SYSTEM
+            };
+            call_llm(&config, prompt, &original).await
+        })
+    }
+}
+
+fn process_caption_windows_with(
+    config: &AppConfig,
+    backend: &str,
+    session_id: &str,
+    queue: &SharedQueue,
+    error_state: &SharedError,
+    running: &Arc<AtomicBool>,
+    stop_rx: mpsc::Receiver<()>,
+    decoder: &mut dyn WindowDecoder,
+    sink: Arc<dyn WindowEventSink>,
+    postprocessor: Arc<dyn WindowPostprocessor>,
+) -> Result<()> {
     let window_samples = config.live_caption_window_seconds as usize * SAMPLE_RATE as usize;
     let step_samples = config.live_caption_step_seconds as usize * SAMPLE_RATE as usize;
     let max_pending_samples = MAX_PENDING_AUDIO_SECONDS * SAMPLE_RATE as usize;
@@ -821,16 +1045,16 @@ fn process_caption_windows(
                 .unwrap_or(true);
             if should_notify {
                 last_drop_notice = Some(Instant::now());
-                emit_error(
-                    app,
-                    "轉錄速度跟不上聲音，已捨棄部分較舊音訊以追上進度".into(),
-                );
+                let gate = queue.lock().map_err(|_| anyhow!("無法取得字幕派發狀態"))?;
+                if gate.is_accepting() && running.load(Ordering::SeqCst) {
+                    sink.error("轉錄速度跟不上聲音，已捨棄部分較舊音訊以追上進度".into());
+                }
             }
         }
 
         if incremental && incremental_segment.is_expired() {
             complete_incremental_segment(
-                app,
+                &sink,
                 config,
                 &mut agreement,
                 &mut incremental_segment,
@@ -841,6 +1065,7 @@ fn process_caption_windows(
                 &mut revision,
                 running,
                 queue,
+                &postprocessor,
             );
         }
         let interval_elapsed = last_decode_at
@@ -889,35 +1114,9 @@ fn process_caption_windows(
         }
 
         let transcribe_started_at = Instant::now();
-        let transcription = match backend {
-            "local_whisper" => transcribe_with_whisper(
-                whisper_context.ok_or_else(|| anyhow!("本地 Whisper 模型未初始化"))?,
-                &window,
-                &config.live_caption_language,
-            ),
-            "voxnote_asr" => {
-                if incremental {
-                    tauri::async_runtime::block_on(
-                        crate::asr::transcribe_live_caption_remote_incremental(
-                            remote_client.ok_or_else(|| anyhow!("即時字幕遠端連線未初始化"))?,
-                            live_caption_remote_base_url(config),
-                            &window,
-                            &config.live_caption_language,
-                            config.live_caption_remote_timeout_seconds as u64,
-                        ),
-                    )
-                } else {
-                    tauri::async_runtime::block_on(transcribe_live_caption_remote(
-                        remote_client.ok_or_else(|| anyhow!("即時字幕遠端連線未初始化"))?,
-                        live_caption_remote_base_url(config),
-                        &window,
-                        &config.live_caption_language,
-                        config.live_caption_remote_timeout_seconds as u64,
-                    ))
-                }
-            }
-            _ => Err(anyhow!("不支援的即時字幕轉錄後端：{}", backend)),
-        };
+        let transcription = decoder.decode(backend, incremental, &window, config);
+        #[cfg(test)]
+        decoder.after_decode();
         if incremental {
             // 以解碼完成時間作為節奏基準；若單次解碼已超過間隔，下一輪會等待
             // 下一個間隔而不是立即補跑，避免待處理工作無限累積。
@@ -931,7 +1130,6 @@ fn process_caption_windows(
 
         let transcription = match transcription {
             Ok(text) if !text.trim().is_empty() => {
-                println!("[live-caption] 後端={} 原始輸出={:?}", backend, text.trim());
                 if is_hallucination(&text) {
                     println!("[live-caption] 判定為模型幻覺，略過本段");
                     continue;
@@ -944,18 +1142,22 @@ fn process_caption_windows(
             }
             Err(error) => {
                 println!("[live-caption] 後端={} 轉錄失敗：{}", backend, error);
+                let gate = queue.lock().map_err(|_| anyhow!("無法取得字幕派發狀態"))?;
+                if !gate.is_accepting() || !running.load(Ordering::SeqCst) {
+                    break;
+                }
                 if incremental && backend == "voxnote_asr" && !incremental_fallback_reported {
                     incremental_fallback_reported = true;
                     incremental = false;
-                    emit_error(
-                        app,
-                        format!("低延遲增量端點不可用，已回退至視窗式字幕輸出：{}", error),
-                    );
+                    sink.error(format!(
+                        "低延遲增量端點不可用，已回退至視窗式字幕輸出：{}",
+                        error
+                    ));
                     // 增量端點不支援時，不中止 session；後續請求改走既有批次同步契約。
                     // 此處以局部旗標控制本次 session，不修改使用者設定。
                     // `incremental` 為不可變設定快照，故透過回退旗標判斷後續路徑。
                 } else if !incremental_fallback_reported {
-                    emit_error(app, format!("單段即時字幕轉錄失敗，將繼續處理：{}", error));
+                    sink.error(format!("單段即時字幕轉錄失敗，將繼續處理：{}", error));
                 }
                 continue;
             }
@@ -1017,157 +1219,38 @@ fn process_caption_windows(
             continue;
         }
         revision = revision.saturating_add(1);
-        let _ = app.emit(
-            LIVE_CAPTION_EVENT,
-            LiveCaptionPayload {
-                session_id: session_id.to_string(),
-                sequence: event_sequence,
-                revision,
-                phase: if incremental { "partial" } else { "final" }.into(),
-                original: emitted_text.clone(),
-                translation: None,
-                display_text,
-                confirmed_text: confirmed_text.clone(),
-                tentative_text: tentative_text.clone(),
-                is_tentative,
-            },
-        );
-
-        let (should_translate, should_proofread) = resolve_translate_or_proofread(
-            config.live_caption_translate,
-            config.live_caption_proofread,
-            &config.live_caption_display_mode,
-            &config.live_caption_language,
-        );
-
-        if should_translate && !incremental {
-            let translation_app = app.clone();
-            let translation_config = config.clone();
-            let translation_text = emitted_text.clone();
-            let translation_sequence = event_sequence;
-            let translation_revision = revision.saturating_add(1);
-            let translation_session_id = session_id.to_string();
-            let translation_mode = config.live_caption_display_mode.clone();
-            let translation_failure_reported = translation_failure_reported.clone();
-            let translation_running = running.clone();
-            let translation_queue = queue.clone();
-            // 翻譯不得阻塞下一段 ASR；完成後用相同 sequence 更新已顯示的字幕。
-            thread::spawn(move || {
-                match tauri::async_runtime::block_on(run_caption_work_until_stopped(
-                    &translation_running,
-                    &translation_queue,
-                    call_llm(
-                        &translation_config,
-                        "你是即時字幕翻譯員。請將輸入內容翻譯成自然、簡潔的繁體中文台灣用語。只輸出譯文，不要加註解、前綴或引號。",
-                        &translation_text,
-                    ),
-                )) {
-                    Ok(Some(value)) if !value.trim().is_empty() => {
-                        if !translation_running.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        let value = value.trim().to_string();
-                        translation_failure_reported.store(false, Ordering::SeqCst);
-                        let Ok(gate) = translation_queue.lock() else { return; };
-                        if !gate.is_accepting() || !translation_running.load(Ordering::SeqCst) { return; }
-                        let _ = translation_app.emit(
-                            LIVE_CAPTION_EVENT,
-                            LiveCaptionPayload {
-                                session_id: translation_session_id,
-                                sequence: translation_sequence,
-                                revision: translation_revision,
-                                phase: "postprocessed".into(),
-                                original: translation_text.clone(),
-                                display_text: build_display_text(
-                                    &translation_text,
-                                    Some(&value),
-                                    &translation_mode,
-                                ),
-                                translation: Some(value),
-                                confirmed_text: translation_text.clone(),
-                                tentative_text: String::new(),
-                                is_tentative: false,
-                            },
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        if !translation_failure_reported.swap(true, Ordering::SeqCst) {
-                            emit_error(
-                                &translation_app,
-                                format!("字幕翻譯暫時不可用，將維持顯示原文：{}", error),
-                            );
-                        }
-                    }
-                }
-            });
-        } else if should_proofread && !incremental {
-            let proofread_app = app.clone();
-            let proofread_config = config.clone();
-            let proofread_text = emitted_text.clone();
-            let proofread_sequence = event_sequence;
-            let proofread_revision = revision.saturating_add(1);
-            let proofread_session_id = session_id.to_string();
-            let proofread_failure_reported = translation_failure_reported.clone();
-            let proofread_running = running.clone();
-            let proofread_queue = queue.clone();
-            // 校稿更新顯示文字；保留 ASR 原文快照作為段落身分，譯文欄位維持 None。
-            thread::spawn(move || {
-                match tauri::async_runtime::block_on(run_caption_work_until_stopped(
-                    &proofread_running,
-                    &proofread_queue,
-                    call_llm(&proofread_config, PROOFREAD_CORE_SYSTEM, &proofread_text),
-                )) {
-                    Ok(Some(value)) if !value.trim().is_empty() => {
-                        if !proofread_running.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        let value = value.trim().to_string();
-                        proofread_failure_reported.store(false, Ordering::SeqCst);
-                        let Ok(gate) = proofread_queue.lock() else {
-                            return;
-                        };
-                        if !gate.is_accepting() || !proofread_running.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        let _ = proofread_app.emit(
-                            LIVE_CAPTION_EVENT,
-                            LiveCaptionPayload {
-                                session_id: proofread_session_id,
-                                sequence: proofread_sequence,
-                                revision: proofread_revision,
-                                phase: "postprocessed".into(),
-                                original: proofread_text.clone(),
-                                // 不透過 build_display_text：該函式依 mode 在原文／譯文間選擇，
-                                // 但此處沒有「譯文」，三種 mode 目前都恰好收斂回 value，純屬巧合
-                                // （並非刻意設計）。直接指定 value，避免日後修改
-                                // build_display_text 的行為時，此處被意外連動改變。
-                                display_text: value.clone(),
-                                translation: None,
-                                confirmed_text: value.clone(),
-                                tentative_text: String::new(),
-                                is_tentative: false,
-                            },
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        if !proofread_failure_reported.swap(true, Ordering::SeqCst) {
-                            emit_error(
-                                &proofread_app,
-                                format!("字幕校稿暫時不可用，將維持顯示原文：{}", error),
-                            );
-                        }
-                    }
-                }
-            });
+        sink.caption(LiveCaptionPayload {
+            session_id: session_id.to_string(),
+            sequence: event_sequence,
+            revision,
+            phase: if incremental { "partial" } else { "final" }.into(),
+            original: emitted_text.clone(),
+            translation: None,
+            display_text,
+            confirmed_text: confirmed_text.clone(),
+            tentative_text: tentative_text.clone(),
+            is_tentative,
+        });
+        if !incremental {
+            spawn_caption_postprocessing(
+                &sink,
+                &postprocessor,
+                config,
+                event_sequence,
+                emitted_text,
+                &translation_failure_reported,
+                session_id,
+                revision.saturating_add(1),
+                running,
+                queue,
+            );
         }
     }
 
     if incremental && (agreement.has_text() || incremental_segment.sequence.is_some()) {
         if running.load(Ordering::SeqCst) {
             complete_incremental_segment(
-                app,
+                &sink,
                 config,
                 &mut agreement,
                 &mut incremental_segment,
@@ -1178,6 +1261,7 @@ fn process_caption_windows(
                 &mut revision,
                 running,
                 queue,
+                &postprocessor,
             );
         } else {
             let _ = agreement.finish();
@@ -1328,7 +1412,7 @@ fn drain_queue(queue: &SharedQueue, target: &mut VecDeque<f32>) -> usize {
 /// 完成目前的顯示段。此生命週期只由固定顯示週期或 session 結束觸發，
 /// 不依賴標點、agreement 或模型是否仍重送舊前綴。
 fn complete_incremental_segment(
-    app: &AppHandle,
+    sink: &Arc<dyn WindowEventSink>,
     config: &AppConfig,
     agreement: &mut LocalAgreement,
     segment: &mut IncrementalSegmentState,
@@ -1339,6 +1423,7 @@ fn complete_incremental_segment(
     revision: &mut u64,
     running: &Arc<AtomicBool>,
     queue: &SharedQueue,
+    postprocessor: &Arc<dyn WindowPostprocessor>,
 ) {
     let final_text = if agreement.has_text() {
         agreement.finish().confirmed
@@ -1357,27 +1442,25 @@ fn complete_incremental_segment(
                 return;
             }
             *revision = revision.saturating_add(1);
-            let _ = app.emit(
-                LIVE_CAPTION_EVENT,
-                LiveCaptionPayload {
-                    session_id: session_id.to_string(),
-                    sequence: event_sequence,
-                    revision: *revision,
-                    phase: "final".into(),
-                    original: final_text.clone(),
-                    translation: None,
-                    display_text: build_display_text(
-                        &final_text,
-                        None,
-                        &config.live_caption_display_mode,
-                    ),
-                    confirmed_text: final_text.clone(),
-                    tentative_text: String::new(),
-                    is_tentative: false,
-                },
-            );
+            sink.caption(LiveCaptionPayload {
+                session_id: session_id.to_string(),
+                sequence: event_sequence,
+                revision: *revision,
+                phase: "final".into(),
+                original: final_text.clone(),
+                translation: None,
+                display_text: build_display_text(
+                    &final_text,
+                    None,
+                    &config.live_caption_display_mode,
+                ),
+                confirmed_text: final_text.clone(),
+                tentative_text: String::new(),
+                is_tentative: false,
+            });
             spawn_caption_postprocessing(
-                app,
+                sink,
+                postprocessor,
                 config,
                 event_sequence,
                 final_text,
@@ -1394,7 +1477,8 @@ fn complete_incremental_segment(
 }
 
 fn spawn_caption_postprocessing(
-    app: &AppHandle,
+    sink: &Arc<dyn WindowEventSink>,
+    postprocessor: &Arc<dyn WindowPostprocessor>,
     config: &AppConfig,
     sequence: u64,
     text: String,
@@ -1414,7 +1498,8 @@ fn spawn_caption_postprocessing(
         return;
     }
 
-    let app = app.clone();
+    let sink = sink.clone();
+    let postprocessor = postprocessor.clone();
     let config = config.clone();
     let mode = config.live_caption_display_mode.clone();
     let failure_reported = failure_reported.clone();
@@ -1422,16 +1507,17 @@ fn spawn_caption_postprocessing(
     let running = running.clone();
     let queue = queue.clone();
     thread::spawn(move || {
-        let system_prompt = if should_translate {
-            "你是即時字幕翻譯員。請將輸入內容翻譯成自然、簡潔的繁體中文台灣用語。只輸出譯文，不要加註解、前綴或引號。"
-        } else {
-            PROOFREAD_CORE_SYSTEM
+        let work = {
+            let Ok(gate) = queue.lock() else {
+                return;
+            };
+            if !gate.is_accepting() || !running.load(Ordering::SeqCst) {
+                return;
+            }
+            postprocessor.process(config, should_translate, text.clone())
         };
-        let result = tauri::async_runtime::block_on(run_caption_work_until_stopped(
-            &running,
-            &queue,
-            call_llm(&config, system_prompt, &text),
-        ));
+        let result =
+            tauri::async_runtime::block_on(run_caption_work_until_stopped(&running, &queue, work));
 
         match result {
             Ok(Some(value)) if !value.trim().is_empty() => {
@@ -1473,15 +1559,18 @@ fn spawn_caption_postprocessing(
                         is_tentative: false,
                     }
                 };
-                let _ = app.emit(LIVE_CAPTION_EVENT, payload);
+                sink.caption(payload);
             }
             Ok(_) => {}
             Err(error) => {
+                let Ok(gate) = queue.lock() else {
+                    return;
+                };
+                if !gate.is_accepting() || !running.load(Ordering::SeqCst) {
+                    return;
+                }
                 if !failure_reported.swap(true, Ordering::SeqCst) {
-                    emit_error(
-                        &app,
-                        format!("字幕後處理暫時不可用，將維持顯示原文：{}", error),
-                    );
+                    sink.error(format!("字幕後處理暫時不可用，將維持顯示原文：{}", error));
                 }
             }
         }

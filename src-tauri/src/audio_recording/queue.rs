@@ -13,6 +13,8 @@ pub(crate) struct AudioQueue {
     stopped_at: Option<Instant>,
     dropped: bool,
     last_drop_notice: Option<Instant>,
+    captured_samples: u64,
+    dropped_samples: u64,
 }
 
 impl Default for AudioQueue {
@@ -25,6 +27,8 @@ impl Default for AudioQueue {
             stopped_at: None,
             dropped: false,
             last_drop_notice: None,
+            captured_samples: 0,
+            dropped_samples: 0,
         }
     }
 }
@@ -42,12 +46,14 @@ impl AudioQueue {
             return;
         }
         for sample in samples {
+            self.captured_samples = self.captured_samples.saturating_add(1);
             if self
                 .capacity
                 .is_some_and(|capacity| self.samples.len() >= capacity)
             {
                 self.samples.pop_front();
                 self.dropped = true;
+                self.dropped_samples = self.dropped_samples.saturating_add(1);
             }
             self.samples.push_back(sample);
         }
@@ -55,6 +61,14 @@ impl AudioQueue {
 
     pub fn len(&self) -> usize {
         self.samples.len()
+    }
+
+    pub fn captured_samples(&self) -> u64 {
+        self.captured_samples
+    }
+
+    pub fn dropped_samples(&self) -> u64 {
+        self.dropped_samples
     }
 
     pub fn pop_front(&mut self) -> Option<f32> {
@@ -114,6 +128,8 @@ mod tests {
         let mut queue = AudioQueue::bounded(32_000);
         queue.extend((0..50_000).map(|sample| sample as f32));
         assert_eq!(queue.len(), 32_000);
+        assert_eq!(queue.captured_samples(), 50_000);
+        assert_eq!(queue.dropped_samples(), 18_000);
         assert_eq!(queue.pop_front(), Some(18_000.0));
         let now = Instant::now();
         assert!(queue.take_drop_notice(now, Duration::from_secs(5)));

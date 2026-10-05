@@ -4,10 +4,10 @@ use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 use tokio_tungstenite::{
-    connect_async,
+    connect_async_with_config,
     tungstenite::{
         client::IntoClientRequest, http::header::AUTHORIZATION, http::HeaderValue, Message,
     },
@@ -17,6 +17,7 @@ use tokio_tungstenite::{
 const ASSEMBLYAI_STREAMING_ENDPOINT: &str = "wss://streaming.assemblyai.com/v3/ws";
 const AUDIO_FRAME_SAMPLES: usize = 1_600;
 const MIN_AUDIO_FRAME_SAMPLES: usize = 800;
+const MAX_AUDIO_FRAME_SAMPLES: usize = 16_000;
 #[cfg(test)]
 const MAX_PENDING_SAMPLES: usize = 32_000;
 const DROP_NOTICE_THROTTLE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -56,6 +57,7 @@ mod session_tests {
         cancelled_work: AtomicUsize,
         ready: AtomicUsize,
         capture_stops: AtomicUsize,
+        diagnostics: Mutex<Vec<StreamDiagnostic>>,
         read_fail: AtomicBool,
         write_fail: AtomicBool,
         llm_fail: AtomicBool,
@@ -71,6 +73,9 @@ mod session_tests {
         }
         fn ready(&mut self) {
             self.0.ready.fetch_add(1, Ordering::SeqCst);
+        }
+        fn diagnostic(&mut self, diagnostic: StreamDiagnostic) {
+            self.0.diagnostics.lock().expect("診斷鎖").push(diagnostic);
         }
     }
 
@@ -374,6 +379,22 @@ mod session_tests {
         queue.lock().expect("queue").extend([9.0]);
         assert_eq!(queue.lock().expect("queue").len(), 0);
         assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+        let diagnostics = observed.diagnostics.lock().expect("診斷鎖");
+        assert!(matches!(
+            diagnostics.last(),
+            Some(StreamDiagnostic::Stopped {
+                audio_packets: 1,
+                tail_packets: 1,
+                terminate_sent: true,
+                termination_ack: true,
+                socket_released: true,
+                code: "user_stop",
+                ..
+            })
+        ));
+        let serialized = serde_json::to_string(&*diagnostics).expect("診斷應可序列化");
+        assert!(!serialized.contains("Hello") && !serialized.contains("offline-test-key"));
+        assert!(!serialized.contains("original") && !serialized.contains("translation"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -416,6 +437,15 @@ mod session_tests {
         assert_eq!(observed.calls.load(Ordering::SeqCst), 15);
         assert_eq!(observed.started_work.load(Ordering::SeqCst), 2);
         assert_eq!(observed.cancelled_work.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            observed.diagnostics.lock().expect("診斷鎖").last(),
+            Some(StreamDiagnostic::Stopped {
+                terminate_sent: true,
+                termination_ack: false,
+                socket_released: true,
+                ..
+            })
+        ));
         assert!(observed
             .notices
             .lock()
@@ -789,6 +819,10 @@ mod session_tests {
         assert!(message.contains("額度或頻率限制"));
         assert!(!message.contains("offline-test-key") && !message.contains("transcript"));
         assert_eq!(observed.drops.load(Ordering::SeqCst), 1);
+        let diagnostics = serde_json::to_string(&*observed.diagnostics.lock().expect("診斷鎖"))
+            .expect("錯誤診斷應可序列化");
+        assert!(diagnostics.contains("rate_limit"));
+        assert!(!diagnostics.contains("offline-test-key") && !diagnostics.contains("transcript"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -907,6 +941,161 @@ mod session_tests {
         assert!(times
             .windows(2)
             .all(|pair| pair[1].duration_since(pair[0]) >= AUDIO_SEND_INTERVAL));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn steady_capture_with_late_wakeups_does_not_accumulate_or_drop_audio() {
+        let (connector, server, observed) = fixture(true, false, false);
+        let queue = Arc::new(Mutex::new(AudioQueue::bounded(32_000)));
+        queue
+            .lock()
+            .expect("queue")
+            .extend(vec![0.25; AUDIO_FRAME_SAMPLES]);
+        let running = AtomicBool::new(true);
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        server
+            .send(ServerFrame::Text(r#"{"type":"Begin"}"#.into()))
+            .expect("Begin");
+        let driver = async {
+            while ready_rx.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            // 每次晚 20 ms 醒來，但擷取仍以 16 kHz 連續產生，不模擬快速補播。
+            for _ in 0..140 {
+                queue.lock().expect("queue").extend(vec![0.25; 1_920]);
+                server.send(ServerFrame::Other).expect("Heartbeat");
+                tokio::time::advance(Duration::from_millis(120)).await;
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            assert!(
+                queue.lock().expect("queue").len() <= AUDIO_FRAME_SAMPLES,
+                "排程晚到不得讓持續 16 kHz 音訊逐漸累積"
+            );
+            stop_tx.send(()).expect("停止");
+        };
+        let (result, _) = tokio::join!(
+            drive(
+                &connector,
+                observed.clone(),
+                &queue,
+                &running,
+                stop_rx,
+                ready_tx,
+                Instant::now() + Duration::from_secs(10),
+                false
+            ),
+            driver
+        );
+        assert!(result.is_ok());
+        assert!(!observed
+            .notices
+            .lock()
+            .expect("notice")
+            .iter()
+            .any(|notice| notice.contains("音訊超過")));
+        let audio = observed.audio.lock().expect("audio");
+        assert_eq!(
+            audio.iter().map(Vec::len).sum::<usize>(),
+            (AUDIO_FRAME_SAMPLES + 140 * 1_920) * 2
+        );
+        assert!(audio
+            .iter()
+            .all(|packet| (1_600..=32_000).contains(&packet.len())));
+        let diagnostics = observed.diagnostics.lock().expect("diagnostics");
+        let flows: Vec<_> = diagnostics
+            .iter()
+            .filter_map(|diagnostic| match diagnostic {
+                StreamDiagnostic::AudioFlow {
+                    captured_samples,
+                    sent_samples,
+                    dropped_samples,
+                    pending_samples,
+                    ..
+                } => Some((
+                    *captured_samples,
+                    *sent_samples,
+                    *dropped_samples,
+                    *pending_samples,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert!(!flows.is_empty(), "長時間傳送應有非文字吞吐量診斷");
+        assert!(flows
+            .iter()
+            .all(|(captured, sent, dropped, pending)| *dropped == 0
+                && *captured - *sent == *pending as u64));
+        let times = observed.audio_dispatch_times.lock().expect("節奏鎖");
+        assert!(times
+            .windows(2)
+            .all(|pair| pair[1].duration_since(pair[0]) >= AUDIO_SEND_INTERVAL));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn steady_capture_with_slow_writes_keeps_bounded_recent_audio() {
+        let (connector, server, observed) = fixture(true, false, false);
+        connector
+            .socket
+            .lock()
+            .expect("socket")
+            .as_mut()
+            .expect("socket 應存在")
+            .write_delay = Duration::from_millis(250);
+        let queue = Arc::new(Mutex::new(AudioQueue::bounded(32_000)));
+        let running = AtomicBool::new(true);
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        server
+            .send(ServerFrame::Text(r#"{"type":"Begin"}"#.into()))
+            .expect("Begin");
+        let driver = async {
+            while ready_rx.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+            for _ in 0..100 {
+                queue
+                    .lock()
+                    .expect("queue")
+                    .extend(vec![0.25; AUDIO_FRAME_SAMPLES]);
+                server.send(ServerFrame::Other).expect("Heartbeat");
+                tokio::time::sleep(AUDIO_SEND_INTERVAL).await;
+            }
+            let queue = queue.lock().expect("queue");
+            assert_eq!(
+                queue.dropped_samples(),
+                0,
+                "固定寫入延遲不應使傳送音訊速率一直落後"
+            );
+            assert!(queue.len() <= 8_000, "待傳資料應維持在短暫寫入延遲範圍內");
+            drop(queue);
+            stop_tx.send(()).expect("停止");
+        };
+        let (result, _) = tokio::join!(
+            drive(
+                &connector,
+                observed.clone(),
+                &queue,
+                &running,
+                stop_rx,
+                ready_tx,
+                Instant::now() + Duration::from_secs(10),
+                false
+            ),
+            driver
+        );
+        assert!(result.is_ok());
+        assert!(!observed
+            .notices
+            .lock()
+            .expect("notice")
+            .iter()
+            .any(|notice| notice.contains("音訊超過")));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1114,6 +1303,8 @@ pub(super) async fn run_stream_session(
         app,
         session_id,
         audio_source,
+        detailed_diagnostics: std::env::var("VOXNOTE_STREAMING_DIAGNOSTICS")
+            .is_ok_and(|value| value == "1"),
     };
     run_session_with(
         &TlsWebSocketConnector,
@@ -1187,12 +1378,86 @@ trait SessionEventSink {
     fn caption(&mut self, payload: super::LiveCaptionPayload);
     fn notice(&mut self, message: &'static str);
     fn ready(&mut self);
+    fn diagnostic(&mut self, _diagnostic: StreamDiagnostic) {}
+}
+
+/// 僅記錄協定階段、數量與時間，不接受金鑰、音訊或文字內容欄位。
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum StreamDiagnostic {
+    Ready {
+        at_ms: u64,
+    },
+    Turn {
+        turn_order: u64,
+        phase: &'static str,
+        at_ms: u64,
+    },
+    Stopping {
+        audio_packets: u64,
+        at_ms: u64,
+    },
+    AudioFlow {
+        at_ms: u64,
+        captured_samples: u64,
+        sent_samples: u64,
+        dropped_samples: u64,
+        pending_samples: usize,
+        max_write_ms: u64,
+    },
+    Stopped {
+        duration_ms: u64,
+        stop_elapsed_ms: u64,
+        termination_wait_ms: u64,
+        audio_packets: u64,
+        tail_packets: u64,
+        terminate_sent: bool,
+        termination_ack: bool,
+        socket_released: bool,
+        code: &'static str,
+    },
+}
+
+fn elapsed_ms(started: tokio::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn diagnostic_code(result: &Result<()>, session_limit: bool) -> &'static str {
+    let Err(error) = result else {
+        return if session_limit {
+            "session_limit"
+        } else {
+            "user_stop"
+        };
+    };
+    let message = error.to_string();
+    if message.contains("已取消") {
+        "cancelled"
+    } else if message.contains("認證") {
+        "authentication"
+    } else if message.contains("額度") || message.contains("頻率") {
+        "rate_limit"
+    } else if message.contains("音源") {
+        "capture_error"
+    } else if message.contains("15 秒") {
+        "server_idle"
+    } else if message.contains("寫入逾時") {
+        "write_timeout"
+    } else if message.contains("啟動逾時") || message.contains("Begin 逾時") {
+        "startup_timeout"
+    } else if message.contains("Turn") || message.contains("格式化") || message.contains("模型")
+    {
+        "protocol"
+    } else {
+        "transport_or_configuration"
+    }
 }
 
 struct AppEventSink {
     app: AppHandle,
     session_id: String,
     audio_source: String,
+    detailed_diagnostics: bool,
 }
 
 impl SessionEventSink for AppEventSink {
@@ -1215,6 +1480,22 @@ impl SessionEventSink for AppEventSink {
                 session_id: Some(self.session_id.clone()),
             },
         );
+    }
+
+    fn diagnostic(&mut self, diagnostic: StreamDiagnostic) {
+        if matches!(diagnostic, StreamDiagnostic::Turn { .. }) && !self.detailed_diagnostics {
+            return;
+        }
+        let wall_time_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default();
+        if let Ok(json) = serde_json::to_string(&diagnostic) {
+            println!(
+                "[assemblyai-streaming] session={} wall_time_ms={} {}",
+                self.session_id, wall_time_ms, json
+            );
+        }
     }
 }
 
@@ -1341,6 +1622,15 @@ async fn run_session_with(
         .map(|value| value.authorization.clone())
         .unwrap_or_default();
     let started = tokio::time::Instant::now();
+    let mut audio_packets = 0u64;
+    let mut sent_samples = 0u64;
+    let mut max_write_ms = 0u64;
+    let mut last_flow_report = started;
+    let mut tail_packets = 0u64;
+    let mut terminate_sent = false;
+    let mut termination_ack = false;
+    let mut termination_wait_ms = 0u64;
+    let mut session_limit = false;
     let result = async {
         let connection = connection?;
         if stop_requested(running, &stop_rx) {
@@ -1395,11 +1685,13 @@ async fn run_session_with(
         ready_tx.send(Ok(())).map_err(|_| anyhow!("即時字幕啟動狀態無法回傳"))?;
         ready = true;
         sink.ready();
+        sink.diagnostic(StreamDiagnostic::Ready { at_ms: elapsed_ms(started) });
 
         let mut reducer = TurnReducer::default();
         let mut pending: VecDeque<PostprocessFuture> = VecDeque::new();
         let mut active = futures_util::stream::FuturesUnordered::new();
         let mut last_frame = tokio::time::Instant::now();
+        let mut last_audio_dispatch = None;
         let mut ticker = tokio::time::interval(AUDIO_SEND_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut check = tokio::time::interval(Duration::from_millis(10));
@@ -1408,6 +1700,7 @@ async fn run_session_with(
             if stop_requested(running, &stop_rx) { break; }
             check_capture(error_state)?;
             if tokio::time::Instant::now().duration_since(started) >= MAX_SESSION_DURATION {
+                session_limit = true;
                 sink.notice("即時字幕已達 180 分鐘上限，連線正在停止");
                 break;
             }
@@ -1430,6 +1723,12 @@ async fn run_session_with(
                                     let original = update.text.clone();
                                     let gate = queue.lock().map_err(|_| anyhow!("音訊佇列無法讀取"))?;
                                     if !gate.is_accepting() || !running.load(Ordering::SeqCst) { break; }
+                                    if update.revision == 1 {
+                                        sink.diagnostic(StreamDiagnostic::Turn { turn_order, phase: "first_caption", at_ms: elapsed_ms(started) });
+                                    }
+                                    if is_final {
+                                        sink.diagnostic(StreamDiagnostic::Turn { turn_order, phase: "final", at_ms: elapsed_ms(started) });
+                                    }
                                     sink.caption(caption_payload(update, config));
                                     if is_final {
                                         let (translate, proofread) = super::resolve_translate_or_proofread(
@@ -1469,6 +1768,15 @@ async fn run_session_with(
                         .take_drop_notice(Instant::now(), DROP_NOTICE_THROTTLE) {
                         sink.notice("串流音訊超過佇列上限，已捨棄較舊音訊");
                     }
+                    if last_flow_report.elapsed() >= DROP_NOTICE_THROTTLE {
+                        let queue = queue.lock().map_err(|_| anyhow!("音訊佇列無法讀取"))?;
+                        sink.diagnostic(StreamDiagnostic::AudioFlow {
+                            at_ms: elapsed_ms(started), captured_samples: queue.captured_samples(),
+                            sent_samples, dropped_samples: queue.dropped_samples(),
+                            pending_samples: queue.len(), max_write_ms,
+                        });
+                        last_flow_report = tokio::time::Instant::now();
+                    }
                 }
                 Some((order, original, translated, result)) = active.next(), if !active.is_empty() => {
                     let gate = queue.lock().map_err(|_| anyhow!("音訊佇列無法讀取"))?;
@@ -1479,6 +1787,7 @@ async fn run_session_with(
                             if let Some(turn) = reducer.turns.get_mut(&order) {
                                 if turn.final_text.as_deref() == Some(original.as_str()) {
                                     turn.revision = turn.revision.saturating_add(1);
+                                    sink.diagnostic(StreamDiagnostic::Turn { turn_order: order, phase: "postprocessed", at_ms: elapsed_ms(started) });
                                     sink.caption(super::LiveCaptionPayload {
                                         session_id: String::new(), sequence: order.saturating_add(1),
                                         revision: turn.revision, phase: "postprocessed".into(),
@@ -1495,14 +1804,17 @@ async fn run_session_with(
                 }
                 _ = ticker.tick() => {
                     if stop_requested(running, &stop_rx) { break; }
+                    let dispatched_at = tokio::time::Instant::now();
+                    let packet_samples = audio_packet_samples(last_audio_dispatch, dispatched_at);
                     let frame = {
                         let mut queue = queue.lock().map_err(|_| anyhow!("音訊佇列無法讀取"))?;
                         if queue.len() >= AUDIO_FRAME_SAMPLES {
-                            Some(encode_pcm16_le(&queue.drain(..AUDIO_FRAME_SAMPLES).collect::<Vec<_>>()))
+                            let count = queue.len().min(packet_samples);
+                            Some(encode_pcm16_le(&queue.drain(..count).collect::<Vec<_>>()))
                         } else { None }
                     };
                     if let Some(frame) = frame {
-                        let dispatched_at = tokio::time::Instant::now();
+                        let frame_samples = frame.len() / 2;
                         tokio::select! {
                             result = tokio::time::timeout(AUDIO_WRITE_TIMEOUT, current.send_binary(frame)) => {
                                 result.map_err(|_| anyhow!("AssemblyAI 音訊寫入逾時"))?
@@ -1510,6 +1822,10 @@ async fn run_session_with(
                             }
                             _ = wait_for_session_stop(running, &stop_rx) => break,
                         }
+                        max_write_ms = max_write_ms.max(elapsed_ms(dispatched_at));
+                        sent_samples = sent_samples.saturating_add(frame_samples as u64);
+                        last_audio_dispatch = Some(dispatched_at);
+                        audio_packets = audio_packets.saturating_add(1);
                         ticker.reset_at(dispatched_at + AUDIO_SEND_INTERVAL);
                     }
                 }
@@ -1529,6 +1845,10 @@ async fn run_session_with(
     };
     running.store(false, Ordering::SeqCst);
     stop_capture();
+    sink.diagnostic(StreamDiagnostic::Stopping {
+        audio_packets,
+        at_ms: elapsed_ms(started),
+    });
     if let Some(mut socket) = socket {
         let mut tail = match queue.lock() {
             Ok(mut guard) => guard.take_stopped_samples(),
@@ -1549,12 +1869,15 @@ async fn run_session_with(
             ) {
                 break;
             }
+            tail_packets = tail_packets.saturating_add(1);
         }
         let limit = (tokio::time::Instant::now() + AUDIO_WRITE_TIMEOUT).min(deadline);
         if tokio::time::timeout_at(limit, socket.send_text(r#"{"type":"Terminate"}"#.into()))
             .await
             .is_ok_and(|result| result.is_ok())
         {
+            terminate_sent = true;
+            let ack_started = tokio::time::Instant::now();
             let ack_deadline =
                 (tokio::time::Instant::now() + TERMINATION_ACK_TIMEOUT).min(deadline);
             while tokio::time::Instant::now() < ack_deadline {
@@ -1565,14 +1888,27 @@ async fn run_session_with(
                             Ok(ServerEvent::Termination)
                         ) =>
                     {
-                        break
+                        termination_ack = true;
+                        break;
                     }
                     Ok(Ok(ServerFrame::Closed)) | Ok(Err(_)) | Err(_) => break,
                     _ => {}
                 }
             }
+            termination_wait_ms = elapsed_ms(ack_started);
         }
     }
+    sink.diagnostic(StreamDiagnostic::Stopped {
+        duration_ms: elapsed_ms(started),
+        stop_elapsed_ms: u64::try_from(stopped_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        termination_wait_ms,
+        audio_packets,
+        tail_packets,
+        terminate_sent,
+        termination_ack,
+        socket_released: true,
+        code: diagnostic_code(&result, session_limit),
+    });
     if !ready {
         if let Err(error) = &result {
             let _ = ready_tx.try_send(Err(anyhow!("{error}")));
@@ -1660,6 +1996,22 @@ fn remaining_audio_cadence(last_sent_at: Option<Instant>, now: Instant) -> Durat
     last_sent_at
         .map(|sent| AUDIO_SEND_INTERVAL.saturating_sub(now.saturating_duration_since(sent)))
         .unwrap_or(Duration::ZERO)
+}
+
+/// 晚到的 tick 以同一段牆鐘時間涵蓋較長音訊，維持音訊速率而不快速補送多包。
+fn audio_packet_samples(
+    previous: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> usize {
+    let elapsed = previous
+        .map(|previous| now.saturating_duration_since(previous))
+        .unwrap_or(AUDIO_SEND_INTERVAL);
+    // 只在真實已擷取樣本中取資料；向上取整到樣本單位，避免長時間的分數截斷累積。
+    let samples = elapsed
+        .as_nanos()
+        .saturating_mul(super::SAMPLE_RATE as u128)
+        .div_ceil(1_000_000_000);
+    samples.clamp(AUDIO_FRAME_SAMPLES as u128, MAX_AUDIO_FRAME_SAMPLES as u128) as usize
 }
 
 #[cfg(test)]
@@ -1843,25 +2195,31 @@ impl StreamingConnector for TlsWebSocketConnector {
         authorization: &'a str,
     ) -> BoxFuture<'a, Result<Box<dyn StreamingSocket>>> {
         Box::pin(async move {
+            // WSS 的信任根功能不會選擇加密 provider；既有 process default 存在時沿用。
+            if rustls::crypto::CryptoProvider::get_default().is_none() {
+                let _ = rustls::crypto::ring::default_provider().install_default();
+            }
             let mut request = url
                 .into_client_request()
                 .map_err(|error| anyhow!("AssemblyAI WebSocket URL 無效：{error}"))?;
             let authorization = HeaderValue::from_str(authorization)
                 .map_err(|_| anyhow!("AssemblyAI API Key 格式無效"))?;
             request.headers_mut().insert(AUTHORIZATION, authorization);
-            let (socket, _) = connect_async(request).await.map_err(|error| match error {
-                tokio_tungstenite::tungstenite::Error::Http(response)
-                    if matches!(response.status().as_u16(), 401 | 403) =>
-                {
-                    anyhow!("AssemblyAI 認證失敗，請檢查 API Key")
-                }
-                tokio_tungstenite::tungstenite::Error::Http(response)
-                    if response.status().as_u16() == 429 =>
-                {
-                    anyhow!("AssemblyAI 額度或頻率限制，請稍後重試")
-                }
-                _ => anyhow!("AssemblyAI WebSocket 連線失敗，請檢查網路與認證設定"),
-            })?;
+            let (socket, _) = connect_async_with_config(request, None, true)
+                .await
+                .map_err(|error| match error {
+                    tokio_tungstenite::tungstenite::Error::Http(response)
+                        if matches!(response.status().as_u16(), 401 | 403) =>
+                    {
+                        anyhow!("AssemblyAI 認證失敗，請檢查 API Key")
+                    }
+                    tokio_tungstenite::tungstenite::Error::Http(response)
+                        if response.status().as_u16() == 429 =>
+                    {
+                        anyhow!("AssemblyAI 額度或頻率限制，請稍後重試")
+                    }
+                    _ => anyhow!("AssemblyAI WebSocket 連線失敗，請檢查網路與認證設定"),
+                })?;
             Ok(Box::new(TlsStreamingSocket { socket }) as Box<dyn StreamingSocket>)
         })
     }
@@ -1999,7 +2357,7 @@ mod tests {
         CaptionPhase, ServerEvent, ServerFrame, StreamingConnector, StreamingSocket,
         TlsWebSocketConnector, TurnReducer, AUDIO_WRITE_TIMEOUT,
     };
-    use futures_util::SinkExt;
+    use futures_util::{FutureExt, SinkExt};
     use std::collections::VecDeque;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -2080,6 +2438,37 @@ mod tests {
             super::ServerFrame::Text(r#"{"type":"Begin","id":"mock-session"}"#.into())
         );
         server.await.expect("mock server 應正常結束");
+    }
+
+    #[tokio::test]
+    async fn local_wss_tls_initialization_returns_error_without_panicking() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("本機 TLS 測試 listener 應可啟動");
+        let address = listener.local_addr().expect("應取得本機位址");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("應接受 TCP 連線");
+            // 故意不提供 TLS 憑證；應回傳握手錯誤，而不是在 crypto provider 初始化時 panic。
+            stream.shutdown().await.expect("應關閉測試 TCP 連線");
+        });
+        let url = format!("wss://{address}");
+        let attempt =
+            std::panic::AssertUnwindSafe(TlsWebSocketConnector.connect(&url, "fixture-only"))
+                .catch_unwind();
+        let result = tokio::time::timeout(Duration::from_secs(2), attempt)
+            .await
+            .expect("TLS 測試應有限時間完成");
+        server.await.expect("測試 server 應正常結束");
+        assert!(
+            result.is_ok(),
+            "WSS crypto provider 初始化不可讓 worker panic"
+        );
+        assert!(
+            result.expect("不可 panic").is_err(),
+            "沒有 TLS 的 server 應被拒絕"
+        );
     }
 
     struct MockSocket {
