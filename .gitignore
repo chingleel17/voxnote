@@ -26,6 +26,7 @@ dist-ssr
 # Tauri / Rust
 src-tauri/target/
 src-tauri/gen/
+src-tauri/binaries/
 
 # Generated files
 src/api/generated/
