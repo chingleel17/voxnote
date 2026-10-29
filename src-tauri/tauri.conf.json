@@ -14,6 +14,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "VoxNote",
         "width": 800,
         "height": 600,
@@ -21,6 +22,7 @@
       },
       {
         "label": "live-caption-overlay",
+        "create": false,
         "title": "即時字幕",
         "url": "overlay.html",
         "width": 720,

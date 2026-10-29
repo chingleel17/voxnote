@@ -180,6 +180,9 @@ CREATE TABLE IF NOT EXISTS meeting_tags (
     FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
 );
 
+"#;
+
+const INDEX_SQL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_meetings_archived_created
     ON meetings(archived_at, created_at DESC);
 
@@ -227,77 +230,134 @@ pub async fn init_db(app: &AppHandle) -> Result<SqlitePool> {
         .connect_with(options)
         .await?;
 
+    migrate(&pool).await?;
+
+    Ok(pool)
+}
+
+async fn migrate(pool: &SqlitePool) -> Result<()> {
     // 逐條執行 migration，忽略空白語句
     for statement in MIGRATION_SQL.split(';') {
         let trimmed = statement.trim();
         if !trimmed.is_empty() {
-            sqlx::query(trimmed).execute(&pool).await?;
+            sqlx::query(trimmed).execute(pool).await?;
         }
     }
 
     // 向下相容 ALTER TABLE（舊資料庫補欄位，重複欄位錯誤可忽略）
     let _ = sqlx::query("ALTER TABLE recordings ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
-        .execute(&pool)
+        .execute(pool)
         .await;
     let _ = sqlx::query("ALTER TABLE recordings ADD COLUMN original_file_name TEXT")
-        .execute(&pool)
+        .execute(pool)
         .await;
     let _ = sqlx::query("ALTER TABLE recordings ADD COLUMN source_mode TEXT")
-        .execute(&pool)
+        .execute(pool)
         .await;
     let _ = sqlx::query("ALTER TABLE recordings ADD COLUMN segment_transcript TEXT")
-        .execute(&pool)
+        .execute(pool)
         .await;
     let _ = sqlx::query("ALTER TABLE recordings ADD COLUMN segment_proofread TEXT")
-        .execute(&pool)
+        .execute(pool)
         .await;
     let _ = sqlx::query(
         "ALTER TABLE recordings ADD COLUMN diarization_degraded INTEGER NOT NULL DEFAULT 0",
     )
-    .execute(&pool)
+    .execute(pool)
     .await;
     let _ =
         sqlx::query("ALTER TABLE recordings ADD COLUMN no_break_before INTEGER NOT NULL DEFAULT 0")
-            .execute(&pool)
+            .execute(pool)
             .await;
     let _ = sqlx::query("ALTER TABLE recordings ADD COLUMN speaker_count INTEGER DEFAULT NULL")
-        .execute(&pool)
+        .execute(pool)
         .await;
     let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN manual_content TEXT")
-        .execute(&pool)
+        .execute(pool)
         .await;
     let _ = sqlx::query(
         "ALTER TABLE transcripts ADD COLUMN proofread_status TEXT NOT NULL DEFAULT 'idle'",
     )
-    .execute(&pool)
+    .execute(pool)
     .await;
     let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN proofread_error TEXT")
-        .execute(&pool)
+        .execute(pool)
         .await;
     let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN proofread_warning TEXT")
-        .execute(&pool)
+        .execute(pool)
         .await;
     let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN proofread_started_at TEXT")
-        .execute(&pool)
+        .execute(pool)
         .await;
     let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN manual_base_version TEXT")
-        .execute(&pool)
+        .execute(pool)
         .await;
     let _ = sqlx::query("ALTER TABLE transcripts ADD COLUMN manual_updated_at TEXT")
-        .execute(&pool)
+        .execute(pool)
         .await;
 
     let _ = sqlx::query("ALTER TABLE meetings ADD COLUMN meeting_date TEXT")
-        .execute(&pool)
+        .execute(pool)
         .await;
     let _ = sqlx::query("ALTER TABLE meetings ADD COLUMN archived_at TEXT")
-        .execute(&pool)
+        .execute(pool)
         .await;
     let _ = sqlx::query("ALTER TABLE meetings ADD COLUMN archived_path TEXT")
-        .execute(&pool)
+        .execute(pool)
         .await;
 
-    transcript::recover_interrupted_proofreads(&pool).await?;
+    // 舊資料庫須先補齊 archived_at、sort_order 等欄位，才能建立對應索引。
+    for statement in INDEX_SQL.split(';') {
+        let trimmed = statement.trim();
+        if !trimmed.is_empty() {
+            sqlx::query(trimmed).execute(pool).await?;
+        }
+    }
 
-    Ok(pool)
+    transcript::recover_interrupted_proofreads(pool).await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn migrates_legacy_tables_before_creating_indexes() -> Result<()> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await?;
+
+        sqlx::query(
+            "CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE recordings (id TEXT PRIMARY KEY, meeting_id TEXT NOT NULL, created_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("INSERT INTO meetings (id, title, created_at, updated_at) VALUES ('legacy', '舊會議', '2024-01-01', '2024-01-01')")
+            .execute(&pool)
+            .await?;
+
+        migrate(&pool).await?;
+        migrate(&pool).await?;
+
+        let (title,): (String,) = sqlx::query_as("SELECT title FROM meetings WHERE id = 'legacy'")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(title, "舊會議");
+        let (index_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN ('idx_meetings_archived_created', 'idx_recordings_meeting_sort')",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(index_count, 2);
+
+        Ok(())
+    }
 }
