@@ -1,4 +1,4 @@
-use tauri::{Manager, WindowEvent};
+use tauri::{Manager, WebviewWindowBuilder, WindowEvent};
 
 mod ai;
 mod asr;
@@ -51,15 +51,16 @@ pub fn run() {
         })
         .setup(|app| {
             let app_handle = app.handle().clone();
-            tauri::async_runtime::block_on(async move {
-                let pool = db::init_db(&app_handle).await.expect("資料庫初始化失敗");
-                app_handle.manage(pool);
-                app_handle.manage(backup::DataOperationLock::default());
-                app_handle.manage(audio_recording::DesktopRecordingManager::default());
-                app_handle.manage(live_caption::LiveCaptionManager::default());
-            });
+            let pool = tauri::async_runtime::block_on(db::init_db(&app_handle))?;
+            app.manage(pool);
+            app.manage(backup::DataOperationLock::default());
+            app.manage(audio_recording::DesktopRecordingManager::default());
+            app.manage(live_caption::LiveCaptionManager::default());
+            for window_config in &app.config().app.windows {
+                WebviewWindowBuilder::from_config(app.handle(), window_config)?.build()?;
+            }
             if let Some(main_window) = app.get_webview_window("main") {
-                main_window.show().expect("主視窗顯示失敗");
+                main_window.show()?;
             }
 
             let cleanup_app_handle = app.handle().clone();
