@@ -1,0 +1,105 @@
+name: macOS Candidate
+
+on:
+  push:
+    branches: [feature/macos-desktop-support]
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'src-tauri/**'
+      - 'public/**'
+      - '*.html'
+      - 'package*.json'
+      - 'vite.config.*'
+      - 'tsconfig.json'
+      - '.github/workflows/macos-candidate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-candidate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            arch: arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          shared-key: macos-candidate-${{ matrix.target }}
+      - name: 準備原生工具鏈
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          uname -m
+          command -v cmake || brew install cmake
+          cmake --version
+          echo "LIBCLANG_PATH=$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib" >> "$GITHUB_ENV"
+      - name: 安裝前端套件並建置
+        run: npm ci && npm run build
+      - name: Rust 測試
+        working-directory: src-tauri
+        run: cargo test --locked --lib --target ${{ matrix.target }}
+      - name: 建立未公證候選安裝包
+        run: npm run tauri -- build --target ${{ matrix.target }} --bundles app,dmg -- --locked
+      - name: 驗證應用程式封裝
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          app="src-tauri/target/$TARGET/release/bundle/macos/VoxNote.app"
+          plist="$app/Contents/Info.plist"
+          executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")
+          version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")
+          test "$version" = "$(node -p 'require("./package.json").version')"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$plist")" = '13.0'
+          /usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$plist"
+          test "$(lipo -archs "$app/Contents/MacOS/$executable")" = "$EXPECTED_ARCH"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv --verbose=2 "$app"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "src-tauri/target/$TARGET/release/bundle/macos/VoxNote-$version-$EXPECTED_ARCH.app.zip"
+          {
+            echo "## VoxNote $version — $EXPECTED_ARCH 候選包"
+            echo '最低 macOS 13；ad-hoc 簽署，未經 Apple 公證。'
+            echo '此流程僅驗證編譯、測試與封裝，不代表系統音訊／混音或權限已實機驗收。'
+            echo "Commit: $GITHUB_SHA"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: 上傳候選包
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoxNote-macos-${{ matrix.arch }}-${{ github.run_number }}
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.zip
+          if-no-files-found: error
+          retention-days: 14

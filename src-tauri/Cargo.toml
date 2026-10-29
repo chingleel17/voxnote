@@ -1,6 +1,6 @@
 [package]
 name = "voxnote"
-version = "0.1.4"
+version = "0.1.5"
 description = "VoxNote - 錄音、逐字稿、AI 校稿、會議摘要一站式桌面應用"
 authors = ["ching"]
 edition = "2021"
@@ -30,11 +30,16 @@ reqwest = { version = "0.12", features = ["json", "multipart"] }
 tauri-plugin-notification = "2.3.3"
 cpal = "0.17.3"
 hound = "3.5.1"
-wasapi = "0.23.0"
 zip = { version = "2", features = ["deflate"] }
 fs4 = "1.1.0"
 whisper-rs = { version = "0.16", default-features = false }
 opencc-fmmseg = "0.12.1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wasapi = "0.23.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tauri = { version = "=2.11.2", features = ["macos-private-api"] }
 
 [features]
 live-caption-cuda = ["whisper-rs/cuda"]
