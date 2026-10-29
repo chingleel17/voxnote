@@ -290,7 +290,7 @@ fn run_recording_session(
         )?);
     }
 
-    let loopback_handle = if request.mode.needs_system_audio() {
+    let loopback_handle: Option<thread::JoinHandle<Result<()>>> = if request.mode.needs_system_audio() {
         #[cfg(target_os = "windows")]
         {
             Some(start_windows_loopback_capture(
