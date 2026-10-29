@@ -1,7 +1,4 @@
 {
-  "app": {
-    "macOSPrivateApi": true
-  },
   "bundle": {
     "macOS": {
       "minimumSystemVersion": "13.0",

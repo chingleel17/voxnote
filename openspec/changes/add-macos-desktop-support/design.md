@@ -60,7 +60,7 @@ Mac 系統與 CPAL 麥克風皆轉為目標單聲道浮點 PCM，依各自實際
 
 ### 6. Mac 浮窗與本地模型
 
-固定專案目前 Tauri 2.11.2；該版本透明浮窗需核對並採用 macOS 專用 `macos-private-api` feature 與 `app.macOSPrivateApi` 設定，不以較新 2.12.1 文件推論目前行為。先驗證透明、置頂、拖曳、縮放與穿透；以原生 collection behavior 補足切換 Spaces／全螢幕的既有浮窗需求，不修改字幕段數政策。
+固定專案目前 Tauri 2.11.2；該版本透明浮窗採用 `macos-private-api` feature 與 `app.macOSPrivateApi` 設定，不以較新 2.12.1 文件推論目前行為。tauri-build 2.6.2 的 manifest 檢查優先讀一般 dependency 而不合併同名 target dependency，因此這兩項須放在一般 tauri dependency 與共用 app 設定中保持一致；實際 Mac API 仍由 Tauri 依平台條件編譯。首次 arm64 CI 已確認 target-only feature 會造成 allowlist mismatch。先驗證透明、置頂、拖曳、縮放與穿透；以原生 collection behavior 補足切換 Spaces／全螢幕的既有浮窗需求，不修改字幕段數政策。
 
 Whisper 預設 CPU，兩種架構均須成功編譯 native library，模型使用者自行提供。不納入 Metal 效能承諾。外部 CLI 為選用，Finder 啟動需驗證 PATH；工具缺少時僅回報該選項不可用，不阻斷其他後端。不得以 bundle yt-dlp 作為本 change 相依。
 
