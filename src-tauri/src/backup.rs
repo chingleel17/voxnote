@@ -857,7 +857,8 @@ async fn open_sqlite(path: &Path) -> Result<SqlitePool> {
 }
 
 fn safe_zip_path(name: &str) -> Result<PathBuf> {
-    if name.is_empty() || name.contains('\\') {
+    // ZIP 路徑須在所有平台一致拒絕 Windows 磁碟機前綴與替代資料串流。
+    if name.is_empty() || name.contains('\\') || name.contains(':') {
         bail!("備份包含不安全路徑");
     }
     let path = Path::new(name);

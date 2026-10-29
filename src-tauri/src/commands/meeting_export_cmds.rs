@@ -176,7 +176,8 @@ mod tests {
     #[test]
     fn 桌面錄音無原始檔名時退回磁碟檔名() {
         // commit_temporary_recording 路徑：original_file_name 為 None
-        let name = build_audio_file_name(None, Path::new(r"C:\data\recordings\abc_1778490519228.wav"));
+        let source = Path::new("recordings").join("abc_1778490519228.wav");
+        let name = build_audio_file_name(None, &source);
         assert_eq!(name, "abc_1778490519228.wav");
     }
 
@@ -194,7 +195,8 @@ mod tests {
 
     #[test]
     fn 原始檔名為空白時退回磁碟檔名() {
-        let name = build_audio_file_name(Some("   "), Path::new(r"C:\data\rec_9.m4a"));
+        let source = Path::new("recordings").join("rec_9.m4a");
+        let name = build_audio_file_name(Some("   "), &source);
         assert_eq!(name, "rec_9.m4a");
     }
 
